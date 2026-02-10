@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicoverbruggen/tauri-settings-schema/v2/schema.json",
+  "productName": "telegram-korean-search",
+  "version": "0.1.0",
+  "identifier": "com.sskys18.telegram-korean-search",
+  "build": {
+    "beforeDevCommand": "bun run dev",
+    "beforeBuildCommand": "bun run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "telegram-korean-search",
+        "width": 600,
+        "height": 700,
+        "center": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  }
+}
