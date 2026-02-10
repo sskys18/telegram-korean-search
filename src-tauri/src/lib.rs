@@ -1,4 +1,5 @@
 pub mod collector;
+pub mod commands;
 pub mod error;
 pub mod indexer;
 pub mod logging;
@@ -6,14 +7,21 @@ pub mod search;
 pub mod security;
 pub mod store;
 
+use grammers_client::types::LoginToken;
+use grammers_client::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use store::message::Cursor;
 use store::Store;
 use tauri::State;
+use tokio::sync::Mutex as TokioMutex;
 
 pub struct AppState {
     pub store: Mutex<Store>,
+    pub client: tokio::sync::OnceCell<Client>,
+    pub login_token: TokioMutex<Option<LoginToken>>,
+    pub password_token: TokioMutex<Option<Box<grammers_client::types::PasswordToken>>>,
+    pub runner_handle: TokioMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,6 +104,10 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             store: Mutex::new(store),
+            client: tokio::sync::OnceCell::new(),
+            login_token: TokioMutex::new(None),
+            password_token: TokioMutex::new(None),
+            runner_handle: TokioMutex::new(None),
         })
         .setup(|app| {
             #[cfg(desktop)]
@@ -130,6 +142,13 @@ pub fn run() {
             search_messages,
             get_chats,
             set_chat_excluded,
+            commands::get_api_credentials,
+            commands::save_api_credentials,
+            commands::connect_telegram,
+            commands::request_login_code,
+            commands::submit_login_code,
+            commands::submit_password,
+            commands::start_collection,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
