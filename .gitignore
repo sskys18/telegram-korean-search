@@ -1,0 +1,33 @@
+# Rust
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# Node
+node_modules/
+dist/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Secrets / sensitive
+.env
+.env.*
+session.bin
+*.key
+
+# Logs
+*.log
+
+# Conductor workspace
+.context/
+.conductor/
