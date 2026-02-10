@@ -45,9 +45,14 @@ impl Store {
     }
 }
 
-pub fn default_db_path() -> PathBuf {
+pub fn app_data_dir() -> PathBuf {
     let mut path = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("telegram-korean-search");
+    path
+}
+
+pub fn default_db_path() -> PathBuf {
+    let mut path = app_data_dir();
     path.push("tg-korean-search.db");
     path
 }
