@@ -19,6 +19,8 @@ aes-gcm = "0.10"
 security-framework = "3"
 rand = "0.8"
 zeroize = "1"
+lindera = { version = "2", features = ["embed-ko-dic"] }
+unicode-segmentation = "1"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

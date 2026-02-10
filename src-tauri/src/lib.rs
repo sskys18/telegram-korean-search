@@ -1,3 +1,4 @@
+pub mod indexer;
 pub mod security;
 pub mod store;
 
