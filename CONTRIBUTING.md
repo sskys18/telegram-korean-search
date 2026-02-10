@@ -16,15 +16,15 @@ Thank you for your interest in contributing! Here's how you can help.
 ## Development Setup
 
 ```bash
-# Prerequisites: Rust 1.75+, Node.js 20+
-npm install
+# Prerequisites: Rust 1.75+, Bun 1.0+
+bun install
 cargo tauri dev
 ```
 
 ## Code Style
 
 - **Rust**: Follow standard Rust conventions. Run `cargo fmt` and `cargo clippy` before committing.
-- **TypeScript/React**: Use consistent formatting. Run `npm run lint` if available.
+- **TypeScript/React**: Use consistent formatting. Run `bun run lint` if available.
 - Keep changes focused -- one feature or fix per PR.
 
 ## Reporting Issues

@@ -34,7 +34,7 @@ _Coming soon_
 
 - macOS 12+
 - [Rust](https://rustup.rs/) (1.75+)
-- [Node.js](https://nodejs.org/) (20+)
+- [Bun](https://bun.sh/) (1.0+)
 - Telegram account
 
 ### Build from Source
@@ -45,7 +45,7 @@ git clone https://github.com/sskys18/telegram-korean-search.git
 cd telegram-korean-search
 
 # Install frontend dependencies
-npm install
+bun install
 
 # Run in development mode
 cargo tauri dev
