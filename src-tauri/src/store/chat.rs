@@ -1,4 +1,3 @@
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
 use super::Store;
@@ -14,97 +13,95 @@ pub struct ChatRow {
 }
 
 impl Store {
-    pub fn upsert_chat(&self, chat: &ChatRow) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
+    pub fn upsert_chat(&self, chat: &ChatRow) -> Result<(), sqlite::Error> {
+        let mut stmt = self.conn.prepare(
             "INSERT INTO chats (chat_id, title, chat_type, username, access_hash, is_excluded)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(chat_id) DO UPDATE SET
                 title = excluded.title,
                 chat_type = excluded.chat_type,
                 username = excluded.username,
                 access_hash = excluded.access_hash",
-            params![
-                chat.chat_id,
-                chat.title,
-                chat.chat_type,
-                chat.username,
-                chat.access_hash,
-                chat.is_excluded as i32,
-            ],
         )?;
+        stmt.bind((1, chat.chat_id))?;
+        stmt.bind((2, chat.title.as_str()))?;
+        stmt.bind((3, chat.chat_type.as_str()))?;
+        match &chat.username {
+            Some(u) => stmt.bind((4, u.as_str()))?,
+            None => stmt.bind((4, sqlite::Value::Null))?,
+        };
+        match chat.access_hash {
+            Some(h) => stmt.bind((5, h))?,
+            None => stmt.bind((5, sqlite::Value::Null))?,
+        };
+        stmt.bind((6, chat.is_excluded as i64))?;
+        stmt.next()?;
         Ok(())
     }
 
-    pub fn get_chat(&self, chat_id: i64) -> Result<Option<ChatRow>, rusqlite::Error> {
+    pub fn get_chat(&self, chat_id: i64) -> Result<Option<ChatRow>, sqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT chat_id, title, chat_type, username, access_hash, is_excluded
-             FROM chats WHERE chat_id = ?1",
+             FROM chats WHERE chat_id = ?",
         )?;
-        let mut rows = stmt.query_map(params![chat_id], |row| {
-            Ok(ChatRow {
-                chat_id: row.get(0)?,
-                title: row.get(1)?,
-                chat_type: row.get(2)?,
-                username: row.get(3)?,
-                access_hash: row.get(4)?,
-                is_excluded: row.get::<_, i32>(5)? != 0,
-            })
-        })?;
-        match rows.next() {
-            Some(Ok(chat)) => Ok(Some(chat)),
-            Some(Err(e)) => Err(e),
-            None => Ok(None),
+        stmt.bind((1, chat_id))?;
+        if let Ok(sqlite::State::Row) = stmt.next() {
+            Ok(Some(read_chat_row(&stmt)?))
+        } else {
+            Ok(None)
         }
     }
 
-    pub fn get_active_chats(&self) -> Result<Vec<ChatRow>, rusqlite::Error> {
+    pub fn get_active_chats(&self) -> Result<Vec<ChatRow>, sqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT chat_id, title, chat_type, username, access_hash, is_excluded
              FROM chats WHERE is_excluded = 0 ORDER BY title",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(ChatRow {
-                chat_id: row.get(0)?,
-                title: row.get(1)?,
-                chat_type: row.get(2)?,
-                username: row.get(3)?,
-                access_hash: row.get(4)?,
-                is_excluded: row.get::<_, i32>(5)? != 0,
-            })
-        })?;
-        rows.collect()
+        let mut results = Vec::new();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            results.push(read_chat_row(&stmt)?);
+        }
+        Ok(results)
     }
 
-    pub fn get_all_chats(&self) -> Result<Vec<ChatRow>, rusqlite::Error> {
+    pub fn get_all_chats(&self) -> Result<Vec<ChatRow>, sqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT chat_id, title, chat_type, username, access_hash, is_excluded
              FROM chats ORDER BY title",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(ChatRow {
-                chat_id: row.get(0)?,
-                title: row.get(1)?,
-                chat_type: row.get(2)?,
-                username: row.get(3)?,
-                access_hash: row.get(4)?,
-                is_excluded: row.get::<_, i32>(5)? != 0,
-            })
-        })?;
-        rows.collect()
+        let mut results = Vec::new();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            results.push(read_chat_row(&stmt)?);
+        }
+        Ok(results)
     }
 
-    pub fn set_chat_excluded(&self, chat_id: i64, excluded: bool) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "UPDATE chats SET is_excluded = ?1 WHERE chat_id = ?2",
-            params![excluded as i32, chat_id],
-        )?;
+    pub fn set_chat_excluded(&self, chat_id: i64, excluded: bool) -> Result<(), sqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("UPDATE chats SET is_excluded = ? WHERE chat_id = ?")?;
+        stmt.bind((1, excluded as i64))?;
+        stmt.bind((2, chat_id))?;
+        stmt.next()?;
         Ok(())
     }
 
-    pub fn chat_count(&self) -> Result<i64, rusqlite::Error> {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM chats", [], |row| row.get(0))
+    pub fn chat_count(&self) -> Result<i64, sqlite::Error> {
+        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM chats")?;
+        stmt.next()?;
+        stmt.read::<i64, _>(0)
     }
+}
+
+fn read_chat_row(stmt: &sqlite::Statement) -> Result<ChatRow, sqlite::Error> {
+    Ok(ChatRow {
+        chat_id: stmt.read::<i64, _>("chat_id")?,
+        title: stmt.read::<String, _>("title")?,
+        chat_type: stmt.read::<String, _>("chat_type")?,
+        username: stmt.read::<Option<String>, _>("username")?,
+        access_hash: stmt.read::<Option<i64>, _>("access_hash")?,
+        is_excluded: stmt.read::<i64, _>("is_excluded")? != 0,
+    })
 }
 
 #[cfg(test)]

@@ -1,32 +1,33 @@
-use rusqlite::params;
-
 use super::Store;
 
 impl Store {
-    pub fn get_meta(&self, key: &str) -> Result<Option<String>, rusqlite::Error> {
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, sqlite::Error> {
         let mut stmt = self
             .conn
-            .prepare("SELECT value FROM app_meta WHERE key = ?1")?;
-        let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
-        match rows.next() {
-            Some(Ok(value)) => Ok(Some(value)),
-            Some(Err(e)) => Err(e),
-            None => Ok(None),
+            .prepare("SELECT value FROM app_meta WHERE key = ?")?;
+        stmt.bind((1, key))?;
+        if let Ok(sqlite::State::Row) = stmt.next() {
+            Ok(Some(stmt.read::<String, _>(0)?))
+        } else {
+            Ok(None)
         }
     }
 
-    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "INSERT INTO app_meta (key, value) VALUES (?1, ?2)
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), sqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO app_meta (key, value) VALUES (?, ?)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
         )?;
+        stmt.bind((1, key))?;
+        stmt.bind((2, value))?;
+        stmt.next()?;
         Ok(())
     }
 
-    pub fn delete_meta(&self, key: &str) -> Result<(), rusqlite::Error> {
-        self.conn
-            .execute("DELETE FROM app_meta WHERE key = ?1", params![key])?;
+    pub fn delete_meta(&self, key: &str) -> Result<(), sqlite::Error> {
+        let mut stmt = self.conn.prepare("DELETE FROM app_meta WHERE key = ?")?;
+        stmt.bind((1, key))?;
+        stmt.next()?;
         Ok(())
     }
 }

@@ -1,23 +1,20 @@
-use rusqlite::params;
-
 use super::Store;
 
 impl Store {
-    pub fn insert_or_get_term(
-        &self,
-        term: &str,
-        source_type: &str,
-    ) -> Result<i64, rusqlite::Error> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO index_terms (term, source_type) VALUES (?1, ?2)",
-            params![term, source_type],
-        )?;
-        let term_id: i64 = self.conn.query_row(
-            "SELECT term_id FROM index_terms WHERE term = ?1",
-            params![term],
-            |row| row.get(0),
-        )?;
-        Ok(term_id)
+    pub fn insert_or_get_term(&self, term: &str, source_type: &str) -> Result<i64, sqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("INSERT OR IGNORE INTO index_terms (term, source_type) VALUES (?, ?)")?;
+        stmt.bind((1, term))?;
+        stmt.bind((2, source_type))?;
+        stmt.next()?;
+
+        let mut stmt2 = self
+            .conn
+            .prepare("SELECT term_id FROM index_terms WHERE term = ?")?;
+        stmt2.bind((1, term))?;
+        stmt2.next()?;
+        stmt2.read::<i64, _>(0)
     }
 
     pub fn insert_posting(
@@ -26,47 +23,62 @@ impl Store {
         chat_id: i64,
         message_id: i64,
         timestamp: i64,
-    ) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
+    ) -> Result<(), sqlite::Error> {
+        let mut stmt = self.conn.prepare(
             "INSERT OR IGNORE INTO postings (term_id, chat_id, message_id, timestamp)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![term_id, chat_id, message_id, timestamp],
+             VALUES (?, ?, ?, ?)",
         )?;
+        stmt.bind((1, term_id))?;
+        stmt.bind((2, chat_id))?;
+        stmt.bind((3, message_id))?;
+        stmt.bind((4, timestamp))?;
+        stmt.next()?;
         Ok(())
     }
 
-    pub fn get_term_ids(&self, term: &str) -> Result<Vec<i64>, rusqlite::Error> {
+    pub fn get_term_ids(&self, term: &str) -> Result<Vec<i64>, sqlite::Error> {
         let mut stmt = self
             .conn
-            .prepare("SELECT term_id FROM index_terms WHERE term = ?1")?;
-        let rows = stmt.query_map(params![term], |row| row.get(0))?;
-        rows.collect()
+            .prepare("SELECT term_id FROM index_terms WHERE term = ?")?;
+        stmt.bind((1, term))?;
+        let mut results = Vec::new();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            results.push(stmt.read::<i64, _>(0)?);
+        }
+        Ok(results)
     }
 
     pub fn get_term_ids_by_type(
         &self,
         term: &str,
         source_type: &str,
-    ) -> Result<Vec<i64>, rusqlite::Error> {
+    ) -> Result<Vec<i64>, sqlite::Error> {
         let mut stmt = self
             .conn
-            .prepare("SELECT term_id FROM index_terms WHERE term = ?1 AND source_type = ?2")?;
-        let rows = stmt.query_map(params![term, source_type], |row| row.get(0))?;
-        rows.collect()
+            .prepare("SELECT term_id FROM index_terms WHERE term = ? AND source_type = ?")?;
+        stmt.bind((1, term))?;
+        stmt.bind((2, source_type))?;
+        let mut results = Vec::new();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            results.push(stmt.read::<i64, _>(0)?);
+        }
+        Ok(results)
     }
 
-    pub fn term_count(&self) -> Result<i64, rusqlite::Error> {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM index_terms", [], |row| row.get(0))
+    pub fn term_count(&self) -> Result<i64, sqlite::Error> {
+        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM index_terms")?;
+        stmt.next()?;
+        stmt.read::<i64, _>(0)
     }
 
-    pub fn posting_count(&self) -> Result<i64, rusqlite::Error> {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM postings", [], |row| row.get(0))
+    pub fn posting_count(&self) -> Result<i64, sqlite::Error> {
+        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM postings")?;
+        stmt.next()?;
+        stmt.read::<i64, _>(0)
     }
 
-    pub fn clear_index(&self) -> Result<(), rusqlite::Error> {
-        self.conn.execute_batch(
+    pub fn clear_index(&self) -> Result<(), sqlite::Error> {
+        self.conn.execute(
             "DELETE FROM postings;
              DELETE FROM index_terms;",
         )?;
@@ -87,7 +99,7 @@ mod tests {
         let store = test_store();
         let id1 = store.insert_or_get_term("hello", "token").unwrap();
         let id2 = store.insert_or_get_term("hello", "token").unwrap();
-        assert_eq!(id1, id2); // same term returns same ID
+        assert_eq!(id1, id2);
 
         let id3 = store.insert_or_get_term("world", "ngram").unwrap();
         assert_ne!(id1, id3);
@@ -107,7 +119,6 @@ mod tests {
     #[test]
     fn test_insert_posting() {
         let store = test_store();
-        // Need a chat and message first
         use crate::store::chat::ChatRow;
         use crate::store::message::{strip_whitespace, MessageRow};
 

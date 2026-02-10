@@ -1,4 +1,3 @@
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
 use super::Store;
@@ -35,25 +34,25 @@ pub fn strip_whitespace(text: &str) -> String {
 }
 
 impl Store {
-    pub fn insert_messages_batch(&self, messages: &[MessageRow]) -> Result<(), rusqlite::Error> {
-        let tx = self.conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare_cached(
+    pub fn insert_messages_batch(&self, messages: &[MessageRow]) -> Result<(), sqlite::Error> {
+        self.conn.execute("BEGIN")?;
+        for msg in messages {
+            let mut stmt = self.conn.prepare(
                 "INSERT OR IGNORE INTO messages (message_id, chat_id, timestamp, text_plain, text_stripped, link)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 VALUES (?, ?, ?, ?, ?, ?)",
             )?;
-            for msg in messages {
-                stmt.execute(params![
-                    msg.message_id,
-                    msg.chat_id,
-                    msg.timestamp,
-                    msg.text_plain,
-                    msg.text_stripped,
-                    msg.link,
-                ])?;
-            }
+            stmt.bind((1, msg.message_id))?;
+            stmt.bind((2, msg.chat_id))?;
+            stmt.bind((3, msg.timestamp))?;
+            stmt.bind((4, msg.text_plain.as_str()))?;
+            stmt.bind((5, msg.text_stripped.as_str()))?;
+            match &msg.link {
+                Some(l) => stmt.bind((6, l.as_str()))?,
+                None => stmt.bind((6, sqlite::Value::Null))?,
+            };
+            stmt.next()?;
         }
-        tx.commit()?;
+        self.conn.execute("COMMIT")?;
         Ok(())
     }
 
@@ -61,25 +60,24 @@ impl Store {
         &self,
         chat_id: i64,
         message_id: i64,
-    ) -> Result<Option<MessageRow>, rusqlite::Error> {
+    ) -> Result<Option<MessageRow>, sqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT message_id, chat_id, timestamp, text_plain, text_stripped, link
-             FROM messages WHERE chat_id = ?1 AND message_id = ?2",
+             FROM messages WHERE chat_id = ? AND message_id = ?",
         )?;
-        let mut rows = stmt.query_map(params![chat_id, message_id], |row| {
-            Ok(MessageRow {
-                message_id: row.get(0)?,
-                chat_id: row.get(1)?,
-                timestamp: row.get(2)?,
-                text_plain: row.get(3)?,
-                text_stripped: row.get(4)?,
-                link: row.get(5)?,
-            })
-        })?;
-        match rows.next() {
-            Some(Ok(msg)) => Ok(Some(msg)),
-            Some(Err(e)) => Err(e),
-            None => Ok(None),
+        stmt.bind((1, chat_id))?;
+        stmt.bind((2, message_id))?;
+        if let Ok(sqlite::State::Row) = stmt.next() {
+            Ok(Some(MessageRow {
+                message_id: stmt.read::<i64, _>(0)?,
+                chat_id: stmt.read::<i64, _>(1)?,
+                timestamp: stmt.read::<i64, _>(2)?,
+                text_plain: stmt.read::<String, _>(3)?,
+                text_stripped: stmt.read::<String, _>(4)?,
+                link: stmt.read::<Option<String>, _>(5)?,
+            }))
+        } else {
+            Ok(None)
         }
     }
 
@@ -88,13 +86,13 @@ impl Store {
         term_ids: &[Vec<i64>],
         cursor: Option<&Cursor>,
         limit: usize,
-    ) -> Result<Vec<MessageWithChat>, rusqlite::Error> {
+    ) -> Result<Vec<MessageWithChat>, sqlite::Error> {
         if term_ids.is_empty() {
             return Ok(vec![]);
         }
 
         let mut subqueries = Vec::new();
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let mut all_ids: Vec<i64> = Vec::new();
 
         for ids in term_ids.iter() {
             if ids.is_empty() {
@@ -105,9 +103,7 @@ impl Store {
                 "SELECT DISTINCT chat_id, message_id FROM postings WHERE term_id IN ({})",
                 placeholders.join(", ")
             ));
-            for id in ids {
-                param_values.push(Box::new(*id));
-            }
+            all_ids.extend_from_slice(ids);
         }
 
         let intersection = if subqueries.len() == 1 {
@@ -139,37 +135,47 @@ impl Store {
             intersection, cursor_clause
         );
 
-        if let Some(c) = cursor {
-            param_values.push(Box::new(c.timestamp));
-            param_values.push(Box::new(c.timestamp));
-            param_values.push(Box::new(c.chat_id));
-            param_values.push(Box::new(c.timestamp));
-            param_values.push(Box::new(c.chat_id));
-            param_values.push(Box::new(c.message_id));
-        }
-        param_values.push(Box::new(limit as i64));
-
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
-
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_ref.as_slice(), |row| {
-            Ok(MessageWithChat {
-                message_id: row.get(0)?,
-                chat_id: row.get(1)?,
-                timestamp: row.get(2)?,
-                text_plain: row.get(3)?,
-                link: row.get(4)?,
-                chat_title: row.get(5)?,
-            })
-        })?;
+        let mut bind_idx = 1;
+        for id in &all_ids {
+            stmt.bind((bind_idx, *id))?;
+            bind_idx += 1;
+        }
+        if let Some(c) = cursor {
+            stmt.bind((bind_idx, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.chat_id))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.chat_id))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.message_id))?;
+            bind_idx += 1;
+        }
+        stmt.bind((bind_idx, limit as i64))?;
 
-        rows.collect()
+        let mut results = Vec::new();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            results.push(MessageWithChat {
+                message_id: stmt.read::<i64, _>(0)?,
+                chat_id: stmt.read::<i64, _>(1)?,
+                timestamp: stmt.read::<i64, _>(2)?,
+                text_plain: stmt.read::<String, _>(3)?,
+                link: stmt.read::<Option<String>, _>(4)?,
+                chat_title: stmt.read::<String, _>(5)?,
+            });
+        }
+
+        Ok(results)
     }
 
-    pub fn message_count(&self) -> Result<i64, rusqlite::Error> {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+    pub fn message_count(&self) -> Result<i64, sqlite::Error> {
+        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM messages")?;
+        stmt.next()?;
+        stmt.read::<i64, _>(0)
     }
 }
 
