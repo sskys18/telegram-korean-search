@@ -172,6 +172,93 @@ impl Store {
         Ok(results)
     }
 
+    pub fn search_messages_by_terms_in_chat(
+        &self,
+        term_ids: &[Vec<i64>],
+        chat_id: i64,
+        cursor: Option<&Cursor>,
+        limit: usize,
+    ) -> Result<Vec<MessageWithChat>, sqlite::Error> {
+        if term_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut subqueries = Vec::new();
+        let mut all_ids: Vec<i64> = Vec::new();
+
+        for ids in term_ids.iter() {
+            if ids.is_empty() {
+                return Ok(vec![]);
+            }
+            let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
+            subqueries.push(format!(
+                "SELECT DISTINCT chat_id, message_id FROM postings WHERE term_id IN ({})",
+                placeholders.join(", ")
+            ));
+            all_ids.extend_from_slice(ids);
+        }
+
+        let intersection = if subqueries.len() == 1 {
+            subqueries.into_iter().next().unwrap()
+        } else {
+            subqueries
+                .into_iter()
+                .reduce(|a, b| format!("{} INTERSECT {}", a, b))
+                .unwrap()
+        };
+
+        let cursor_clause = if cursor.is_some() {
+            "AND (m.timestamp < ?
+                  OR (m.timestamp = ? AND m.message_id > ?))"
+        } else {
+            ""
+        };
+
+        let sql = format!(
+            "SELECT m.message_id, m.chat_id, m.timestamp, m.text_plain, m.link, c.title
+             FROM ({}) AS matched
+             JOIN messages m ON matched.chat_id = m.chat_id AND matched.message_id = m.message_id
+             JOIN chats c ON m.chat_id = c.chat_id
+             WHERE m.chat_id = ? AND c.is_excluded = 0
+             {}
+             ORDER BY m.timestamp DESC, m.message_id ASC
+             LIMIT ?",
+            intersection, cursor_clause
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind_idx = 1;
+        for id in &all_ids {
+            stmt.bind((bind_idx, *id))?;
+            bind_idx += 1;
+        }
+        stmt.bind((bind_idx, chat_id))?;
+        bind_idx += 1;
+        if let Some(c) = cursor {
+            stmt.bind((bind_idx, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.message_id))?;
+            bind_idx += 1;
+        }
+        stmt.bind((bind_idx, limit as i64))?;
+
+        let mut results = Vec::new();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            results.push(MessageWithChat {
+                message_id: stmt.read::<i64, _>(0)?,
+                chat_id: stmt.read::<i64, _>(1)?,
+                timestamp: stmt.read::<i64, _>(2)?,
+                text_plain: stmt.read::<String, _>(3)?,
+                link: stmt.read::<Option<String>, _>(4)?,
+                chat_title: stmt.read::<String, _>(5)?,
+            });
+        }
+
+        Ok(results)
+    }
+
     pub fn message_count(&self) -> Result<i64, sqlite::Error> {
         let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM messages")?;
         stmt.next()?;
