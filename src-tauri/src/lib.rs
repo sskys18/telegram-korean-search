@@ -1,5 +1,7 @@
 pub mod collector;
+pub mod error;
 pub mod indexer;
+pub mod logging;
 pub mod search;
 pub mod security;
 pub mod store;
@@ -20,11 +22,6 @@ pub struct DbStats {
     pub messages: i64,
     pub terms: i64,
     pub postings: i64,
-}
-
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}!", name)
 }
 
 #[tauri::command]
@@ -72,11 +69,31 @@ fn get_chats(state: State<AppState>) -> Result<Vec<store::chat::ChatRow>, String
     store.get_all_chats().map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn set_chat_excluded(state: State<AppState>, chat_id: i64, excluded: bool) -> Result<(), String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .set_chat_excluded(chat_id, excluded)
+        .map_err(|e| e.to_string())
+}
+
 pub fn run() {
+    // Initialize logging
+    let log_dir = store::app_data_dir();
+    if let Err(e) = logging::init(&log_dir) {
+        eprintln!("Failed to initialize logging: {}", e);
+    }
+
+    log::info!(
+        "Starting telegram-korean-search v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+
     let db_path = store::default_db_path();
     let store = Store::open(&db_path).expect("failed to open database");
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             store: Mutex::new(store),
         })
@@ -109,10 +126,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            greet,
             get_db_stats,
             search_messages,
             get_chats,
+            set_chat_excluded,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

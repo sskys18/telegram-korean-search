@@ -1,3 +1,4 @@
+import { open } from "@tauri-apps/plugin-shell";
 import type { SearchItem } from "../types";
 import { applyHighlights } from "../utils/highlight";
 import { formatTimestamp } from "../utils/format";
@@ -11,7 +12,7 @@ export function ResultItem({ item }: ResultItemProps) {
 
   const handleClick = () => {
     if (item.link) {
-      window.open(item.link, "_blank");
+      open(item.link).catch((err) => console.error("Failed to open link:", err));
     }
   };
 
