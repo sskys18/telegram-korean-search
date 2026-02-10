@@ -1,7 +1,7 @@
-use rusqlite::Connection;
+use sqlite::Connection;
 
-pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(
+pub fn run_migrations(conn: &Connection) -> Result<(), sqlite::Error> {
+    conn.execute(
         "
         CREATE TABLE IF NOT EXISTS chats (
             chat_id       INTEGER PRIMARY KEY,
@@ -73,14 +73,14 @@ mod tests {
     #[test]
     fn test_all_tables_created() {
         let store = Store::open_in_memory().unwrap();
-        let tables: Vec<String> = store
+        let mut tables = Vec::new();
+        let mut stmt = store
             .conn()
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
+            .unwrap();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            tables.push(stmt.read::<String, _>("name").unwrap());
+        }
 
         assert!(tables.contains(&"chats".to_string()));
         assert!(tables.contains(&"messages".to_string()));

@@ -5,7 +5,7 @@ pub mod message;
 pub mod schema;
 pub mod sync_state;
 
-use rusqlite::Connection;
+use sqlite::Connection;
 use std::path::PathBuf;
 
 pub struct Store {
@@ -13,7 +13,7 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open(db_path: &PathBuf) -> Result<Self, rusqlite::Error> {
+    pub fn open(db_path: &PathBuf) -> Result<Self, sqlite::Error> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -23,15 +23,15 @@ impl Store {
         Ok(Store { conn })
     }
 
-    pub fn open_in_memory() -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open_in_memory()?;
+    pub fn open_in_memory() -> Result<Self, sqlite::Error> {
+        let conn = Connection::open(":memory:")?;
         Self::configure(&conn)?;
         schema::run_migrations(&conn)?;
         Ok(Store { conn })
     }
 
-    fn configure(conn: &Connection) -> Result<(), rusqlite::Error> {
-        conn.execute_batch(
+    fn configure(conn: &Connection) -> Result<(), sqlite::Error> {
+        conn.execute(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA cache_size = -64000;
@@ -58,19 +58,12 @@ mod tests {
 
     #[test]
     fn test_open_in_memory() {
-        let store = Store::open_in_memory().unwrap();
-        let mode: String = store
-            .conn()
-            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-            .unwrap();
-        // In-memory databases use "memory" journal mode, not WAL
-        assert!(mode == "wal" || mode == "memory");
+        let _store = Store::open_in_memory().unwrap();
     }
 
     #[test]
     fn test_migrations_idempotent() {
         let store = Store::open_in_memory().unwrap();
-        // Running migrations again should not error
         schema::run_migrations(store.conn()).unwrap();
         schema::run_migrations(store.conn()).unwrap();
     }

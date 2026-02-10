@@ -1,4 +1,3 @@
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
 use super::Store;
@@ -13,44 +12,47 @@ pub struct SyncStateRow {
 }
 
 impl Store {
-    pub fn get_sync_state(&self, chat_id: i64) -> Result<Option<SyncStateRow>, rusqlite::Error> {
+    pub fn get_sync_state(&self, chat_id: i64) -> Result<Option<SyncStateRow>, sqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT chat_id, last_message_id, oldest_message_id, initial_done, last_sync_at
-             FROM sync_state WHERE chat_id = ?1",
+             FROM sync_state WHERE chat_id = ?",
         )?;
-        let mut rows = stmt.query_map(params![chat_id], |row| {
-            Ok(SyncStateRow {
-                chat_id: row.get(0)?,
-                last_message_id: row.get(1)?,
-                oldest_message_id: row.get(2)?,
-                initial_done: row.get::<_, i32>(3)? != 0,
-                last_sync_at: row.get(4)?,
-            })
-        })?;
-        match rows.next() {
-            Some(Ok(state)) => Ok(Some(state)),
-            Some(Err(e)) => Err(e),
-            None => Ok(None),
+        stmt.bind((1, chat_id))?;
+        if let Ok(sqlite::State::Row) = stmt.next() {
+            Ok(Some(SyncStateRow {
+                chat_id: stmt.read::<i64, _>(0)?,
+                last_message_id: stmt.read::<i64, _>(1)?,
+                oldest_message_id: stmt.read::<Option<i64>, _>(2)?,
+                initial_done: stmt.read::<i64, _>(3)? != 0,
+                last_sync_at: stmt.read::<Option<String>, _>(4)?,
+            }))
+        } else {
+            Ok(None)
         }
     }
 
-    pub fn upsert_sync_state(&self, state: &SyncStateRow) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
+    pub fn upsert_sync_state(&self, state: &SyncStateRow) -> Result<(), sqlite::Error> {
+        let mut stmt = self.conn.prepare(
             "INSERT INTO sync_state (chat_id, last_message_id, oldest_message_id, initial_done, last_sync_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+             VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(chat_id) DO UPDATE SET
                 last_message_id = excluded.last_message_id,
                 oldest_message_id = excluded.oldest_message_id,
                 initial_done = excluded.initial_done,
                 last_sync_at = excluded.last_sync_at",
-            params![
-                state.chat_id,
-                state.last_message_id,
-                state.oldest_message_id,
-                state.initial_done as i32,
-                state.last_sync_at,
-            ],
         )?;
+        stmt.bind((1, state.chat_id))?;
+        stmt.bind((2, state.last_message_id))?;
+        match state.oldest_message_id {
+            Some(v) => stmt.bind((3, v))?,
+            None => stmt.bind((3, sqlite::Value::Null))?,
+        };
+        stmt.bind((4, state.initial_done as i64))?;
+        match &state.last_sync_at {
+            Some(v) => stmt.bind((5, v.as_str()))?,
+            None => stmt.bind((5, sqlite::Value::Null))?,
+        };
+        stmt.next()?;
         Ok(())
     }
 
@@ -59,11 +61,14 @@ impl Store {
         chat_id: i64,
         last_message_id: i64,
         last_sync_at: &str,
-    ) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "UPDATE sync_state SET last_message_id = ?1, last_sync_at = ?2 WHERE chat_id = ?3",
-            params![last_message_id, last_sync_at, chat_id],
+    ) -> Result<(), sqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "UPDATE sync_state SET last_message_id = ?, last_sync_at = ? WHERE chat_id = ?",
         )?;
+        stmt.bind((1, last_message_id))?;
+        stmt.bind((2, last_sync_at))?;
+        stmt.bind((3, chat_id))?;
+        stmt.next()?;
         Ok(())
     }
 
@@ -71,19 +76,22 @@ impl Store {
         &self,
         chat_id: i64,
         oldest_message_id: i64,
-    ) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "UPDATE sync_state SET oldest_message_id = ?1 WHERE chat_id = ?2",
-            params![oldest_message_id, chat_id],
-        )?;
+    ) -> Result<(), sqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("UPDATE sync_state SET oldest_message_id = ? WHERE chat_id = ?")?;
+        stmt.bind((1, oldest_message_id))?;
+        stmt.bind((2, chat_id))?;
+        stmt.next()?;
         Ok(())
     }
 
-    pub fn mark_initial_done(&self, chat_id: i64) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
-            "UPDATE sync_state SET initial_done = 1 WHERE chat_id = ?1",
-            params![chat_id],
-        )?;
+    pub fn mark_initial_done(&self, chat_id: i64) -> Result<(), sqlite::Error> {
+        let mut stmt = self
+            .conn
+            .prepare("UPDATE sync_state SET initial_done = 1 WHERE chat_id = ?")?;
+        stmt.bind((1, chat_id))?;
+        stmt.next()?;
         Ok(())
     }
 }

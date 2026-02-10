@@ -15,7 +15,7 @@ pub fn index_message(
     timestamp: i64,
     text: &str,
     text_stripped: &str,
-) -> Result<(), rusqlite::Error> {
+) -> Result<(), sqlite::Error> {
     if text.trim().is_empty() {
         return Ok(());
     }
@@ -56,7 +56,7 @@ pub fn index_message(
 pub fn index_batch(
     store: &Store,
     messages: &[(i64, i64, i64, &str, &str)],
-) -> Result<(), rusqlite::Error> {
+) -> Result<(), sqlite::Error> {
     for &(chat_id, message_id, timestamp, text, text_stripped) in messages {
         index_message(store, chat_id, message_id, timestamp, text, text_stripped)?;
     }
