@@ -1,3 +1,4 @@
+pub mod security;
 pub mod store;
 
 use serde::Serialize;
