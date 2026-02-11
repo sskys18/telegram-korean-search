@@ -167,3 +167,96 @@ body {
   border-radius: 2px;
   padding: 0 1px;
 }
+
+/* Login Page */
+.login-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  gap: 16px;
+  padding: 24px;
+}
+
+.login-page h2 {
+  font-size: 18px;
+  font-weight: 600;
+  color: #e0e0e0;
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  max-width: 320px;
+}
+
+.login-form input {
+  padding: 10px 14px;
+  border: 1px solid #444;
+  border-radius: 6px;
+  background: #2d2d2d;
+  color: #e0e0e0;
+  font-size: 14px;
+  outline: none;
+}
+
+.login-form input:focus {
+  border-color: #0078d4;
+}
+
+.login-form input::placeholder {
+  color: #888;
+}
+
+.login-form button {
+  padding: 10px;
+  border: none;
+  border-radius: 6px;
+  background: #0078d4;
+  color: #fff;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.login-form button:hover {
+  background: #1084d8;
+}
+
+.login-error {
+  color: #ff6b6b;
+  font-size: 13px;
+  max-width: 320px;
+  text-align: center;
+}
+
+.login-status {
+  color: #aaa;
+  font-size: 14px;
+}
+
+.login-detail {
+  color: #888;
+  font-size: 13px;
+  text-align: center;
+}
+
+.login-detail a {
+  color: #0078d4;
+  text-decoration: none;
+}
+
+.login-detail a:hover {
+  text-decoration: underline;
+}
+
+.login-spinner {
+  width: 24px;
+  height: 24px;
+  border: 3px solid #555;
+  border-top-color: #0078d4;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}

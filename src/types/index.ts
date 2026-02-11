@@ -46,3 +46,28 @@ export interface SearchQuery {
   cursor?: Cursor;
   limit?: number;
 }
+
+// Auth types
+
+export interface ApiCredentials {
+  api_id: number;
+  api_hash: string;
+}
+
+export interface ConnectResult {
+  authorized: boolean;
+}
+
+export interface SignInResponse {
+  success: boolean;
+  requires_2fa: boolean;
+  hint: string | null;
+}
+
+export interface CollectionProgress {
+  phase: "chats" | "messages";
+  chat_title?: string;
+  chats_done?: number;
+  chats_total?: number;
+  detail?: string;
+}

@@ -1,15 +1,16 @@
 use grammers_client::types::LoginToken;
 use grammers_client::{Client, SignInError};
 
-use super::{api_hash, CollectorError};
+use super::CollectorError;
 
 /// Request a login code for the given phone number.
 pub async fn request_login_code(
     client: &Client,
     phone: &str,
+    api_hash: &str,
 ) -> Result<LoginToken, CollectorError> {
     client
-        .request_login_code(phone, &api_hash())
+        .request_login_code(phone, api_hash)
         .await
         .map_err(|e| CollectorError::Auth(format!("failed to request login code: {}", e)))
 }

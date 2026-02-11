@@ -9,24 +9,6 @@ use grammers_client::Client;
 use grammers_mtsender::SenderPool;
 use grammers_session::storages::SqliteSession;
 
-/// Default Telegram API credentials (bundled).
-/// Can be overridden via TG_API_ID / TG_API_HASH environment variables.
-const DEFAULT_API_ID: i32 = 0; // Replace with real API ID before release
-const DEFAULT_API_HASH: &str = ""; // Replace with real API hash before release
-
-pub fn api_id() -> i32 {
-    std::env::var("TG_API_ID")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_API_ID)
-}
-
-pub fn api_hash() -> String {
-    std::env::var("TG_API_HASH")
-        .ok()
-        .unwrap_or_else(|| DEFAULT_API_HASH.to_string())
-}
-
 pub fn session_path() -> PathBuf {
     dirs::data_dir()
         .expect("could not determine data directory")
@@ -36,7 +18,7 @@ pub fn session_path() -> PathBuf {
 
 /// Create a connected Telegram client.
 /// Returns the client and a runner join handle. The runner must be kept alive.
-pub async fn connect() -> Result<(Client, tokio::task::JoinHandle<()>), CollectorError> {
+pub async fn connect(api_id: i32) -> Result<(Client, tokio::task::JoinHandle<()>), CollectorError> {
     let path = session_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(CollectorError::Io)?;
@@ -47,7 +29,7 @@ pub async fn connect() -> Result<(Client, tokio::task::JoinHandle<()>), Collecto
             .map_err(|e| CollectorError::Session(e.to_string()))?,
     );
 
-    let pool = SenderPool::new(Arc::clone(&session), api_id());
+    let pool = SenderPool::new(Arc::clone(&session), api_id);
     let client = Client::new(&pool);
 
     // Destructure to take ownership of the runner
