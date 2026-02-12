@@ -29,26 +29,17 @@ export function LoginPage({
   const [apiHash, setApiHash] = useState(savedApiHash);
   const [phone, setPhone] = useState("");
 
-  if (step === "loading" || step === "connecting" || step === "checked") {
+  if (step === "loading" || step === "connecting") {
     return (
       <div className="login-page">
         <div className="splash">
           <h1 className="splash-title">Telegram Search</h1>
           <p className="splash-subtitle">Korean message search</p>
           <div className="splash-status">
-            {step === "checked" ? (
-              <>
-                <div className="login-checkmark">&#10003;</div>
-                <p className="login-status">Authenticated</p>
-              </>
-            ) : (
-              <>
-                <div className="login-spinner" />
-                <p className="login-status">
-                  {step === "loading" ? "Loading..." : "Connecting..."}
-                </p>
-              </>
-            )}
+            <div className="login-spinner" />
+            <p className="login-status">
+              {step === "loading" ? "Loading..." : "Connecting..."}
+            </p>
           </div>
         </div>
       </div>

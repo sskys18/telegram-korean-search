@@ -17,7 +17,6 @@ export type AuthStep =
   | "loading"
   | "login"
   | "connecting"
-  | "checked"
   | "code"
   | "2fa"
   | "ready"
@@ -57,13 +56,10 @@ interface AuthState {
 function transitionToReady(
   setState: React.Dispatch<React.SetStateAction<AuthState>>,
 ) {
-  setState((s) => ({ ...s, step: "checked" }));
+  setState((s) => ({ ...s, step: "ready" }));
   startCollection().catch((err) =>
     console.error("Collection failed:", err),
   );
-  setTimeout(() => {
-    setState((s) => ({ ...s, step: "ready" }));
-  }, 800);
 }
 
 export function useAuth() {

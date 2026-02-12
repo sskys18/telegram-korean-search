@@ -256,9 +256,8 @@ pub async fn start_collection(app: AppHandle) -> Result<(), String> {
 }
 
 // Runs on a dedicated thread with a single-threaded tokio runtime.
-// The std::sync::MutexGuard<Store> is held across .await points, which is safe
-// because block_on runs everything on this single thread (no Send required).
-#[allow(clippy::await_holding_lock)]
+// The store lock is acquired only for brief DB writes, never during network I/O,
+// so other Tauri commands (search, get_chats) remain responsive.
 fn run_collection(app: AppHandle, client: grammers_client::Client) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -268,7 +267,7 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
     rt.block_on(async {
         let state = app.state::<AppState>();
 
-        // Phase 1: Fetch chats
+        // Phase 1: Fetch chats from network (no store lock needed)
         let _ = app.emit(
             "collection-progress",
             serde_json::json!({
@@ -277,9 +276,8 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
             }),
         );
 
-        let store = state.store.lock().unwrap();
-        let chat_count = match collector::messages::fetch_and_save_chats(&client, &store).await {
-            Ok(count) => count,
+        let chat_rows = match collector::messages::fetch_chats(&client).await {
+            Ok(rows) => rows,
             Err(e) => {
                 log::error!("Chat fetch failed: {}", e);
                 let _ = app.emit("collection-error", e.to_string());
@@ -287,8 +285,18 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
             }
         };
 
-        let chats = store.get_active_chats().unwrap_or_default();
-        drop(store);
+        // Brief lock: save chats and read active list
+        let (chats, chat_count) = {
+            let store = state.store.lock().unwrap();
+            for row in &chat_rows {
+                if let Err(e) = store.upsert_chat(row) {
+                    log::warn!("Failed to save chat {}: {}", row.title, e);
+                }
+            }
+            let active = store.get_active_chats().unwrap_or_default();
+            let count = chat_rows.len();
+            (active, count)
+        };
 
         // Phase 2: Fetch messages per chat (FTS5 indexing is automatic)
         for (i, chat) in chats.iter().enumerate() {
@@ -302,16 +310,21 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
                 }),
             );
 
-            let store = state.store.lock().unwrap();
-            match collector::messages::fetch_messages_for_chat(
-                &client, &store, chat, None,
-            )
-            .await
-            {
-                Ok(count) => log::info!("Fetched {} messages for {}", count, chat.title),
+            // Network I/O: no store lock held
+            match collector::messages::fetch_messages(&client, chat, None).await {
+                Ok(rows) => {
+                    let count = rows.len();
+                    if !rows.is_empty() {
+                        // Brief lock: save messages
+                        let store = state.store.lock().unwrap();
+                        if let Err(e) = store.insert_messages_batch(&rows) {
+                            log::warn!("Failed to save messages for {}: {}", chat.title, e);
+                        }
+                    }
+                    log::info!("Fetched {} messages for {}", count, chat.title);
+                }
                 Err(e) => log::warn!("Failed to fetch messages for {}: {}", chat.title, e),
             }
-            drop(store);
 
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         }
