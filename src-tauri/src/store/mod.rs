@@ -1,6 +1,5 @@
 pub mod app_meta;
 pub mod chat;
-pub mod index_store;
 pub mod message;
 pub mod schema;
 pub mod sync_state;
@@ -42,6 +41,14 @@ impl Store {
 
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    pub fn begin_transaction(&self) -> Result<(), sqlite::Error> {
+        self.conn.execute("BEGIN")
+    }
+
+    pub fn commit_transaction(&self) -> Result<(), sqlite::Error> {
+        self.conn.execute("COMMIT")
     }
 }
 

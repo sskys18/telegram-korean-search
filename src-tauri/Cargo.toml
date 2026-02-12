@@ -19,8 +19,6 @@ aes-gcm = "0.10"
 security-framework = "3"
 rand = "0.8"
 zeroize = "1"
-lindera = { version = "2", features = ["embed-ko-dic"] }
-unicode-segmentation = "1"
 grammers-client = "0.8"
 grammers-mtsender = "0.8"
 grammers-session = "0.8"

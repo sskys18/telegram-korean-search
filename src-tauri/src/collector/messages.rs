@@ -3,7 +3,6 @@ use grammers_client::Client;
 use grammers_session::defs::{PeerAuth, PeerId, PeerRef};
 
 use crate::collector::link::build_link;
-use crate::indexer;
 use crate::store::chat::ChatRow;
 use crate::store::message::{strip_whitespace, MessageRow};
 use crate::store::Store;
@@ -77,7 +76,7 @@ fn peer_ref_from_chat(chat: &ChatRow) -> PeerRef {
     }
 }
 
-/// Fetch messages from a single chat, save to store, and index them.
+/// Fetch messages from a single chat, save to store, and index via FTS5.
 /// Fetches from newest to oldest, stopping at `oldest_id` if provided.
 /// Returns the number of messages fetched.
 pub async fn fetch_messages_for_chat(
@@ -127,29 +126,10 @@ pub async fn fetch_messages_for_chat(
     }
 
     if !rows.is_empty() {
-        // Save messages
+        // Save messages (FTS5 indexing happens automatically inside insert_messages_batch)
         store
             .insert_messages_batch(&rows)
             .map_err(|e| CollectorError::Api(format!("message save error: {}", e)))?;
-
-        // Index messages
-        for row in &rows {
-            if let Err(e) = indexer::index_message(
-                store,
-                row.chat_id,
-                row.message_id,
-                row.timestamp,
-                &row.text_plain,
-                &row.text_stripped,
-            ) {
-                log::warn!(
-                    "Failed to index message {}/{}: {}",
-                    row.chat_id,
-                    row.message_id,
-                    e
-                );
-            }
-        }
     }
 
     Ok(fetched)
