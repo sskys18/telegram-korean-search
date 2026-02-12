@@ -88,9 +88,7 @@ fn migrate_to_fts5(conn: &Connection) -> Result<(), sqlite::Error> {
     conn.execute("DROP TABLE IF EXISTS index_terms")?;
 
     // Mark migration complete
-    conn.execute(
-        "INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '2')",
-    )?;
+    conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '2')")?;
 
     Ok(())
 }

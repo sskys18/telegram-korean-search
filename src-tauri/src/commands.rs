@@ -77,7 +77,7 @@ pub async fn connect_telegram(state: State<'_, AppState>) -> Result<ConnectResul
         let authenticated = store
             .get_meta("tg_authenticated")
             .map_err(|e| e.to_string())?
-            .map_or(false, |v| v == "1");
+            .is_some_and(|v| v == "1");
         (api_id, authenticated)
     };
 

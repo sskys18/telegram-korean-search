@@ -154,7 +154,11 @@ pub fn run() {
                 use tauri::Manager;
                 let handle = {
                     let state = app.state::<AppState>();
-                    state.runner_handle.try_lock().ok().and_then(|mut g| g.take())
+                    state
+                        .runner_handle
+                        .try_lock()
+                        .ok()
+                        .and_then(|mut g| g.take())
                 };
                 if let Some(h) = handle {
                     h.abort();

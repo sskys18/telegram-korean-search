@@ -129,7 +129,9 @@ pub async fn incremental_sync(
     store: &std::sync::Mutex<Store>,
 ) -> Result<usize, CollectorError> {
     let chats = {
-        let s = store.lock().map_err(|e| CollectorError::Api(e.to_string()))?;
+        let s = store
+            .lock()
+            .map_err(|e| CollectorError::Api(e.to_string()))?;
         s.get_active_chats()
             .map_err(|e| CollectorError::Api(format!("failed to get active chats: {}", e)))?
     };
@@ -138,7 +140,9 @@ pub async fn incremental_sync(
 
     for chat in &chats {
         let oldest_id = {
-            let s = store.lock().map_err(|e| CollectorError::Api(e.to_string()))?;
+            let s = store
+                .lock()
+                .map_err(|e| CollectorError::Api(e.to_string()))?;
             s.get_sync_state(chat.chat_id)
                 .map_err(|e| CollectorError::Api(e.to_string()))?
                 .map(|s| s.last_message_id)
@@ -148,7 +152,9 @@ pub async fn incremental_sync(
             Ok(rows) => {
                 let count = rows.len();
                 if !rows.is_empty() {
-                    let s = store.lock().map_err(|e| CollectorError::Api(e.to_string()))?;
+                    let s = store
+                        .lock()
+                        .map_err(|e| CollectorError::Api(e.to_string()))?;
                     s.insert_messages_batch(&rows)
                         .map_err(|e| CollectorError::Api(format!("message save error: {}", e)))?;
                 }

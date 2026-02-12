@@ -63,9 +63,9 @@ impl Store {
                 rowid_stmt.next()?;
                 let msg_rowid: i64 = rowid_stmt.read(0)?;
 
-                let mut fts_stmt = self.conn.prepare(
-                    "INSERT INTO messages_fts(rowid, text_plain) VALUES (?, ?)",
-                )?;
+                let mut fts_stmt = self
+                    .conn
+                    .prepare("INSERT INTO messages_fts(rowid, text_plain) VALUES (?, ?)")?;
                 fts_stmt.bind((1, msg_rowid))?;
                 fts_stmt.bind((2, msg.text_plain.as_str()))?;
                 fts_stmt.next()?;
