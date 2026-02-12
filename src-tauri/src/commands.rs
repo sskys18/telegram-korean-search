@@ -61,41 +61,86 @@ pub fn save_api_credentials(
 
 /// Connect to Telegram using saved credentials.
 /// Stores the client in AppState and checks if already authorized.
+/// If the session is stale (AUTH_KEY_UNREGISTERED), deletes it and reconnects fresh.
 #[tauri::command]
 pub async fn connect_telegram(state: State<'_, AppState>) -> Result<ConnectResult, String> {
-    // Read api_id from DB
-    let api_id = {
+    // Read api_id and auth flag from DB
+    let (api_id, was_authenticated) = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let id_str = store
             .get_meta("tg_api_id")
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "API credentials not configured".to_string())?;
-        id_str
+        let api_id = id_str
             .parse::<i32>()
-            .map_err(|_| "invalid api_id in database".to_string())?
+            .map_err(|_| "invalid api_id in database".to_string())?;
+        let authenticated = store
+            .get_meta("tg_authenticated")
+            .map_err(|e| e.to_string())?
+            .is_some_and(|v| v == "1");
+        (api_id, authenticated)
     };
 
+    let session_path = collector::session_path();
+
+    // Abort any existing runner before connecting
+    if let Some(old) = state.runner_handle.lock().await.take() {
+        old.abort();
+    }
+    // Clear the old client
+    *state.client.lock().await = None;
+
+    // Only try to reuse an existing session if login was previously completed.
+    // Otherwise, delete any leftover session file to avoid stale auth key issues.
+    if was_authenticated && session_path.exists() {
+        let (client, runner) = collector::connect(api_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let auth_check = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            collector::auth::is_authorized(&client),
+        )
+        .await;
+
+        match auth_check {
+            Ok(Ok(true)) => {
+                *state.client.lock().await = Some(client);
+                *state.runner_handle.lock().await = Some(runner);
+                return Ok(ConnectResult { authorized: true });
+            }
+            _ => {
+                // Session expired — clean up and reconnect fresh.
+                runner.abort();
+                let _ = std::fs::remove_file(&session_path);
+                // Clear the authenticated flag since session is no longer valid.
+                let store = state.store.lock().map_err(|e| e.to_string())?;
+                let _ = store.delete_meta("tg_authenticated");
+                log::info!("Session expired, reconnecting fresh");
+            }
+        }
+    } else if session_path.exists() {
+        // Session file exists but user never completed login — just delete it.
+        let _ = std::fs::remove_file(&session_path);
+    }
+
+    // Fresh connection
     let (client, runner) = collector::connect(api_id)
         .await
         .map_err(|e| e.to_string())?;
 
-    let authorized = collector::auth::is_authorized(&client)
-        .await
-        .unwrap_or(false);
-
-    // Store client and runner. If OnceCell already set, ignore (reconnect not supported).
-    let _ = state.client.set(client);
+    *state.client.lock().await = Some(client);
     *state.runner_handle.lock().await = Some(runner);
 
-    Ok(ConnectResult { authorized })
+    Ok(ConnectResult { authorized: false })
 }
 
 /// Request a login code for the given phone number.
 #[tauri::command]
 pub async fn request_login_code(state: State<'_, AppState>, phone: String) -> Result<(), String> {
-    let client = state
-        .client
-        .get()
+    let client_guard = state.client.lock().await;
+    let client = client_guard
+        .as_ref()
         .ok_or_else(|| "Client not connected".to_string())?;
 
     // Read api_hash from DB for the login code request
@@ -107,9 +152,13 @@ pub async fn request_login_code(state: State<'_, AppState>, phone: String) -> Re
             .ok_or_else(|| "API credentials not configured".to_string())?
     };
 
-    let token = collector::auth::request_login_code(client, &phone, &api_hash)
-        .await
-        .map_err(|e| e.to_string())?;
+    let token = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        collector::auth::request_login_code(client, &phone, &api_hash),
+    )
+    .await
+    .map_err(|_| "Connection timed out. Please try again.".to_string())?
+    .map_err(|e| e.to_string())?;
     *state.login_token.lock().await = Some(token);
     Ok(())
 }
@@ -120,9 +169,9 @@ pub async fn submit_login_code(
     state: State<'_, AppState>,
     code: String,
 ) -> Result<SignInResponse, String> {
-    let client = state
-        .client
-        .get()
+    let client_guard = state.client.lock().await;
+    let client = client_guard
+        .as_ref()
         .ok_or_else(|| "Client not connected".to_string())?;
 
     let token = state
@@ -137,11 +186,16 @@ pub async fn submit_login_code(
         .map_err(|e| e.to_string())?;
 
     match result {
-        collector::auth::SignInResult::Success => Ok(SignInResponse {
-            success: true,
-            requires_2fa: false,
-            hint: None,
-        }),
+        collector::auth::SignInResult::Success => {
+            // Mark as authenticated so we can reuse the session on next launch.
+            let store = state.store.lock().map_err(|e| e.to_string())?;
+            let _ = store.set_meta("tg_authenticated", "1");
+            Ok(SignInResponse {
+                success: true,
+                requires_2fa: false,
+                hint: None,
+            })
+        }
         collector::auth::SignInResult::TwoFactorRequired {
             password_token,
             hint,
@@ -159,9 +213,9 @@ pub async fn submit_login_code(
 /// Submit 2FA password.
 #[tauri::command]
 pub async fn submit_password(state: State<'_, AppState>, password: String) -> Result<(), String> {
-    let client = state
-        .client
-        .get()
+    let client_guard = state.client.lock().await;
+    let client = client_guard
+        .as_ref()
         .ok_or_else(|| "Client not connected".to_string())?;
 
     let token = state
@@ -173,7 +227,12 @@ pub async fn submit_password(state: State<'_, AppState>, password: String) -> Re
 
     collector::auth::check_password(client, *token, &password)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    // Mark as authenticated so we can reuse the session on next launch.
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let _ = store.set_meta("tg_authenticated", "1");
+    Ok(())
 }
 
 /// Start initial message collection in a background thread.
@@ -183,7 +242,9 @@ pub async fn start_collection(app: AppHandle) -> Result<(), String> {
     let client = app
         .state::<AppState>()
         .client
-        .get()
+        .lock()
+        .await
+        .as_ref()
         .ok_or_else(|| "Client not connected".to_string())?
         .clone();
 
@@ -195,9 +256,8 @@ pub async fn start_collection(app: AppHandle) -> Result<(), String> {
 }
 
 // Runs on a dedicated thread with a single-threaded tokio runtime.
-// The std::sync::MutexGuard<Store> is held across .await points, which is safe
-// because block_on runs everything on this single thread (no Send required).
-#[allow(clippy::await_holding_lock)]
+// The store lock is acquired only for brief DB writes, never during network I/O,
+// so other Tauri commands (search, get_chats) remain responsive.
 fn run_collection(app: AppHandle, client: grammers_client::Client) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -207,7 +267,7 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
     rt.block_on(async {
         let state = app.state::<AppState>();
 
-        // Phase 1: Fetch chats
+        // Phase 1: Fetch chats from network (no store lock needed)
         let _ = app.emit(
             "collection-progress",
             serde_json::json!({
@@ -216,9 +276,8 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
             }),
         );
 
-        let store = state.store.lock().unwrap();
-        let chat_count = match collector::messages::fetch_and_save_chats(&client, &store).await {
-            Ok(count) => count,
+        let chat_rows = match collector::messages::fetch_chats(&client).await {
+            Ok(rows) => rows,
             Err(e) => {
                 log::error!("Chat fetch failed: {}", e);
                 let _ = app.emit("collection-error", e.to_string());
@@ -226,10 +285,20 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
             }
         };
 
-        let chats = store.get_active_chats().unwrap_or_default();
-        drop(store);
+        // Brief lock: save chats and read active list
+        let (chats, chat_count) = {
+            let store = state.store.lock().unwrap();
+            for row in &chat_rows {
+                if let Err(e) = store.upsert_chat(row) {
+                    log::warn!("Failed to save chat {}: {}", row.title, e);
+                }
+            }
+            let active = store.get_active_chats().unwrap_or_default();
+            let count = chat_rows.len();
+            (active, count)
+        };
 
-        // Phase 2: Fetch messages per chat
+        // Phase 2: Fetch messages per chat (FTS5 indexing is automatic)
         for (i, chat) in chats.iter().enumerate() {
             let _ = app.emit(
                 "collection-progress",
@@ -241,12 +310,21 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
                 }),
             );
 
-            let store = state.store.lock().unwrap();
-            match collector::messages::fetch_messages_for_chat(&client, &store, chat, None).await {
-                Ok(count) => log::info!("Fetched {} messages for {}", count, chat.title),
+            // Network I/O: no store lock held
+            match collector::messages::fetch_messages(&client, chat, None).await {
+                Ok(rows) => {
+                    let count = rows.len();
+                    if !rows.is_empty() {
+                        // Brief lock: save messages
+                        let store = state.store.lock().unwrap();
+                        if let Err(e) = store.insert_messages_batch(&rows) {
+                            log::warn!("Failed to save messages for {}: {}", chat.title, e);
+                        }
+                    }
+                    log::info!("Fetched {} messages for {}", count, chat.title);
+                }
                 Err(e) => log::warn!("Failed to fetch messages for {}: {}", chat.title, e),
             }
-            drop(store);
 
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         }

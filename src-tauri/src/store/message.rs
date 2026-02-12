@@ -51,6 +51,25 @@ impl Store {
                 None => stmt.bind((6, sqlite::Value::Null))?,
             };
             stmt.next()?;
+
+            // Check if the row was actually inserted (not a duplicate)
+            let mut changes_stmt = self.conn.prepare("SELECT changes()")?;
+            changes_stmt.next()?;
+            let changes: i64 = changes_stmt.read(0)?;
+
+            if changes > 0 {
+                // New message — index in FTS5
+                let mut rowid_stmt = self.conn.prepare("SELECT last_insert_rowid()")?;
+                rowid_stmt.next()?;
+                let msg_rowid: i64 = rowid_stmt.read(0)?;
+
+                let mut fts_stmt = self
+                    .conn
+                    .prepare("INSERT INTO messages_fts(rowid, text_plain) VALUES (?, ?)")?;
+                fts_stmt.bind((1, msg_rowid))?;
+                fts_stmt.bind((2, msg.text_plain.as_str()))?;
+                fts_stmt.next()?;
+            }
         }
         self.conn.execute("COMMIT")?;
         Ok(())
@@ -81,39 +100,141 @@ impl Store {
         }
     }
 
-    pub fn search_messages_by_terms(
+    pub fn search_messages_fts(
         &self,
-        term_ids: &[Vec<i64>],
+        fts_query: &str,
         cursor: Option<&Cursor>,
         limit: usize,
     ) -> Result<Vec<MessageWithChat>, sqlite::Error> {
-        if term_ids.is_empty() {
+        let cursor_clause = if cursor.is_some() {
+            "AND (m.timestamp < ?
+                  OR (m.timestamp = ? AND m.chat_id > ?)
+                  OR (m.timestamp = ? AND m.chat_id = ? AND m.message_id > ?))"
+        } else {
+            ""
+        };
+
+        let sql = format!(
+            "SELECT m.message_id, m.chat_id, m.timestamp, m.text_plain, m.link, c.title
+             FROM messages m
+             JOIN chats c ON m.chat_id = c.chat_id
+             WHERE m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)
+             AND c.is_excluded = 0
+             {}
+             ORDER BY m.timestamp DESC, m.chat_id ASC, m.message_id ASC
+             LIMIT ?",
+            cursor_clause
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind_idx = 1;
+        stmt.bind((bind_idx, fts_query))?;
+        bind_idx += 1;
+        if let Some(c) = cursor {
+            stmt.bind((bind_idx, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.chat_id))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.chat_id))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.message_id))?;
+            bind_idx += 1;
+        }
+        stmt.bind((bind_idx, limit as i64))?;
+
+        let mut results = Vec::new();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            results.push(MessageWithChat {
+                message_id: stmt.read::<i64, _>(0)?,
+                chat_id: stmt.read::<i64, _>(1)?,
+                timestamp: stmt.read::<i64, _>(2)?,
+                text_plain: stmt.read::<String, _>(3)?,
+                link: stmt.read::<Option<String>, _>(4)?,
+                chat_title: stmt.read::<String, _>(5)?,
+            });
+        }
+
+        Ok(results)
+    }
+
+    pub fn search_messages_fts_in_chat(
+        &self,
+        fts_query: &str,
+        chat_id: i64,
+        cursor: Option<&Cursor>,
+        limit: usize,
+    ) -> Result<Vec<MessageWithChat>, sqlite::Error> {
+        let cursor_clause = if cursor.is_some() {
+            "AND (m.timestamp < ?
+                  OR (m.timestamp = ? AND m.message_id > ?))"
+        } else {
+            ""
+        };
+
+        let sql = format!(
+            "SELECT m.message_id, m.chat_id, m.timestamp, m.text_plain, m.link, c.title
+             FROM messages m
+             JOIN chats c ON m.chat_id = c.chat_id
+             WHERE m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)
+             AND m.chat_id = ? AND c.is_excluded = 0
+             {}
+             ORDER BY m.timestamp DESC, m.message_id ASC
+             LIMIT ?",
+            cursor_clause
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind_idx = 1;
+        stmt.bind((bind_idx, fts_query))?;
+        bind_idx += 1;
+        stmt.bind((bind_idx, chat_id))?;
+        bind_idx += 1;
+        if let Some(c) = cursor {
+            stmt.bind((bind_idx, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.message_id))?;
+            bind_idx += 1;
+        }
+        stmt.bind((bind_idx, limit as i64))?;
+
+        let mut results = Vec::new();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            results.push(MessageWithChat {
+                message_id: stmt.read::<i64, _>(0)?,
+                chat_id: stmt.read::<i64, _>(1)?,
+                timestamp: stmt.read::<i64, _>(2)?,
+                text_plain: stmt.read::<String, _>(3)?,
+                link: stmt.read::<Option<String>, _>(4)?,
+                chat_title: stmt.read::<String, _>(5)?,
+            });
+        }
+
+        Ok(results)
+    }
+
+    /// LIKE-based search fallback for queries with terms shorter than 3 chars
+    /// (FTS5 trigram needs >= 3 chars to produce trigrams).
+    pub fn search_messages_like(
+        &self,
+        terms: &[String],
+        cursor: Option<&Cursor>,
+        limit: usize,
+    ) -> Result<Vec<MessageWithChat>, sqlite::Error> {
+        if terms.is_empty() {
             return Ok(vec![]);
         }
 
-        let mut subqueries = Vec::new();
-        let mut all_ids: Vec<i64> = Vec::new();
-
-        for ids in term_ids.iter() {
-            if ids.is_empty() {
-                return Ok(vec![]);
-            }
-            let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
-            subqueries.push(format!(
-                "SELECT DISTINCT chat_id, message_id FROM postings WHERE term_id IN ({})",
-                placeholders.join(", ")
-            ));
-            all_ids.extend_from_slice(ids);
-        }
-
-        let intersection = if subqueries.len() == 1 {
-            subqueries.into_iter().next().unwrap()
-        } else {
-            subqueries
-                .into_iter()
-                .reduce(|a, b| format!("{} INTERSECT {}", a, b))
-                .unwrap()
-        };
+        let like_clauses: Vec<String> = terms
+            .iter()
+            .map(|_| "m.text_plain LIKE '%' || ? || '%'".to_string())
+            .collect();
+        let like_where = like_clauses.join(" AND ");
 
         let cursor_clause = if cursor.is_some() {
             "AND (m.timestamp < ?
@@ -125,20 +246,19 @@ impl Store {
 
         let sql = format!(
             "SELECT m.message_id, m.chat_id, m.timestamp, m.text_plain, m.link, c.title
-             FROM ({}) AS matched
-             JOIN messages m ON matched.chat_id = m.chat_id AND matched.message_id = m.message_id
+             FROM messages m
              JOIN chats c ON m.chat_id = c.chat_id
-             WHERE c.is_excluded = 0
+             WHERE {} AND c.is_excluded = 0
              {}
              ORDER BY m.timestamp DESC, m.chat_id ASC, m.message_id ASC
              LIMIT ?",
-            intersection, cursor_clause
+            like_where, cursor_clause
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
         let mut bind_idx = 1;
-        for id in &all_ids {
-            stmt.bind((bind_idx, *id))?;
+        for term in terms {
+            stmt.bind((bind_idx, term.as_str()))?;
             bind_idx += 1;
         }
         if let Some(c) = cursor {
@@ -172,40 +292,22 @@ impl Store {
         Ok(results)
     }
 
-    pub fn search_messages_by_terms_in_chat(
+    pub fn search_messages_like_in_chat(
         &self,
-        term_ids: &[Vec<i64>],
+        terms: &[String],
         chat_id: i64,
         cursor: Option<&Cursor>,
         limit: usize,
     ) -> Result<Vec<MessageWithChat>, sqlite::Error> {
-        if term_ids.is_empty() {
+        if terms.is_empty() {
             return Ok(vec![]);
         }
 
-        let mut subqueries = Vec::new();
-        let mut all_ids: Vec<i64> = Vec::new();
-
-        for ids in term_ids.iter() {
-            if ids.is_empty() {
-                return Ok(vec![]);
-            }
-            let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
-            subqueries.push(format!(
-                "SELECT DISTINCT chat_id, message_id FROM postings WHERE term_id IN ({})",
-                placeholders.join(", ")
-            ));
-            all_ids.extend_from_slice(ids);
-        }
-
-        let intersection = if subqueries.len() == 1 {
-            subqueries.into_iter().next().unwrap()
-        } else {
-            subqueries
-                .into_iter()
-                .reduce(|a, b| format!("{} INTERSECT {}", a, b))
-                .unwrap()
-        };
+        let like_clauses: Vec<String> = terms
+            .iter()
+            .map(|_| "m.text_plain LIKE '%' || ? || '%'".to_string())
+            .collect();
+        let like_where = like_clauses.join(" AND ");
 
         let cursor_clause = if cursor.is_some() {
             "AND (m.timestamp < ?
@@ -216,20 +318,19 @@ impl Store {
 
         let sql = format!(
             "SELECT m.message_id, m.chat_id, m.timestamp, m.text_plain, m.link, c.title
-             FROM ({}) AS matched
-             JOIN messages m ON matched.chat_id = m.chat_id AND matched.message_id = m.message_id
+             FROM messages m
              JOIN chats c ON m.chat_id = c.chat_id
-             WHERE m.chat_id = ? AND c.is_excluded = 0
+             WHERE {} AND m.chat_id = ? AND c.is_excluded = 0
              {}
              ORDER BY m.timestamp DESC, m.message_id ASC
              LIMIT ?",
-            intersection, cursor_clause
+            like_where, cursor_clause
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
         let mut bind_idx = 1;
-        for id in &all_ids {
-            stmt.bind((bind_idx, *id))?;
+        for term in terms {
+            stmt.bind((bind_idx, term.as_str()))?;
             bind_idx += 1;
         }
         stmt.bind((bind_idx, chat_id))?;
@@ -333,6 +434,63 @@ mod tests {
         store.insert_messages_batch(&[msg.clone()]).unwrap();
         store.insert_messages_batch(&[msg]).unwrap();
         assert_eq!(store.message_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_fts_search_long_query() {
+        let store = test_store();
+        setup_chat(&store, 1);
+
+        store
+            .insert_messages_batch(&[
+                make_message(1, 1, 1000, "삼성전자 주가가 상승했다"),
+                make_message(1, 2, 1001, "오늘 날씨가 좋습니다"),
+            ])
+            .unwrap();
+
+        // FTS5 trigram needs >= 3 chars
+        let results = store.search_messages_fts("\"삼성전\"", None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message_id, 1);
+    }
+
+    #[test]
+    fn test_like_search_short_query() {
+        let store = test_store();
+        setup_chat(&store, 1);
+
+        store
+            .insert_messages_batch(&[
+                make_message(1, 1, 1000, "삼성전자 주가가 상승했다"),
+                make_message(1, 2, 1001, "오늘 날씨가 좋습니다"),
+            ])
+            .unwrap();
+
+        // LIKE fallback for < 3 char queries
+        let terms = vec!["삼성".to_string()];
+        let results = store.search_messages_like(&terms, None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message_id, 1);
+    }
+
+    #[test]
+    fn test_fts_search_in_chat() {
+        let store = test_store();
+        setup_chat(&store, 1);
+        setup_chat(&store, 2);
+
+        store
+            .insert_messages_batch(&[
+                make_message(1, 1, 1000, "hello from chat 1"),
+                make_message(2, 1, 1001, "hello from chat 2"),
+            ])
+            .unwrap();
+
+        let results = store
+            .search_messages_fts_in_chat("\"hello\"", 1, None, 10)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chat_id, 1);
     }
 
     #[test]

@@ -36,8 +36,6 @@ export interface ChatRow {
 export interface DbStats {
   chats: number;
   messages: number;
-  terms: number;
-  postings: number;
 }
 
 export interface SearchQuery {

@@ -9,14 +9,17 @@ function App() {
     error,
     hint2fa,
     progress,
-    sendCredentials,
-    sendPhone,
+    syncing,
+    savedApiId,
+    savedApiHash,
+    sendLogin,
     sendCode,
     sendPassword,
+    goBack,
   } = useAuth();
 
   if (step === "ready") {
-    return <SearchPage />;
+    return <SearchPage syncing={syncing} progress={progress} />;
   }
 
   return (
@@ -24,11 +27,12 @@ function App() {
       step={step}
       error={error}
       hint2fa={hint2fa}
-      progress={progress}
-      onCredentials={sendCredentials}
-      onPhone={sendPhone}
+      savedApiId={savedApiId}
+      savedApiHash={savedApiHash}
+      onLogin={sendLogin}
       onCode={sendCode}
       onPassword={sendPassword}
+      onBack={goBack}
     />
   );
 }

@@ -1,7 +1,6 @@
 pub mod collector;
 pub mod commands;
 pub mod error;
-pub mod indexer;
 pub mod logging;
 pub mod search;
 pub mod security;
@@ -18,7 +17,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 pub struct AppState {
     pub store: Mutex<Store>,
-    pub client: tokio::sync::OnceCell<Client>,
+    pub client: TokioMutex<Option<Client>>,
     pub login_token: TokioMutex<Option<LoginToken>>,
     pub password_token: TokioMutex<Option<Box<grammers_client::types::PasswordToken>>>,
     pub runner_handle: TokioMutex<Option<tokio::task::JoinHandle<()>>>,
@@ -28,8 +27,6 @@ pub struct AppState {
 pub struct DbStats {
     pub chats: i64,
     pub messages: i64,
-    pub terms: i64,
-    pub postings: i64,
 }
 
 #[tauri::command]
@@ -38,8 +35,6 @@ fn get_db_stats(state: State<AppState>) -> Result<DbStats, String> {
     Ok(DbStats {
         chats: store.chat_count().map_err(|e| e.to_string())?,
         messages: store.message_count().map_err(|e| e.to_string())?,
-        terms: store.term_count().map_err(|e| e.to_string())?,
-        postings: store.posting_count().map_err(|e| e.to_string())?,
     })
 }
 
@@ -104,7 +99,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             store: Mutex::new(store),
-            client: tokio::sync::OnceCell::new(),
+            client: TokioMutex::new(None),
             login_token: TokioMutex::new(None),
             password_token: TokioMutex::new(None),
             runner_handle: TokioMutex::new(None),
@@ -150,6 +145,25 @@ pub fn run() {
             commands::submit_password,
             commands::start_collection,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Gracefully shut down the Telegram runner on app exit
+                // to prevent stale session files.
+                use tauri::Manager;
+                let handle = {
+                    let state = app.state::<AppState>();
+                    state
+                        .runner_handle
+                        .try_lock()
+                        .ok()
+                        .and_then(|mut g| g.take())
+                };
+                if let Some(h) = handle {
+                    h.abort();
+                    log::info!("Telegram runner stopped on exit");
+                }
+            }
+        });
 }

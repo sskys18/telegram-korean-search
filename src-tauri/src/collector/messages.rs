@@ -3,7 +3,6 @@ use grammers_client::Client;
 use grammers_session::defs::{PeerAuth, PeerId, PeerRef};
 
 use crate::collector::link::build_link;
-use crate::indexer;
 use crate::store::chat::ChatRow;
 use crate::store::message::{strip_whitespace, MessageRow};
 use crate::store::Store;
@@ -13,11 +12,11 @@ use super::CollectorError;
 const BATCH_SIZE: usize = 100;
 const INTER_CHAT_DELAY_MS: u64 = 400;
 
-/// Fetch all dialogs (groups, supergroups, channels) and save to store.
-/// Returns the number of chats saved.
-pub async fn fetch_and_save_chats(client: &Client, store: &Store) -> Result<usize, CollectorError> {
+/// Fetch all dialogs (groups, supergroups, channels) from Telegram.
+/// Returns the chat rows without saving to the database.
+pub async fn fetch_chats(client: &Client) -> Result<Vec<ChatRow>, CollectorError> {
     let mut dialogs = client.iter_dialogs();
-    let mut count = 0;
+    let mut rows = Vec::new();
 
     while let Some(dialog) = dialogs
         .next()
@@ -39,22 +38,17 @@ pub async fn fetch_and_save_chats(client: &Client, store: &Store) -> Result<usiz
             }
         };
 
-        let row = ChatRow {
+        rows.push(ChatRow {
             chat_id,
             title: peer.name().unwrap_or("").to_string(),
             chat_type: chat_type.to_string(),
             username: peer.username().map(|u| u.to_string()),
             access_hash,
             is_excluded: false,
-        };
-
-        store
-            .upsert_chat(&row)
-            .map_err(|e| CollectorError::Api(format!("failed to save chat: {}", e)))?;
-        count += 1;
+        });
     }
 
-    Ok(count)
+    Ok(rows)
 }
 
 /// Build a PeerRef from stored chat data so we can call iter_messages.
@@ -77,15 +71,14 @@ fn peer_ref_from_chat(chat: &ChatRow) -> PeerRef {
     }
 }
 
-/// Fetch messages from a single chat, save to store, and index them.
+/// Fetch messages from a single chat over the network.
+/// Returns the rows without saving to the database.
 /// Fetches from newest to oldest, stopping at `oldest_id` if provided.
-/// Returns the number of messages fetched.
-pub async fn fetch_messages_for_chat(
+pub async fn fetch_messages(
     client: &Client,
-    store: &Store,
     chat: &ChatRow,
     oldest_id: Option<i64>,
-) -> Result<usize, CollectorError> {
+) -> Result<Vec<MessageRow>, CollectorError> {
     let peer_ref = peer_ref_from_chat(chat);
 
     let mut iter = client.iter_messages(peer_ref);
@@ -126,59 +119,50 @@ pub async fn fetch_messages_for_chat(
         }
     }
 
-    if !rows.is_empty() {
-        // Save messages
-        store
-            .insert_messages_batch(&rows)
-            .map_err(|e| CollectorError::Api(format!("message save error: {}", e)))?;
-
-        // Index messages
-        for row in &rows {
-            if let Err(e) = indexer::index_message(
-                store,
-                row.chat_id,
-                row.message_id,
-                row.timestamp,
-                &row.text_plain,
-                &row.text_stripped,
-            ) {
-                log::warn!(
-                    "Failed to index message {}/{}: {}",
-                    row.chat_id,
-                    row.message_id,
-                    e
-                );
-            }
-        }
-    }
-
-    Ok(fetched)
+    Ok(rows)
 }
 
 /// Run incremental sync for all active chats.
 /// Fetches new messages since last sync for each chat.
-pub async fn incremental_sync(client: &Client, store: &Store) -> Result<usize, CollectorError> {
-    let chats = store
-        .get_active_chats()
-        .map_err(|e| CollectorError::Api(format!("failed to get active chats: {}", e)))?;
+pub async fn incremental_sync(
+    client: &Client,
+    store: &std::sync::Mutex<Store>,
+) -> Result<usize, CollectorError> {
+    let chats = {
+        let s = store
+            .lock()
+            .map_err(|e| CollectorError::Api(e.to_string()))?;
+        s.get_active_chats()
+            .map_err(|e| CollectorError::Api(format!("failed to get active chats: {}", e)))?
+    };
 
     let mut total = 0;
 
     for chat in &chats {
-        let sync_state = store
-            .get_sync_state(chat.chat_id)
-            .map_err(|e| CollectorError::Api(e.to_string()))?;
+        let oldest_id = {
+            let s = store
+                .lock()
+                .map_err(|e| CollectorError::Api(e.to_string()))?;
+            s.get_sync_state(chat.chat_id)
+                .map_err(|e| CollectorError::Api(e.to_string()))?
+                .map(|s| s.last_message_id)
+        };
 
-        let oldest_id = sync_state.as_ref().map(|s| s.last_message_id);
-
-        match fetch_messages_for_chat(client, store, chat, oldest_id).await {
-            Ok(count) => {
+        match fetch_messages(client, chat, oldest_id).await {
+            Ok(rows) => {
+                let count = rows.len();
+                if !rows.is_empty() {
+                    let s = store
+                        .lock()
+                        .map_err(|e| CollectorError::Api(e.to_string()))?;
+                    s.insert_messages_batch(&rows)
+                        .map_err(|e| CollectorError::Api(format!("message save error: {}", e)))?;
+                }
                 total += count;
                 log::info!("Synced {} messages for chat {}", count, chat.title);
             }
             Err(e) => {
                 log::warn!("Failed to sync chat {}: {}", chat.title, e);
-                // Continue with next chat
             }
         }
 

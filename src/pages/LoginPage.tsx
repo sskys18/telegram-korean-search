@@ -1,55 +1,47 @@
 import { useState } from "react";
 import type { AuthStep } from "../hooks/useAuth";
-import type { CollectionProgress } from "../types";
 
 interface LoginPageProps {
   step: AuthStep;
   error: string | null;
   hint2fa: string | null;
-  progress: CollectionProgress | null;
-  onCredentials: (apiId: number, apiHash: string) => void;
-  onPhone: (phone: string) => void;
+  savedApiId: string;
+  savedApiHash: string;
+  onLogin: (apiId: number, apiHash: string, phone: string) => void;
   onCode: (code: string) => void;
   onPassword: (password: string) => void;
+  onBack: () => void;
 }
 
 export function LoginPage({
   step,
   error,
   hint2fa,
-  progress,
-  onCredentials,
-  onPhone,
+  savedApiId,
+  savedApiHash,
+  onLogin,
   onCode,
   onPassword,
+  onBack,
 }: LoginPageProps) {
   const [input, setInput] = useState("");
-  const [apiId, setApiId] = useState("");
-  const [apiHash, setApiHash] = useState("");
+  const [apiId, setApiId] = useState(savedApiId);
+  const [apiHash, setApiHash] = useState(savedApiHash);
+  const [phone, setPhone] = useState("");
 
   if (step === "loading" || step === "connecting") {
     return (
       <div className="login-page">
-        <div className="login-spinner" />
-        <p className="login-status">
-          {step === "loading" ? "Loading..." : "Connecting to Telegram..."}
-        </p>
-      </div>
-    );
-  }
-
-  if (step === "collecting") {
-    return (
-      <div className="login-page">
-        <div className="login-spinner" />
-        <p className="login-status">Syncing messages...</p>
-        {progress && (
-          <p className="login-detail">
-            {progress.phase === "chats"
-              ? progress.detail
-              : `${progress.chat_title} (${(progress.chats_done ?? 0) + 1}/${progress.chats_total})`}
-          </p>
-        )}
+        <div className="splash">
+          <h1 className="splash-title">Telegram Search</h1>
+          <p className="splash-subtitle">Korean message search</p>
+          <div className="splash-status">
+            <div className="login-spinner" />
+            <p className="login-status">
+              {step === "loading" ? "Loading..." : "Connecting..."}
+            </p>
+          </div>
+        </div>
       </div>
     );
   }
@@ -58,23 +50,26 @@ export function LoginPage({
     return (
       <div className="login-page">
         <p className="login-error">{error}</p>
+        <button className="login-back" onClick={onBack}>
+          Back
+        </button>
       </div>
     );
   }
 
-  if (step === "setup") {
-    const handleSetup = (e: React.FormEvent) => {
+  if (step === "login") {
+    const handleLogin = (e: React.FormEvent) => {
       e.preventDefault();
       const id = parseInt(apiId, 10);
-      if (isNaN(id) || !apiHash.trim()) return;
-      onCredentials(id, apiHash.trim());
+      if (isNaN(id) || !apiHash.trim() || !phone.trim()) return;
+      onLogin(id, apiHash.trim(), phone.trim());
     };
 
     return (
       <div className="login-page">
-        <h2>Telegram API Setup</h2>
+        <h2>Telegram Login</h2>
         <p className="login-detail">
-          Get your API credentials from{" "}
+          Get API credentials from{" "}
           <a
             href="https://my.telegram.org"
             target="_blank"
@@ -84,39 +79,46 @@ export function LoginPage({
           </a>
         </p>
         {error && <p className="login-error">{error}</p>}
-        <form onSubmit={handleSetup} className="login-form">
+        <form onSubmit={handleLogin} className="login-form">
+          <label className="login-label">API ID</label>
           <input
             type="text"
             value={apiId}
             onChange={(e) => setApiId(e.target.value)}
-            placeholder="API ID"
+            placeholder="e.g. 12345678"
             autoFocus
           />
+          <label className="login-label">API Hash</label>
           <input
             type="text"
             value={apiHash}
             onChange={(e) => setApiHash(e.target.value)}
-            placeholder="API Hash"
+            placeholder="e.g. a1b2c3d4e5f6..."
           />
-          <button type="submit">Continue</button>
+          <label className="login-label">Phone Number</label>
+          <input
+            type="text"
+            value={phone}
+            onChange={(e) => setPhone(e.target.value)}
+            placeholder="+82 10 1234 5678"
+          />
+          <button type="submit">Send Code</button>
         </form>
       </div>
     );
   }
 
-  // phone, code, 2fa steps
+  // code, 2fa steps
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const val = input.trim();
     if (!val) return;
-    if (step === "phone") onPhone(val);
-    else if (step === "code") onCode(val);
+    if (step === "code") onCode(val);
     else if (step === "2fa") onPassword(val);
     setInput("");
   };
 
   const labels: Record<string, { title: string; placeholder: string }> = {
-    phone: { title: "Enter Phone Number", placeholder: "+82 10 1234 5678" },
     code: { title: "Enter Verification Code", placeholder: "12345" },
     "2fa": {
       title: "Enter 2FA Password",
@@ -124,7 +126,7 @@ export function LoginPage({
     },
   };
 
-  const { title, placeholder } = labels[step] ?? labels.phone;
+  const { title, placeholder } = labels[step] ?? labels.code;
 
   return (
     <div className="login-page">
@@ -140,6 +142,9 @@ export function LoginPage({
         />
         <button type="submit">Continue</button>
       </form>
+      <button className="login-back" onClick={onBack}>
+        Back
+      </button>
     </div>
   );
 }
