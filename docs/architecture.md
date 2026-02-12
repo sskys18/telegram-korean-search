@@ -1,8 +1,8 @@
 # telegram-korean-search — Architecture Design Document
 
 > Local-first Telegram Korean/English search system
-> Version: 1.0 Draft
-> Date: 2025-02-10
+> Version: 2.0
+> Date: 2026-02-12
 
 ---
 
@@ -31,7 +31,7 @@ telegram-korean-search is a local-only search tool for Telegram messages that su
 │                                                          │
 │  ┌────────────┐    ┌────────────┐    ┌────────────┐      │
 │  │  Tauri UI   │◄──►│  Core Engine │◄──►│  SQLite DB  │  │
-│  │ (WebView)  │    │   (Rust)   │    │            │      │
+│  │ (WebView)  │    │   (Rust)   │    │  + FTS5    │      │
 │  └────────────┘    └─────┬──────┘    └────────────┘      │
 │                          │                               │
 │                    ┌─────▼──────┐                         │
@@ -52,11 +52,11 @@ telegram-korean-search is a local-only search tool for Telegram messages that su
 
 | Module | Role | Technology |
 |--------|------|------------|
-| **UI Layer** | Search panel, settings screen, login flow | Tauri + HTML/CSS/JS (or TS) |
-| **Core Engine** | Search, indexing, sync orchestration | Rust |
+| **UI Layer** | Search panel, login flow | Tauri v2 + React + TypeScript |
+| **Core Engine** | Search, sync orchestration | Rust |
 | **Collector** | Telegram message collection (MTProto) | Rust + grammers |
-| **Indexer** | Tokenization, n-gram generation, inverted index construction | Rust |
-| **Store** | Data storage/retrieval | SQLite (rusqlite) |
+| **Search** | FTS5 trigram full-text search with LIKE fallback | SQLite FTS5 |
+| **Store** | Data storage/retrieval | SQLite (`sqlite` crate) |
 | **Linker** | Search result -> Telegram deep link generation | Rust |
 
 ### 2.3 Data Flow
@@ -65,13 +65,10 @@ telegram-korean-search is a local-only search tool for Telegram messages that su
 [Telegram Servers]
        │ MTProto (grammers)
        ▼
-[Collector] ── message fetch ──► [Store] ── save to messages table
-                                   │
-                                   ▼
-                              [Indexer] ── tokenize + n-gram ──► [Store] ── save to index tables
-                                   │
-                                   ▼
-[UI] ── search query ──► [Core Engine] ── inverted index lookup ──► [Store]
+[Collector] ── fetch messages ──► [Store] ── save to messages table
+                                              │ (FTS5 auto-indexed on insert)
+                                              ▼
+[UI] ── search query ──► [Core Engine] ── FTS5 MATCH / LIKE ──► [Store]
                            │
                            ▼
                     [results + deep links] ──► [UI] ──► [Telegram Desktop]
@@ -101,7 +98,7 @@ CREATE TABLE messages (
     chat_id       INTEGER NOT NULL,
     timestamp     INTEGER NOT NULL,  -- Unix epoch seconds
     text_plain    TEXT NOT NULL,      -- plain text (formatting removed)
-    text_stripped TEXT NOT NULL,      -- whitespace-removed version (for whitespace-agnostic search)
+    text_stripped TEXT NOT NULL,      -- whitespace-removed version
     link          TEXT,               -- tg:// or https://t.me/... deep link
     PRIMARY KEY (chat_id, message_id),
     FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
@@ -110,24 +107,12 @@ CREATE TABLE messages (
 CREATE INDEX idx_messages_timestamp ON messages (timestamp DESC);
 CREATE INDEX idx_messages_chat_timestamp ON messages (chat_id, timestamp DESC);
 
--- Inverted index: token/n-gram dictionary
-CREATE TABLE index_terms (
-    term_id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    term          TEXT NOT NULL UNIQUE,
-    source_type   TEXT NOT NULL CHECK (source_type IN ('token', 'ngram', 'stripped_ngram'))
-);
-
-CREATE INDEX idx_terms_term ON index_terms (term);
-
--- Inverted index: posting list
-CREATE TABLE postings (
-    term_id       INTEGER NOT NULL,
-    chat_id       INTEGER NOT NULL,
-    message_id    INTEGER NOT NULL,
-    timestamp     INTEGER NOT NULL,  -- denormalized for sorting/cursor
-    PRIMARY KEY (term_id, timestamp DESC, chat_id, message_id),
-    FOREIGN KEY (term_id) REFERENCES index_terms(term_id),
-    FOREIGN KEY (chat_id, message_id) REFERENCES messages(chat_id, message_id)
+-- FTS5 trigram index for full-text search
+-- Automatically maintained: new rows indexed on insert via insert_messages_batch()
+CREATE VIRTUAL TABLE messages_fts USING fts5(
+    text_plain,
+    content='messages',
+    tokenize='trigram case_sensitive 0'
 );
 
 -- Sync/meta state
@@ -145,41 +130,47 @@ CREATE TABLE app_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
--- Example keys: 'schema_version', 'index_version', 'global_last_sync', 'initial_bootstrap_done'
+-- Example keys: 'schema_version', 'tg_api_id', 'tg_api_hash', 'tg_authenticated'
 ```
 
-### 3.2 Index Version Management
+### 3.2 Schema Versioning
 
-Index swap approach during full re-indexing:
+Schema migrations are tracked via `app_meta.schema_version`:
 
-```
-Currently active: index_v1 (index_terms, postings)
-Re-indexing:      index_v2 (index_terms_v2, postings_v2) created separately
-After completion: DROP v1 → RENAME v2 to v1
-                  Update app_meta.index_version
-```
+| Version | Changes |
+|---------|---------|
+| 1 | Base tables (chats, messages, sync_state, app_meta) |
+| 2 | Add `messages_fts` FTS5 virtual table, drop legacy `index_terms` and `postings` tables |
 
-Search always references the active index only. Search remains available during re-indexing.
+Migrations run automatically on startup and are idempotent.
 
 ### 3.3 Cursor-based Pagination
 
 Use cursors instead of offsets for infinite scroll:
 
 ```sql
--- First page
-SELECT m.chat_id, m.message_id, m.text_plain, m.timestamp, m.link, c.title
-FROM postings p
-JOIN messages m ON p.chat_id = m.chat_id AND p.message_id = m.message_id
+-- FTS5 search (terms >= 3 chars)
+SELECT m.message_id, m.chat_id, m.timestamp, m.text_plain, m.link, c.title
+FROM messages m
 JOIN chats c ON m.chat_id = c.chat_id
-WHERE p.term_id IN (/* search tokens */)
+WHERE m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)
   AND c.is_excluded = 0
-ORDER BY m.timestamp DESC
+ORDER BY m.timestamp DESC, m.chat_id ASC, m.message_id ASC
 LIMIT 30;
 
 -- Next page (cursor: last_timestamp, last_chat_id, last_message_id)
 ... AND (m.timestamp < :last_ts
          OR (m.timestamp = :last_ts AND m.chat_id > :last_chat_id)
          OR (m.timestamp = :last_ts AND m.chat_id = :last_chat_id AND m.message_id > :last_msg_id))
+ORDER BY m.timestamp DESC
+LIMIT 30;
+
+-- LIKE fallback (terms < 3 chars, where FTS5 trigram cannot produce trigrams)
+SELECT m.message_id, m.chat_id, m.timestamp, m.text_plain, m.link, c.title
+FROM messages m
+JOIN chats c ON m.chat_id = c.chat_id
+WHERE m.text_plain LIKE '%' || ? || '%'
+  AND c.is_excluded = 0
 ORDER BY m.timestamp DESC
 LIMIT 30;
 ```
@@ -194,18 +185,18 @@ LIMIT 30;
 [First app launch]
      │
      ▼
-[Phone number input screen]
-     │ User input
+[Unified login form: API ID + API Hash + Phone number]
+     │ User input → "Send Code"
      ▼
-[grammers: send_code_request]
+[grammers: connect → request_login_code]
      │
      ▼
-[SMS code input screen]
+[Verification code input screen]
      │ User input
      ▼
 [grammers: sign_in]
      │
-     ├─── Success ──► [Main screen / Start initial collection]
+     ├─── Success ──► [Search page + Start background collection]
      │
      └─── 2FA required ──► [Password input screen]
                               │ User input
@@ -213,40 +204,40 @@ LIMIT 30;
                         [grammers: check_password]
                               │
                               ▼
-                        [Main screen / Start initial collection]
+                        [Search page + Start background collection]
 ```
 
 Session management:
 - Session file: `~/Library/Application Support/telegram-korean-search/session.bin`
 - Encryption: AES key stored in macOS Keychain, session file encrypted with AES-256-GCM
 - Auto-login via session file on app restart (no re-authentication needed)
+- Stale session recovery: if `AUTH_KEY_UNREGISTERED` is detected, the session file is deleted and a fresh connection is established
+- `tg_authenticated` flag in `app_meta` tracks whether login was completed (prevents reusing partial sessions)
+- Graceful shutdown: Telegram runner is aborted on app exit to prevent stale session files
 
-### 4.2 Initial Collection (Progressive Bootstrap)
+Login UX:
+- API credentials and phone number are entered in a single unified form
+- Saved credentials are pre-filled on subsequent logins
+- Friendly error messages for common errors (invalid phone, wrong code, flood wait, etc.)
+- Back button allows returning to the login form from code/2FA steps
+
+### 4.2 Initial Collection (Non-blocking)
+
+Collection runs in a background thread and does **not** block the search UI. The store lock is held only for brief DB writes, never during network I/O, so search and other commands remain responsive.
 
 ```
-Phase 1: Fetch entire chat list
+Phase 1: Fetch chat list from network (no store lock)
          ├─ Exclude DMs (groups/supergroups/channels only)
-         ├─ Save to chats table
-         └─ Search-ready immediately after completion
+         ├─ Brief lock: save to chats table
+         └─ Search-ready immediately
 
-Phase 2: Collect messages per chat (newest → oldest)
-         ├─ Priority: most recently active first
-         ├─ 1 batch per chat = 100 messages
-         ├─ All chats round 1 → round 2 (next 100) → ...
-         ├─ Index immediately after each batch
-         └─ Rate limit: 300~500ms delay between chats
-
-Phase 3: All chat histories exhausted → initial_bootstrap_done = true
+Phase 2: Fetch messages per chat (newest → oldest)
+         ├─ Fetch from network (no store lock)
+         ├─ Brief lock: save batch to messages table (FTS5 auto-indexed)
+         └─ Rate limit: 400ms delay between chats
 ```
 
-State tracking:
-- `sync_state.oldest_message_id`: collection depth for each chat
-- `sync_state.initial_done`: whether chat history end has been reached
-- `app_meta.initial_bootstrap_done`: overall initial collection completion
-
-App termination during collection → resumes from `oldest_message_id` on restart.
-
-UI display: "Collection in progress (23/87 chats complete)" + progress bar
+UI display: Non-blocking sync bar on the search page showing "Syncing: chat_name (3/15)"
 
 ### 4.3 Incremental Sync
 
@@ -255,15 +246,13 @@ Trigger: When panel opens, if `global_last_sync` is more than 5 minutes old.
 ```
 1. Query active chat list (chats WHERE is_excluded = 0)
 2. For each chat:
-   - Fetch messages after sync_state.last_message_id
-   - Maximum 100 per chat (resource protection)
-   - Save new messages + index immediately
+   - Fetch messages after sync_state.last_message_id (network, no lock)
+   - Brief lock: save new messages (FTS5 auto-indexed)
    - Update last_message_id, last_sync_at
 3. Update global_last_sync
 ```
 
 Collection runs asynchronously in the background. Search is immediately available using the previous snapshot.
-Latest data is reflected on the next panel open.
 
 ### 4.4 FLOOD_WAIT Handling
 
@@ -280,127 +269,65 @@ match collector.fetch_messages(...).await {
 
 ---
 
-## 5. Search Engine (Indexer + Search)
+## 5. Search Engine
 
-### 5.1 Indexing Pipeline
+### 5.1 FTS5 Trigram Index
 
-Indexing process when a single message is stored:
+Search uses SQLite FTS5 with the `trigram` tokenizer. This provides substring matching for both Korean and English text without requiring language-specific tokenization (no morpheme analysis needed).
 
-```
-Original: "Samsung Electronics stock price rose"
-(Korean: "삼성 전자 주가가 상승했다")
-            │
-            ├──► [Korean language detection]
-            │
-            ▼
-    ┌───────────────────────────────────┐
-    │  Step 1: Original text tokenization│
-    │  Morpheme processing: remove       │
-    │  particles/endings                 │
-    │  Result: ["삼성", "전자", "주가",   │
-    │           "상승"]                  │
-    │  source_type: 'token'             │
-    └───────────────┬───────────────────┘
-                    │
-    ┌───────────────▼───────────────────┐
-    │  Step 2: Per-token bigram          │
-    │  generation                        │
-    │  "삼성" → ["삼성"]                 │
-    │  "전자" → ["전자"]                 │
-    │  "주가" → ["주가"]                 │
-    │  "상승" → ["상승"]                 │
-    │  source_type: 'ngram'             │
-    │  (2-char tokens: bigram = itself)  │
-    └───────────────┬───────────────────┘
-                    │
-    ┌───────────────▼───────────────────┐
-    │  Step 3: Whitespace-stripped text  │
-    │  bigrams                           │
-    │  "삼성전자주가가상승했다"             │
-    │  → morpheme processing →           │
-    │    "삼성전자주가상승"                │
-    │  → bigrams: ["삼성", "성전", "전자",│
-    │    "자주", "주가", "가상", "상승"]   │
-    │  source_type: 'stripped_ngram'     │
-    └───────────────┬───────────────────┘
-                    │
-                    ▼
-    [Save to index_terms + postings tables]
-```
+How it works:
+- FTS5 trigram breaks text into overlapping 3-character sequences
+- Query terms are matched against these trigrams
+- Case-insensitive matching is enabled (`case_sensitive 0`)
+- Indexing happens automatically when messages are inserted via `insert_messages_batch()`
 
-### 5.2 Korean Morpheme Processing
+Advantages over the previous custom inverted index:
+- No external dependencies (removed `lindera` and `unicode-segmentation` crates)
+- ~1000 fewer lines of code
+- Native SQLite performance optimizations
+- Automatic index maintenance (no separate indexing step)
 
-The goal is "practical tokenization for search quality", not linguistic completeness.
-
-Strategy:
-- **Lightweight morpheme analysis**: `lindera` (Rust native, mecab-compatible dictionary)
-  - POS tagging → extract nouns/numerals/proper nouns only
-  - Remove particles (은/는/이/가/을/를/의/에/서/로 etc.)
-  - Remove endings (-했다, -하는, -됐다 etc.)
-- **Fallback**: If morpheme analysis fails, generate bigrams from the raw text
-
-Example:
-```
-Input: "텔레그램에서 검색이 안됐다"
-       ("Search didn't work on Telegram")
-Morphemes: ["텔레그램", "검색"]  (에서/이/안/됐다 removed)
-Bigrams: ["텔레", "레그", "그램", "검색"]
-```
-
-### 5.3 English Processing
-
-- Whitespace-based tokenization
-- Lowercase normalization
-- Punctuation removal
-- No n-grams (word-level search)
-- Prefix matching: SQLite LIKE 'term%' (optional)
-
-### 5.4 Search Query Processing
+### 5.2 Search Query Processing
 
 ```
-User input: "삼성전자 주가" ("Samsung Electronics stock price")
+User input: "삼성전자 주가"
                 │
                 ▼
-        [Language detection + tokenization]
+        [Split by whitespace]
         → Tokens: ["삼성전자", "주가"]
                 │
                 ▼
-        [For each token]
-        ├─ Exact token search (index_terms WHERE term = '삼성전자')
-        ├─ Bigram search (ngram source_type)
-        └─ Whitespace-stripped bigram search (stripped_ngram source_type)
+        [Check minimum length]
+        ├─ All tokens >= 3 chars → FTS5 MATCH query
+        └─ Any token < 3 chars  → LIKE fallback
                 │
                 ▼
-        [Posting list intersection (AND)]
-        → "삼성전자" matching message_ids ∩ "주가" matching message_ids
+        [FTS5 path]
+        Build query: "삼성전자" "주가"  (quoted terms, AND'd by default)
+        Execute: SELECT ... WHERE messages_fts MATCH ?
+                │
+                ▼
+        [LIKE fallback path]
+        Execute: SELECT ... WHERE text_plain LIKE '%삼성%' AND text_plain LIKE '%주가%'
                 │
                 ▼
         [Sort by timestamp DESC + cursor pagination]
         → Return top 30 results
 ```
 
-Multiple keywords use AND operation. Intersection of each keyword's posting list.
+Multiple keywords use AND operation (FTS5 default behavior).
 
-### 5.5 Search Highlighting
+### 5.3 Search Highlighting
 
 Display matching token positions in result preview (2-3 lines):
 
 ```
 Original: "어제 삼성전자 주가가 크게 상승했습니다"
-          ("Samsung Electronics stock price rose significantly yesterday")
 Search:   "삼성전자 주가"
 Display:  "어제 [삼성전자] [주가]가 크게 상승했습니다"
 ```
 
-Highlighting calculates match positions in the original text_plain during UI rendering and wraps them with `<mark>` tags.
-
-### 5.6 Indexing Modes
-
-| Situation | Method | Description |
-|-----------|--------|-------------|
-| New message collection | Incremental indexing | Immediate tokenization → add to index_terms/postings |
-| Schema/logic change | Full re-indexing | Create new index tables → swap |
-| After app update | index_version comparison | Auto re-index on version mismatch |
+Highlighting finds match positions using case-insensitive substring search in the original `text_plain` and wraps them with `<mark>` tags. Overlapping ranges are merged.
 
 ---
 
@@ -416,16 +343,13 @@ Highlighting calculates match positions in the original text_plain during UI ren
 ### 6.2 Link Generation Logic
 
 ```rust
-fn build_link(chat: &Chat, message_id: i64) -> String {
-    match &chat.username {
-        Some(username) => {
-            // Public: https://t.me/username/msg_id
-            format!("https://t.me/{}/{}", username, message_id)
+fn build_link(chat_id: i64, username: Option<&str>, message_id: i64) -> String {
+    match username {
+        Some(u) if !u.is_empty() => {
+            format!("https://t.me/{}/{}", u, message_id)
         }
-        None => {
-            // Private: tg://privatepost?channel=ID&post=msg_id
-            // channel_id: for supergroup/channel, remove -100 prefix from chat_id
-            let channel_id = chat.chat_id.abs() - 1_000_000_000_000; // Telegram ID conversion
+        _ => {
+            let channel_id = (-chat_id) - 1_000_000_000_000;
             format!("tg://privatepost?channel={}&post={}", channel_id, message_id)
         }
     }
@@ -434,10 +358,10 @@ fn build_link(chat: &Chat, message_id: i64) -> String {
 
 ### 6.3 Opening Links
 
-Use the `open` command on macOS or Tauri's `shell::open` API:
+Uses Tauri's shell plugin:
 
 ```rust
-tauri::api::shell::open(&app_handle.shell_scope(), &link, None)?;
+app.shell().open(&link, None)?;
 ```
 
 ---
@@ -454,6 +378,8 @@ tauri::api::shell::open(&app_handle.shell_scope(), &link, None)?;
 ├─────────────────────────────────────────────────┤
 │  🔍 [Enter search term                        ] │
 ├─────────────────────────────────────────────────┤
+│  ● Syncing: #stock_talk (3/15)                  │ ← non-blocking sync bar
+├─────────────────────────────────────────────────┤
 │                                                 │
 │  #crypto_korea · 2025-02-10 14:32               │
 │  Yesterday [Samsung Electronics] [stock price]  │
@@ -469,27 +395,27 @@ tauri::api::shell::open(&app_handle.shell_scope(), &link, None)?;
 │                                                 │
 │  (Load more on scroll...)                       │
 │                                                 │
-├─────────────────────────────────────────────────┤
-│  Collection in progress: 45/87 chats ████░░ 52% │
 └─────────────────────────────────────────────────┘
 ```
 
 ### 7.2 Screen Details
 
-**Login Screen**
-- Phone number input (country code selector)
-- SMS code input
+**Login Screen (Unified)**
+- Single form: API ID, API Hash, Phone number
+- Saved credentials pre-filled on return visits
+- Verification code input (separate step)
 - 2FA password input (if applicable)
-- Error display (wrong code, network error, etc.)
+- Friendly error messages
+- Back button to return to login form
+- Splash screen with spinner during connection
 
 **Search Panel (Main)**
 - Scope toggle: `Channel` / `All`
-- Channel mode: display channel name + change button (type-to-search selection)
 - Search input: auto-focus
 - Result list: scrollable, infinite scroll (30 at a time)
 - Result item: channel name, time, body preview (2-3 lines, keyword highlight)
-- Result click → open Telegram + auto-close panel
-- Bottom status bar: collection progress status (only during initial collection)
+- Result click -> open Telegram via deep link
+- Non-blocking sync bar: shows collection progress without blocking search
 
 **Settings Screen**
 - Hotkey configuration
@@ -498,18 +424,12 @@ tauri::api::shell::open(&app_handle.shell_scope(), &link, None)?;
 - Data reset (delete DB + re-collect)
 - App info/version
 
-**Channel Selection Modal**
-- Text input → filter chat names (local chats table search)
-- Selection locks scope to that channel
-- Remembers last selected channel (stored in app_meta)
-
 ### 7.3 Global Hotkey
 
 - Default: `Cmd+Shift+F`
-- Customizable (change in settings, stored in app_meta)
-- Uses Tauri's `GlobalShortcut` API
+- Uses Tauri's `GlobalShortcut` plugin
 - Panel open: show app window + focus search input
-- Panel close: auto on result click / Esc key / focus lost
+- Panel close: `Esc` key hides window
 
 ### 7.4 Interaction Flow
 
@@ -536,7 +456,7 @@ tauri::api::shell::open(&app_handle.shell_scope(), &link, None)?;
 [Open deep link → Activate Telegram Desktop]
      │
      ▼
-[Panel auto-closes]
+[Panel hides (Esc)]
 ```
 
 ---
@@ -547,32 +467,30 @@ tauri::api::shell::open(&app_handle.shell_scope(), &link, None)?;
 
 | Event | Action | Condition |
 |-------|--------|-----------|
-| First app launch | Start initial collection | `initial_bootstrap_done = false` |
-| App restart | Resume initial collection | `initial_bootstrap_done = false` |
+| First app launch | Start initial collection | No messages collected |
+| App restart with valid session | Auto-login + start collection | `tg_authenticated = 1` |
+| App restart with stale session | Delete session, show login | AUTH_KEY_UNREGISTERED |
 | Panel open | Run incremental sync | `global_last_sync` > 5 minutes ago |
 | Panel open | Skip sync | `global_last_sync` < 5 minutes ago |
 | Background | None | - |
-| After app update | index_version comparison → re-index | Version mismatch |
 
 ### 8.2 Incremental Sync Details
 
 ```
 Max 100 messages per chat
      │
-     ├─ New messages: save to messages + index immediately
-     ├─ New chat discovered: add to chats + start collecting for that chat
+     ├─ New messages: save to messages (FTS5 auto-indexed)
+     ├─ New chat discovered: add to chats + start collecting
      └─ Collection complete: update sync_state
 ```
 
-Search responds immediately with the previous snapshot. Results are not refreshed after collection completes.
-Latest data is reflected on the next panel open.
+Search responds immediately with the previous snapshot.
 
 ### 8.3 Chat Exclusion Handling
 
 - Set `is_excluded = 1` in settings
 - Excluded chats are removed from incremental sync targets
-- Existing index is not deleted immediately (filtered only in search results)
-- Excluded chat data is cleaned up during full re-indexing
+- Excluded chats are filtered out in search results via `WHERE c.is_excluded = 0`
 
 ---
 
@@ -582,22 +500,23 @@ Latest data is reflected on the next panel open.
 
 | Metric | Target | Notes |
 |--------|--------|-------|
-| Search response | < 300ms (perceived) | Inverted index + cursor pagination |
+| Search response | < 300ms (perceived) | FTS5 trigram + cursor pagination |
 | Memory | < 100MB (normal usage) | SQLite cache + minimal resident |
-| Disk | 300~600MB for 100K messages | Including bigram + whitespace-stripped index |
-| Collection speed | Maximum within rate limits | 300~500ms delay between chats |
+| Disk | ~200MB for 100K messages | FTS5 trigram index is more compact than manual inverted index |
+| Collection speed | Maximum within rate limits | 400ms delay between chats |
 
 ### 9.2 Optimization Strategy
 
 **Search Optimization**
-- Inverted index based → O(1) token lookup
-- Cursor pagination → consistent performance even with deep scrolling
-- postings table PK includes timestamp DESC → zero sorting cost
-- Search debounce 200ms → prevent unnecessary queries
+- FTS5 trigram index -> efficient substring matching
+- Cursor pagination -> consistent performance even with deep scrolling
+- LIKE fallback for short queries (< 3 chars) where FTS5 cannot produce trigrams
+- Search debounce 200ms -> prevent unnecessary queries
 
-**Index Optimization**
-- Incremental indexing: transaction batch (100 messages per chat in a single transaction)
-- WAL mode enabled: read/write concurrency
+**Collection Optimization**
+- Non-blocking: store lock held only for brief DB writes, not during network I/O
+- Batch inserts: 100 messages per chat in a single transaction
+- WAL mode: read/write concurrency
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -605,10 +524,9 @@ PRAGMA synchronous = NORMAL;
 PRAGMA cache_size = -64000;  -- 64MB cache
 ```
 
-**Collection Optimization**
-- Initial collection: round-robin distribution across all chats
+**Collection Rate Limiting**
+- 400ms delay between chats
 - FLOOD_WAIT: wait for specified duration then retry
-- Network errors: exponential backoff (1s → 2s → 4s → ... max 60s)
 
 ---
 
@@ -617,7 +535,7 @@ PRAGMA cache_size = -64000;  -- 64MB cache
 ```
 ~/Library/Application Support/telegram-korean-search/
 ├── session.bin              # Telegram session (AES-256-GCM encrypted)
-├── tg-korean-search.db      # SQLite main DB
+├── tg-korean-search.db      # SQLite main DB (includes FTS5 index)
 ├── tg-korean-search.db-wal  # WAL file (auto-generated)
 ├── tg-korean-search.db-shm  # Shared memory (auto-generated)
 └── config.json              # App settings (hotkeys etc., non-DB settings)
@@ -633,25 +551,37 @@ PRAGMA cache_size = -64000;  -- 64MB cache
 |------------|----------|--------------|
 | Network disconnection | Pause collection, resume on reconnect | Toast: "Check network connection" |
 | FLOOD_WAIT | Wait for specified duration then retry | Show wait status in status bar |
-| Session expired | Prompt re-login | Show login screen |
+| Session expired (AUTH_KEY_UNREGISTERED) | Delete session file, show login | Redirect to login with message |
 | DB corruption | Guide DB deletion + re-collection | Dialog: "Data reset required" |
 | Deep link failure | No fallback | Toast: "Unable to open message" |
-| Indexing failure | Skip message, log | None (silent) |
+| Collection failure | Log warning, continue with next chat | None (silent, shown in sync bar) |
 
-### 11.2 Logging
+### 11.2 Friendly Error Messages
 
-- Development mode: `RUST_LOG=debug` → file + console log
-- Production: errors only in file log (`tg-korean-search.log`, rotation 10MB x 3)
-- Users see only toast notifications
+Common Telegram API errors are translated to user-friendly messages:
+
+| API Error | User Message |
+|-----------|-------------|
+| PHONE_NUMBER_INVALID | "Invalid phone number. Please include the country code (e.g. +82)." |
+| PHONE_CODE_INVALID | "Incorrect verification code. Please try again." |
+| PHONE_CODE_EXPIRED | "Verification code expired. Please request a new one." |
+| PASSWORD_HASH_INVALID | "Incorrect password. Please try again." |
+| FLOOD_WAIT | "Too many attempts. Please wait a few minutes and try again." |
+| AUTH_KEY_UNREGISTERED | "Session expired. Please log in again." |
+
+### 11.3 Logging
+
+- Development mode: `RUST_LOG=debug` -> file + console log
+- Production: `flexi_logger` with file rotation
+- Users see only inline error messages and sync bar status
 
 ---
 
 ## 12. Updates
 
-- Uses Tauri `tauri-plugin-updater`
+- Uses Tauri `tauri-plugin-updater` (planned)
 - Auto update check based on GitHub Releases
-- Notification when update available → install after user approval
-- After update, compare index_version → auto re-index if needed
+- Notification when update available -> install after user approval
 
 ---
 
@@ -661,9 +591,10 @@ PRAGMA cache_size = -64000;  -- 64MB cache
 |------|---------|
 | Session file | AES-256-GCM encryption, key in macOS Keychain |
 | DB file | No encryption (local file, protected by macOS file permissions) |
-| API ID/Hash | Embedded in app binary (allowed per Telegram policy) |
+| API ID/Hash | Stored in DB (user-provided via login form) |
 | Memory | Session tokens zeroed after use |
 | Network | MTProto encryption (provided by grammers) |
+| Grammers panics | Suppressed via custom panic hook for stale session errors |
 
 ---
 
@@ -674,23 +605,27 @@ PRAGMA cache_size = -64000;  -- 64MB cache
 | Crate | Purpose | Notes |
 |-------|---------|-------|
 | `tauri` | App framework | v2 |
-| `grammers` | Telegram MTProto client | Session management, message fetch |
-| `rusqlite` | SQLite bindings | WAL, FTS support |
-| `lindera` | Korean morpheme analysis | mecab-compatible, IPADIC/ko-dic |
-| `serde` / `serde_json` | Serialization | Config files etc. |
+| `grammers-client` | Telegram MTProto client | Session management, message fetch |
+| `grammers-mtsender` | MTProto transport | |
+| `grammers-session` | Session persistence | |
+| `sqlite` | SQLite bindings | FTS5 support |
+| `serde` / `serde_json` | Serialization | |
 | `tokio` | Async runtime | grammers dependency |
 | `tauri-plugin-global-shortcut` | Global hotkey | |
-| `tauri-plugin-updater` | Auto updates | |
+| `tauri-plugin-shell` | Open deep links | |
 | `aes-gcm` | Session encryption | |
 | `security-framework` | macOS Keychain access | |
-| `log` + `env_logger` | Logging | |
+| `flexi_logger` | Logging with file rotation | |
+| `log` | Logging facade | |
 
 ### 14.2 Frontend
 
 | Library | Purpose |
 |---------|---------|
-| Vanilla TS or Svelte (lightweight) | UI rendering |
-| Tauri JS API | Rust backend calls |
+| React + TypeScript | UI rendering |
+| Vite | Build tooling |
+| `@tauri-apps/api` | Rust backend calls |
+| Bun | Package manager |
 
 ---
 
@@ -702,7 +637,6 @@ PRAGMA cache_size = -64000;  -- 64MB cache
 - Relevance-based ranking
 - 1:1 DM search
 - Media/file search (text only)
-- Raycast integration (possible via future adapter)
 
 ---
 
@@ -712,5 +646,4 @@ PRAGMA cache_size = -64000;  -- 64MB cache
 - Relevance-based ranking (TF-IDF etc.)
 - Media message metadata search
 - Chat grouping/tagging
-- Raycast adapter
 - Search history / bookmarks
