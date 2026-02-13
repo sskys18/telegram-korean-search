@@ -16,6 +16,17 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -29,7 +40,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'telegram-korean-search ${{ github.ref_name }}'
-          releaseBody: 'See the assets to download this version.'
+          releaseName: '텔레그램 한국어 검색 ${{ github.ref_name }}'
+          releaseBody: |
+            ## 설치 방법
+
+            아래에서 `.dmg` 파일을 다운로드하여 설치하세요.
+
+            > **참고**: 이 앱은 코드 서명이 되어 있지 않습니다. 처음 실행할 때 앱을 우클릭하고 "열기"를 선택한 후, 대화상자에서 "열기"를 클릭하세요. 한 번만 하면 됩니다.
           releaseDraft: true
           prerelease: false
+          args: --target aarch64-apple-darwin
