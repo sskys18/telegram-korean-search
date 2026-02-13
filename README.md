@@ -27,6 +27,11 @@ _준비 중_
 
 [GitHub Releases](https://github.com/sskys18/telegram-korean-search/releases)에서 최신 `.dmg` 파일을 다운로드하여 설치합니다.
 
+> **참고**: 이 앱은 코드 서명이 되어 있지 않습니다. 처음 실행 시 앱을 우클릭 → "열기" → "열기" 클릭하면 됩니다. 또는 터미널에서:
+> ```bash
+> xattr -cr /Applications/텔레그램\ 한국어\ 검색.app
+> ```
+
 ### 2. Telegram API Key 발급
 
 앱에서 텔레그램에 로그인하려면 API 키가 필요합니다.
@@ -103,6 +108,23 @@ cargo tauri build
 ## Contributing
 
 [CONTRIBUTING.md](CONTRIBUTING.md)를 참고하세요.
+
+## Code Signing (선택사항)
+
+코드 서명 없이도 앱은 정상 작동합니다. 향후 코드 서명을 추가하려면:
+
+1. [Apple Developer Program](https://developer.apple.com/programs/) 등록 (연 $99)
+2. **Developer ID Application** 인증서 생성
+3. 인증서를 `.p12`로 내보내고 base64 인코딩: `base64 -i cert.p12 | pbcopy`
+4. [appleid.apple.com](https://appleid.apple.com)에서 앱 전용 비밀번호 생성
+5. GitHub Secrets 추가:
+   - `APPLE_CERTIFICATE` — base64 인코딩된 `.p12`
+   - `APPLE_CERTIFICATE_PASSWORD` — `.p12` 비밀번호
+   - `APPLE_SIGNING_IDENTITY` — 예: `Developer ID Application: Name (TEAM_ID)`
+   - `APPLE_ID` — Apple ID 이메일
+   - `APPLE_PASSWORD` — 앱 전용 비밀번호
+   - `APPLE_TEAM_ID` — 10자리 팀 ID
+6. release workflow의 `tauri-action` 단계에 환경변수 추가
 
 ## License
 
