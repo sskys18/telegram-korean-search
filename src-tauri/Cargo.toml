@@ -23,7 +23,7 @@ grammers-client = "0.8"
 grammers-mtsender = "0.8"
 grammers-session = "0.8"
 grammers-tl-types = "0.8"
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 flexi_logger = "0.29"
 tauri-plugin-shell = "2"
 

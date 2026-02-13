@@ -71,6 +71,7 @@ pub enum CollectorError {
     Session(String),
     Auth(String),
     Api(String),
+    FloodWait(u32),
     InvalidPath,
 }
 
@@ -81,6 +82,7 @@ impl std::fmt::Display for CollectorError {
             CollectorError::Session(e) => write!(f, "session error: {}", e),
             CollectorError::Auth(e) => write!(f, "auth error: {}", e),
             CollectorError::Api(e) => write!(f, "API error: {}", e),
+            CollectorError::FloodWait(secs) => write!(f, "flood wait: {} seconds", secs),
             CollectorError::InvalidPath => write!(f, "invalid session path"),
         }
     }

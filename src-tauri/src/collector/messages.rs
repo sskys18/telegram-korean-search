@@ -1,5 +1,5 @@
 use grammers_client::types::Peer;
-use grammers_client::Client;
+use grammers_client::{Client, InvocationError};
 use grammers_session::defs::{PeerAuth, PeerId, PeerRef};
 
 use crate::collector::link::build_link;
@@ -10,7 +10,7 @@ use crate::store::Store;
 use super::CollectorError;
 
 const BATCH_SIZE: usize = 100;
-const INTER_CHAT_DELAY_MS: u64 = 400;
+const MAX_FLOOD_RETRIES: usize = 2;
 
 /// Fetch all dialogs (groups, supergroups, channels) from Telegram.
 /// Returns the chat rows without saving to the database.
@@ -85,11 +85,12 @@ pub async fn fetch_messages(
     let mut rows = Vec::with_capacity(BATCH_SIZE);
     let mut fetched = 0;
 
-    while let Some(msg) = iter
-        .next()
-        .await
-        .map_err(|e| CollectorError::Api(format!("message fetch error: {}", e)))?
-    {
+    while let Some(msg) = iter.next().await.map_err(|e| match &e {
+        InvocationError::Rpc(rpc) if rpc.name == "FLOOD_WAIT" => {
+            CollectorError::FloodWait(rpc.value.unwrap_or(5))
+        }
+        _ => CollectorError::Api(format!("message fetch error: {}", e)),
+    })? {
         // Stop if we've reached a message we already have
         if let Some(oldest) = oldest_id {
             if (msg.id() as i64) <= oldest {
@@ -122,33 +123,88 @@ pub async fn fetch_messages(
     Ok(rows)
 }
 
-/// Run incremental sync for all active chats.
-/// Fetches new messages since last sync for each chat.
+/// Wrapper around `fetch_messages` that retries on FLOOD_WAIT errors.
+/// Sleeps for the requested duration and retries up to MAX_FLOOD_RETRIES times.
+pub async fn fetch_messages_with_retry(
+    client: &Client,
+    chat: &ChatRow,
+    oldest_id: Option<i64>,
+) -> Result<Vec<MessageRow>, CollectorError> {
+    for attempt in 0..=MAX_FLOOD_RETRIES {
+        match fetch_messages(client, chat, oldest_id).await {
+            Ok(rows) => return Ok(rows),
+            Err(CollectorError::FloodWait(secs)) if attempt < MAX_FLOOD_RETRIES => {
+                log::warn!(
+                    "FloodWait {} secs for {}, retrying ({}/{})",
+                    secs,
+                    chat.title,
+                    attempt + 1,
+                    MAX_FLOOD_RETRIES
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
+/// Run incremental sync for all active chats concurrently.
+/// Fetches new messages since last sync, up to 3 chats at a time.
 pub async fn incremental_sync(
     client: &Client,
     store: &std::sync::Mutex<Store>,
 ) -> Result<usize, CollectorError> {
-    let chats = {
+    // Read all chats and their sync states upfront (single brief lock)
+    let chat_states: Vec<_> = {
         let s = store
             .lock()
             .map_err(|e| CollectorError::Api(e.to_string()))?;
-        s.get_active_chats()
-            .map_err(|e| CollectorError::Api(format!("failed to get active chats: {}", e)))?
+        let chats = s
+            .get_active_chats()
+            .map_err(|e| CollectorError::Api(format!("failed to get active chats: {}", e)))?;
+        chats
+            .into_iter()
+            .map(|chat| {
+                let oldest_id = s
+                    .get_sync_state(chat.chat_id)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.last_message_id);
+                (chat, oldest_id)
+            })
+            .collect()
     };
+
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for (i, (chat, oldest_id)) in chat_states.into_iter().enumerate() {
+        let sem = std::sync::Arc::clone(&semaphore);
+        let cli = client.clone();
+
+        join_set.spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let result = fetch_messages_with_retry(&cli, &chat, oldest_id).await;
+            (chat, result)
+        });
+    }
 
     let mut total = 0;
 
-    for chat in &chats {
-        let oldest_id = {
-            let s = store
-                .lock()
-                .map_err(|e| CollectorError::Api(e.to_string()))?;
-            s.get_sync_state(chat.chat_id)
-                .map_err(|e| CollectorError::Api(e.to_string()))?
-                .map(|s| s.last_message_id)
+    while let Some(join_result) = join_set.join_next().await {
+        let (chat, fetch_result) = match join_result {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("Sync task panicked: {}", e);
+                continue;
+            }
         };
 
-        match fetch_messages(client, chat, oldest_id).await {
+        match fetch_result {
             Ok(rows) => {
                 let count = rows.len();
                 if !rows.is_empty() {
@@ -165,9 +221,6 @@ pub async fn incremental_sync(
                 log::warn!("Failed to sync chat {}: {}", chat.title, e);
             }
         }
-
-        // Rate limit between chats
-        tokio::time::sleep(std::time::Duration::from_millis(INTER_CHAT_DELAY_MS)).await;
     }
 
     Ok(total)
