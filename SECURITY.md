@@ -1,6 +1,6 @@
 # Security Policy
 
-## How telegram-korean-search Handles Security
+## How 텔레그램 한국어 검색 Handles Security
 
 - **Session files** are encrypted with AES-256-GCM. The encryption key is stored in macOS Keychain.
 - **All data is local-only**. No data is transmitted to external servers (except Telegram's own MTProto API for message fetching).

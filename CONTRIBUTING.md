@@ -1,4 +1,4 @@
-# Contributing to telegram-korean-search
+# Contributing to 텔레그램 한국어 검색
 
 Thank you for your interest in contributing! Here's how you can help.
 

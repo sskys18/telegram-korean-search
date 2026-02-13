@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-telegram-korean-search is a local-only Telegram message search app for macOS. It supports Korean partial/substring search and English search using SQLite FTS5 trigram tokenizer. Built with Tauri v2 (Rust backend) + React/TypeScript frontend.
+텔레그램 한국어 검색 (telegram-korean-search) is a local-only Telegram message search app for macOS. It supports Korean partial/substring search and English search using SQLite FTS5 trigram tokenizer. Built with Tauri v2 (Rust backend) + React/TypeScript frontend.
 
 ## Tech Stack
 
