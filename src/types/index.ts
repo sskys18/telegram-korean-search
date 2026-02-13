@@ -68,4 +68,5 @@ export interface CollectionProgress {
   chats_done?: number;
   chats_total?: number;
   detail?: string;
+  active_chats?: string[];
 }

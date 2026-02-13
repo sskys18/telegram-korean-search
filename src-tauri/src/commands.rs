@@ -1,5 +1,10 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::collector;
 use crate::AppState;
@@ -255,11 +260,12 @@ pub async fn start_collection(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-// Runs on a dedicated thread with a single-threaded tokio runtime.
-// The store lock is acquired only for brief DB writes, never during network I/O,
-// so other Tauri commands (search, get_chats) remain responsive.
+// Runs on a dedicated thread with a multi-threaded tokio runtime.
+// Network I/O is parallelized (up to 3 concurrent channels via Semaphore).
+// DB writes are serialized in the join_next() loop — no mutex contention.
 fn run_collection(app: AppHandle, client: grammers_client::Client) {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -285,8 +291,8 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
             }
         };
 
-        // Brief lock: save chats and read active list
-        let (chats, chat_count) = {
+        // Brief lock: save chats and read excluded set
+        let excluded_ids: std::collections::HashSet<i64> = {
             let store = state.store.lock().unwrap();
             for row in &chat_rows {
                 if let Err(e) = store.upsert_chat(row) {
@@ -294,28 +300,72 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
                 }
             }
             let active = store.get_active_chats().unwrap_or_default();
-            let count = chat_rows.len();
-            (active, count)
+            let active_ids: std::collections::HashSet<i64> =
+                active.iter().map(|c| c.chat_id).collect();
+            chat_rows
+                .iter()
+                .filter(|c| !active_ids.contains(&c.chat_id))
+                .map(|c| c.chat_id)
+                .collect()
         };
 
-        // Phase 2: Fetch messages per chat (FTS5 indexing is automatic)
-        for (i, chat) in chats.iter().enumerate() {
-            let _ = app.emit(
-                "collection-progress",
-                serde_json::json!({
-                    "phase": "messages",
-                    "chat_title": &chat.title,
-                    "chats_done": i,
-                    "chats_total": chat_count,
-                }),
-            );
+        // Use chat_rows order (Telegram dialog order = most recently active first),
+        // filtering out excluded chats.
+        let chats: Vec<_> = chat_rows
+            .into_iter()
+            .filter(|c| !excluded_ids.contains(&c.chat_id))
+            .collect();
+        let chats_total = chats.len();
 
-            // Network I/O: no store lock held
-            match collector::messages::fetch_messages(&client, chat, None).await {
+        // Phase 2: Fetch messages concurrently (3 at a time)
+        let semaphore = Arc::new(Semaphore::new(3));
+        let chats_done = Arc::new(AtomicUsize::new(0));
+        let active_titles: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let client = Arc::new(client);
+
+        let mut join_set = JoinSet::new();
+
+        for (i, chat) in chats.into_iter().enumerate() {
+            let sem = Arc::clone(&semaphore);
+            let cli = Arc::clone(&client);
+            let titles = Arc::clone(&active_titles);
+
+            join_set.spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+
+                // Stagger requests slightly after acquiring the permit
+                if i > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+
+                // Track active channel
+                titles.lock().await.push(chat.title.clone());
+
+                let result =
+                    collector::messages::fetch_messages_with_retry(&cli, &chat, None).await;
+
+                // Remove from active list
+                titles.lock().await.retain(|t| t != &chat.title);
+
+                (chat, result)
+            });
+        }
+
+        // Collect results and write to DB one at a time
+        while let Some(join_result) = join_set.join_next().await {
+            let (chat, fetch_result) = match join_result {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("Task panicked: {}", e);
+                    continue;
+                }
+            };
+
+            match fetch_result {
                 Ok(rows) => {
                     let count = rows.len();
                     if !rows.is_empty() {
-                        // Brief lock: save messages
                         let store = state.store.lock().unwrap();
                         if let Err(e) = store.insert_messages_batch(&rows) {
                             log::warn!("Failed to save messages for {}: {}", chat.title, e);
@@ -326,12 +376,22 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
                 Err(e) => log::warn!("Failed to fetch messages for {}: {}", chat.title, e),
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let done = chats_done.fetch_add(1, Ordering::Relaxed) + 1;
+            let current_active = active_titles.lock().await.clone();
+            let _ = app.emit(
+                "collection-progress",
+                serde_json::json!({
+                    "phase": "messages",
+                    "chats_done": done,
+                    "chats_total": chats_total,
+                    "active_chats": current_active,
+                }),
+            );
         }
 
         let _ = app.emit(
             "collection-complete",
-            serde_json::json!({ "chats": chat_count }),
+            serde_json::json!({ "chats": chats_total }),
         );
     });
 }
