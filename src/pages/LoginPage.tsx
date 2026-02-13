@@ -33,12 +33,12 @@ export function LoginPage({
     return (
       <div className="login-page">
         <div className="splash">
-          <h1 className="splash-title">Telegram Search</h1>
-          <p className="splash-subtitle">Korean message search</p>
+          <h1 className="splash-title">텔레그램 한국어 검색</h1>
+          <p className="splash-subtitle">텔레그램 메시지를 한국어로 검색하세요</p>
           <div className="splash-status">
             <div className="login-spinner" />
             <p className="login-status">
-              {step === "loading" ? "Loading..." : "Connecting..."}
+              {step === "loading" ? "로딩 중..." : "연결 중..."}
             </p>
           </div>
         </div>
@@ -51,7 +51,7 @@ export function LoginPage({
       <div className="login-page">
         <p className="login-error">{error}</p>
         <button className="login-back" onClick={onBack}>
-          Back
+          뒤로
         </button>
       </div>
     );
@@ -67,9 +67,9 @@ export function LoginPage({
 
     return (
       <div className="login-page">
-        <h2>Telegram Login</h2>
+        <h2>텔레그램 로그인</h2>
         <p className="login-detail">
-          Get API credentials from{" "}
+          API 인증 정보를 여기서 발급받으세요:{" "}
           <a
             href="https://my.telegram.org"
             target="_blank"
@@ -95,14 +95,14 @@ export function LoginPage({
             onChange={(e) => setApiHash(e.target.value)}
             placeholder="e.g. a1b2c3d4e5f6..."
           />
-          <label className="login-label">Phone Number</label>
+          <label className="login-label">전화번호</label>
           <input
             type="text"
             value={phone}
             onChange={(e) => setPhone(e.target.value)}
             placeholder="+82 10 1234 5678"
           />
-          <button type="submit">Send Code</button>
+          <button type="submit">인증 코드 발송</button>
         </form>
       </div>
     );
@@ -119,10 +119,10 @@ export function LoginPage({
   };
 
   const labels: Record<string, { title: string; placeholder: string }> = {
-    code: { title: "Enter Verification Code", placeholder: "12345" },
+    code: { title: "인증 코드 입력", placeholder: "12345" },
     "2fa": {
-      title: "Enter 2FA Password",
-      placeholder: hint2fa ? `Hint: ${hint2fa}` : "Password",
+      title: "2FA 비밀번호 입력",
+      placeholder: hint2fa ? `힌트: ${hint2fa}` : "비밀번호",
     },
   };
 
@@ -140,10 +140,10 @@ export function LoginPage({
           placeholder={placeholder}
           autoFocus
         />
-        <button type="submit">Continue</button>
+        <button type="submit">계속</button>
       </form>
       <button className="login-back" onClick={onBack}>
-        Back
+        뒤로
       </button>
     </div>
   );

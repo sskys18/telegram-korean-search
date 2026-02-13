@@ -1,4 +1,4 @@
-# telegram-korean-search — Architecture Design Document
+# 텔레그램 한국어 검색 — Architecture Design Document
 
 > Local-first Telegram Korean/English search system
 > Version: 2.0
@@ -10,7 +10,7 @@
 
 ### 1.1 Purpose
 
-telegram-korean-search is a local-only search tool for Telegram messages that supports Korean partial search and whitespace-agnostic search. Users open a mini search panel via a global hotkey while using Telegram Desktop, search instantly, and selecting a result returns them to Telegram Desktop.
+텔레그램 한국어 검색 is a local-only search tool for Telegram messages that supports Korean partial search and whitespace-agnostic search. Users open a mini search panel via a global hotkey while using Telegram Desktop, search instantly, and selecting a result returns them to Telegram Desktop.
 
 ### 1.2 Core Principles
 
@@ -27,7 +27,7 @@ telegram-korean-search is a local-only search tool for Telegram messages that su
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│                telegram-korean-search App                  │
+│              텔레그램 한국어 검색 App                        │
 │                                                          │
 │  ┌────────────┐    ┌────────────┐    ┌────────────┐      │
 │  │  Tauri UI   │◄──►│  Core Engine │◄──►│  SQLite DB  │  │
@@ -372,7 +372,7 @@ app.shell().open(&link, None)?;
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  telegram-korean-search                  ⚙️ [X]  │
+│  텔레그램 한국어 검색                     ⚙️ [X]  │
 ├─────────────────────────────────────────────────┤
 │  [Channel ▾ | All]     Current: #crypto_korea   │
 ├─────────────────────────────────────────────────┤

@@ -25,7 +25,7 @@ export function ChannelSelector({ value, onChange }: ChannelSelectorProps) {
         onChange(val ? Number(val) : undefined);
       }}
     >
-      <option value="">All chats</option>
+      <option value="">전체 채팅</option>
       {chats.map((chat) => (
         <option key={chat.chat_id} value={chat.chat_id}>
           {chat.title}

@@ -21,7 +21,7 @@ export function SearchBar({ value, onChange, loading }: SearchBarProps) {
         className="search-input"
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        placeholder="Search messages..."
+        placeholder="메시지 검색..."
         spellCheck={false}
       />
       {loading && <span className="search-spinner" />}

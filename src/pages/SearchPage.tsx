@@ -40,12 +40,12 @@ export function SearchPage({ syncing, progress }: SearchPageProps) {
           <span className="sync-dot" />
           <span className="sync-text">
             {progress?.phase === "chats"
-              ? "Syncing chats..."
+              ? "채팅 목록 동기화 중..."
               : progress?.active_chats && progress.active_chats.length > 0
-                ? `Syncing (${progress.chats_done ?? 0}/${progress.chats_total}): ${progress.active_chats.join(", ")}`
+                ? `동기화 중 (${progress.chats_done ?? 0}/${progress.chats_total}): ${progress.active_chats.join(", ")}`
                 : progress?.chats_done != null
-                  ? `Syncing messages (${progress.chats_done}/${progress.chats_total})...`
-                  : "Syncing messages..."}
+                  ? `메시지 동기화 중 (${progress.chats_done}/${progress.chats_total})...`
+                  : "메시지 동기화 중..."}
           </span>
         </div>
       )}
