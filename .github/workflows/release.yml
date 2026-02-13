@@ -47,6 +47,6 @@ jobs:
             아래에서 `.dmg` 파일을 다운로드하여 설치하세요.
 
             > **참고**: 이 앱은 코드 서명이 되어 있지 않습니다. 처음 실행할 때 앱을 우클릭하고 "열기"를 선택한 후, 대화상자에서 "열기"를 클릭하세요. 한 번만 하면 됩니다.
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: --target aarch64-apple-darwin
