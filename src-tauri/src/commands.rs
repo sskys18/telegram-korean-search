@@ -309,12 +309,25 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
                 .collect()
         };
 
-        // Use chat_rows order (Telegram dialog order = most recently active first),
-        // filtering out excluded chats.
-        let chats: Vec<_> = chat_rows
+        // Filter out excluded chats, then sort by chat type priority:
+        // broadcast channels first, small groups next, large supergroups last.
+        let mut chats: Vec<_> = chat_rows
             .into_iter()
             .filter(|c| !excluded_ids.contains(&c.chat_id))
             .collect();
+
+        // Due to grammers routing, broadcast channels are stored as "supergroup",
+        // while both old groups and supergroups are stored as "group".
+        // Distinguish supergroups from old groups by ID range (channel IDs < -1T).
+        chats.sort_by_key(|c| {
+            if c.chat_type == "supergroup" {
+                0 // broadcast channels (Peer::Channel → mislabeled "supergroup")
+            } else if c.chat_id > -1_000_000_000_000 {
+                1 // old-style small groups
+            } else {
+                2 // actual supergroups (large discussion groups)
+            }
+        });
         let chats_total = chats.len();
 
         // Phase 2: Fetch messages concurrently (3 at a time)
