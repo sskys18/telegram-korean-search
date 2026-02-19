@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicoverbruggen/tauri-settings-schema/v2/schema.json",
-  "productName": "텔레그램 한국어 검색",
+  "productName": "Telegram Korean Search",
   "version": "0.1.0",
   "identifier": "com.sskys18.telegram-korean-search",
   "build": {
