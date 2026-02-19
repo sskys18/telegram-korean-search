@@ -7,7 +7,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), sqlite::Error> {
         CREATE TABLE IF NOT EXISTS chats (
             chat_id       INTEGER PRIMARY KEY,
             title         TEXT NOT NULL,
-            chat_type     TEXT NOT NULL CHECK (chat_type IN ('group', 'supergroup', 'channel')),
+            chat_type     TEXT NOT NULL CHECK (chat_type IN ('group', 'supergroup', 'channel', 'dm')),
             username      TEXT,
             access_hash   INTEGER,
             is_excluded   INTEGER NOT NULL DEFAULT 0,
@@ -48,6 +48,9 @@ pub fn run_migrations(conn: &Connection) -> Result<(), sqlite::Error> {
 
     // Phase 2: Versioned migration — FTS5 trigram
     migrate_to_fts5(conn)?;
+
+    // Phase 3: Add 'dm' chat_type
+    migrate_add_dm_chat_type(conn)?;
 
     Ok(())
 }
@@ -93,6 +96,37 @@ fn migrate_to_fts5(conn: &Connection) -> Result<(), sqlite::Error> {
     Ok(())
 }
 
+fn migrate_add_dm_chat_type(conn: &Connection) -> Result<(), sqlite::Error> {
+    if get_schema_version(conn) >= 3 {
+        return Ok(());
+    }
+
+    // SQLite doesn't support ALTER CONSTRAINT, so recreate the table
+    conn.execute(
+        "
+        CREATE TABLE chats_new (
+            chat_id       INTEGER PRIMARY KEY,
+            title         TEXT NOT NULL,
+            chat_type     TEXT NOT NULL CHECK (chat_type IN ('group', 'supergroup', 'channel', 'dm')),
+            username      TEXT,
+            access_hash   INTEGER,
+            is_excluded   INTEGER NOT NULL DEFAULT 0,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        INSERT INTO chats_new (chat_id, title, chat_type, username, access_hash, is_excluded, created_at)
+            SELECT chat_id, title, chat_type, username, access_hash, is_excluded, created_at FROM chats;
+
+        DROP TABLE chats;
+        ALTER TABLE chats_new RENAME TO chats;
+        ",
+    )?;
+
+    conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '3')")?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::store::Store;
@@ -123,6 +157,23 @@ mod tests {
             .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = 'messages_fts'")
             .unwrap();
         assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
+    }
+
+    #[test]
+    fn test_dm_chat_type_accepted() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO chats (chat_id, title, chat_type) VALUES (12345, 'John Doe', 'dm')",
+            )
+            .unwrap();
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT chat_type FROM chats WHERE chat_id = 12345")
+            .unwrap();
+        assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
+        assert_eq!(stmt.read::<String, _>(0).unwrap(), "dm");
     }
 
     #[test]

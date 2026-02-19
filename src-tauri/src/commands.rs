@@ -322,6 +322,8 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
         chats.sort_by_key(|c| {
             if c.chat_type == "supergroup" {
                 0 // broadcast channels (Peer::Channel → mislabeled "supergroup")
+            } else if c.chat_type == "dm" {
+                3 // DMs last
             } else if c.chat_id > -1_000_000_000_000 {
                 1 // old-style small groups
             } else {

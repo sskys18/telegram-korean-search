@@ -1,6 +1,7 @@
 use grammers_client::types::Peer;
 use grammers_client::{Client, InvocationError};
 use grammers_session::defs::{PeerAuth, PeerId, PeerRef};
+use grammers_tl_types::enums::User as TlUser;
 
 use crate::collector::link::build_link;
 use crate::store::chat::ChatRow;
@@ -12,7 +13,7 @@ use super::CollectorError;
 const BATCH_SIZE: usize = 100;
 const MAX_FLOOD_RETRIES: usize = 2;
 
-/// Fetch all dialogs (groups, supergroups, channels) from Telegram.
+/// Fetch all dialogs (groups, supergroups, channels, DMs) from Telegram.
 /// Returns the chat rows without saving to the database.
 pub async fn fetch_chats(client: &Client) -> Result<Vec<ChatRow>, CollectorError> {
     let mut dialogs = client.iter_dialogs();
@@ -26,7 +27,15 @@ pub async fn fetch_chats(client: &Client) -> Result<Vec<ChatRow>, CollectorError
         let peer = dialog.peer();
 
         let (chat_type, chat_id, access_hash) = match peer {
-            Peer::User(_) => continue, // Skip DMs
+            Peer::User(user) => {
+                let id = peer.id();
+                let hash = if let TlUser::User(u) = &user.raw {
+                    u.access_hash
+                } else {
+                    None
+                };
+                ("dm", id.bot_api_dialog_id(), hash)
+            }
             Peer::Group(group) => {
                 let id = group.id();
                 ("group", id.bot_api_dialog_id(), None)
@@ -56,6 +65,10 @@ fn peer_ref_from_chat(chat: &ChatRow) -> PeerRef {
     let hash = chat.access_hash.unwrap_or(0);
     // Determine peer kind from chat_type
     match chat.chat_type.as_str() {
+        "dm" => PeerRef {
+            id: PeerId::user(chat.chat_id),
+            auth: PeerAuth::from_hash(hash),
+        },
         "group" => PeerRef {
             id: PeerId::chat(-chat.chat_id),
             auth: PeerAuth::default(),
@@ -103,7 +116,12 @@ pub async fn fetch_messages(
             continue;
         }
 
-        let link = build_link(chat.chat_id, chat.username.as_deref(), msg.id() as i64);
+        let link = build_link(
+            chat.chat_id,
+            chat.username.as_deref(),
+            msg.id() as i64,
+            &chat.chat_type,
+        );
 
         rows.push(MessageRow {
             message_id: msg.id() as i64,
@@ -247,6 +265,21 @@ mod tests {
         };
         let pr = peer_ref_from_chat(&chat);
         assert_eq!(pr.id.bare_id(), 123456);
+    }
+
+    #[test]
+    fn test_peer_ref_from_dm_chat() {
+        let chat = ChatRow {
+            chat_id: 987654, // DM chat_ids are positive user IDs
+            title: "John Doe".to_string(),
+            chat_type: "dm".to_string(),
+            username: Some("johndoe".to_string()),
+            access_hash: Some(99999),
+            is_excluded: false,
+        };
+        let pr = peer_ref_from_chat(&chat);
+        assert_eq!(pr.id.bare_id(), 987654);
+        assert_eq!(pr.auth.hash(), 99999);
     }
 
     #[test]
