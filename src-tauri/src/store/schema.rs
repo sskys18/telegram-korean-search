@@ -101,7 +101,13 @@ fn migrate_add_dm_chat_type(conn: &Connection) -> Result<(), sqlite::Error> {
         return Ok(());
     }
 
-    // SQLite doesn't support ALTER CONSTRAINT, so recreate the table
+    // SQLite doesn't support ALTER CONSTRAINT, so recreate the table.
+    // Temporarily disable foreign keys so we can drop the referenced table.
+    // PRAGMA foreign_keys cannot be changed inside a transaction.
+    conn.execute("PRAGMA foreign_keys = OFF")?;
+
+    // Drop leftover temp table from any previously interrupted migration
+    conn.execute("DROP TABLE IF EXISTS chats_new")?;
     conn.execute(
         "
         CREATE TABLE chats_new (
@@ -123,6 +129,9 @@ fn migrate_add_dm_chat_type(conn: &Connection) -> Result<(), sqlite::Error> {
     )?;
 
     conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '3')")?;
+
+    // Re-enable foreign keys
+    conn.execute("PRAGMA foreign_keys = ON")?;
 
     Ok(())
 }
