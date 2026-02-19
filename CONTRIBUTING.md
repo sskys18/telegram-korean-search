@@ -40,6 +40,16 @@ cargo tauri dev
 - Add tests for new functionality when possible
 - Ensure CI passes before requesting review
 
+### Release Labels
+
+When a PR is merged to `main`, a new version is automatically tagged and released. Add one of these labels to your PR to control the version bump:
+
+| Label | Bump | Example |
+|-------|------|---------|
+| `major` | Major | `0.2.0` -> `1.0.0` |
+| `minor` | Minor | `0.2.0` -> `0.3.0` |
+| _(no label)_ | Patch | `0.2.0` -> `0.2.1` |
+
 ## Code of Conduct
 
 This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md). Please be respectful and constructive.

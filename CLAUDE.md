@@ -73,7 +73,7 @@ cargo clippy -- -D warnings                 # Lint check
 - Tauri commands in `commands.rs` are the bridge between frontend and backend
 - Frontend calls backend via `@tauri-apps/api` invoke
 - `Store` is wrapped in `std::sync::Mutex` and shared via Tauri state
-- Schema migrations are versioned via `app_meta.schema_version` (currently v2)
+- Schema migrations are versioned via `app_meta.schema_version` (currently v3)
 - Collection functions are split: `fetch_chats`/`fetch_messages` (network-only) + brief lock for DB writes
 - Stale sessions detected by `AUTH_KEY_UNREGISTERED` error, auto-recovered by deleting session and reconnecting
 
@@ -84,6 +84,16 @@ cargo clippy -- -D warnings                 # Lint check
   session.bin              # Encrypted Telegram session
   tg-korean-search.db      # SQLite DB (includes FTS5 index)
 ```
+
+## Release Process
+
+- **Auto-release on PR merge**: When a PR is merged to `main`, the `auto-release.yml` workflow automatically bumps the version, commits it, and creates a git tag (which triggers the `release.yml` build).
+- **PR labels control version bump**:
+  - `major` label -> major bump (e.g., `0.2.0` -> `1.0.0`)
+  - `minor` label -> minor bump (e.g., `0.2.0` -> `0.3.0`)
+  - No label -> patch bump (e.g., `0.2.0` -> `0.2.1`)
+- Version is stored in 3 files: `package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` (all updated automatically by the workflow).
+- Do not manually create tags or bump versions -- let the workflow handle it.
 
 ## Do Not
 
