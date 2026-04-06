@@ -21,6 +21,13 @@ pub struct ApiCredentials {
 }
 
 #[derive(Serialize)]
+pub struct EnvCredentials {
+    pub api_id: Option<String>,
+    pub api_hash: Option<String>,
+    pub phone: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct ConnectResult {
     pub authorized: bool,
 }
@@ -69,6 +76,54 @@ fn count_topic_sources(store: &crate::store::Store, topic_id: i64) -> Result<i64
     stmt.bind((1, topic_id))?;
     stmt.next()?;
     stmt.read::<i64, _>(0)
+}
+
+/// Read credentials from .env file in the app's working directory.
+/// Looks for TG_API_ID, TG_API_HASH, TG_PHONE.
+#[tauri::command]
+pub fn read_env_credentials() -> Result<Option<EnvCredentials>, String> {
+    // Try .env in the current directory, then next to the executable
+    let candidates = [
+        std::env::current_dir().ok().map(|p| p.join(".env")),
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(".env"))),
+    ];
+
+    for candidate in candidates.iter().flatten() {
+        if let Ok(content) = std::fs::read_to_string(candidate) {
+            let mut api_id = None;
+            let mut api_hash = None;
+            let mut phone = None;
+
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, value)) = line.split_once('=') {
+                    let key = key.trim();
+                    let value = value.trim().trim_matches('"').trim_matches('\'');
+                    match key {
+                        "TG_API_ID" => api_id = Some(value.to_string()),
+                        "TG_API_HASH" => api_hash = Some(value.to_string()),
+                        "TG_PHONE" => phone = Some(value.to_string()),
+                        _ => {}
+                    }
+                }
+            }
+
+            if api_id.is_some() || api_hash.is_some() {
+                return Ok(Some(EnvCredentials {
+                    api_id,
+                    api_hash,
+                    phone,
+                }));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Read saved API credentials from the database.

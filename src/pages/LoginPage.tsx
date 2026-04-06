@@ -7,6 +7,7 @@ interface LoginPageProps {
   hint2fa: string | null;
   savedApiId: string;
   savedApiHash: string;
+  savedPhone: string;
   onLogin: (apiId: number, apiHash: string, phone: string) => void;
   onCode: (code: string) => void;
   onPassword: (password: string) => void;
@@ -19,6 +20,7 @@ export function LoginPage({
   hint2fa,
   savedApiId,
   savedApiHash,
+  savedPhone,
   onLogin,
   onCode,
   onPassword,
@@ -27,7 +29,7 @@ export function LoginPage({
   const [input, setInput] = useState("");
   const [apiId, setApiId] = useState(savedApiId);
   const [apiHash, setApiHash] = useState(savedApiHash);
-  const [phone, setPhone] = useState("");
+  const [phone, setPhone] = useState(savedPhone);
 
   if (step === "loading" || step === "connecting") {
     return (

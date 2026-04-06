@@ -137,6 +137,7 @@ pub fn run() {
             search_messages,
             get_chats,
             set_chat_excluded,
+            commands::read_env_credentials,
             commands::get_api_credentials,
             commands::save_api_credentials,
             commands::connect_telegram,

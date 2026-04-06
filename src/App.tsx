@@ -15,6 +15,7 @@ function App() {
     syncing,
     savedApiId,
     savedApiHash,
+    savedPhone,
     sendLogin,
     sendCode,
     sendPassword,
@@ -43,6 +44,7 @@ function App() {
       hint2fa={hint2fa}
       savedApiId={savedApiId}
       savedApiHash={savedApiHash}
+      savedPhone={savedPhone}
       onLogin={sendLogin}
       onCode={sendCode}
       onPassword={sendPassword}

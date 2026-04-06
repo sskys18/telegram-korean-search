@@ -37,6 +37,16 @@ export async function getDbStats(): Promise<DbStats> {
 
 // Auth API
 
+export interface EnvCredentials {
+  api_id: string | null;
+  api_hash: string | null;
+  phone: string | null;
+}
+
+export async function readEnvCredentials(): Promise<EnvCredentials | null> {
+  return invoke("read_env_credentials");
+}
+
 export async function getApiCredentials(): Promise<ApiCredentials | null> {
   return invoke("get_api_credentials");
 }

@@ -10,6 +10,7 @@ import {
   onCollectionProgress,
   onCollectionComplete,
   onCollectionError,
+  readEnvCredentials,
 } from "../api/tauri";
 import type { CollectionProgress } from "../types";
 
@@ -51,6 +52,7 @@ interface AuthState {
   progress: CollectionProgress | null;
   savedApiId: string;
   savedApiHash: string;
+  savedPhone: string;
 }
 
 function transitionToReady(
@@ -70,6 +72,7 @@ export function useAuth() {
     progress: null,
     savedApiId: "",
     savedApiHash: "",
+    savedPhone: "",
   });
 
   // On mount: check if API credentials exist
@@ -78,7 +81,15 @@ export function useAuth() {
       try {
         const creds = await getApiCredentials();
         if (!creds) {
-          setState((s) => ({ ...s, step: "login" }));
+          // No saved credentials — check .env for pre-fill
+          const env = await readEnvCredentials().catch(() => null);
+          setState((s) => ({
+            ...s,
+            step: "login",
+            savedApiId: env?.api_id ?? "",
+            savedApiHash: env?.api_hash ?? "",
+            savedPhone: env?.phone ?? "",
+          }));
           return;
         }
         // Credentials exist, try to connect
