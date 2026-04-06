@@ -7,6 +7,11 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::collector;
+use crate::store::message::MessageWithChat;
+use crate::store::wiki_category::WikiCategory;
+use crate::store::wiki_page::{WikiPage, WikiPageSearchResult};
+use crate::store::wiki_topic::WikiTopic;
+use crate::wiki;
 use crate::AppState;
 
 #[derive(Serialize)]
@@ -25,6 +30,55 @@ pub struct SignInResponse {
     pub success: bool,
     pub requires_2fa: bool,
     pub hint: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct WikiStatus {
+    pub queue_pending: i64,
+    pub queue_processing: i64,
+    pub queue_done: i64,
+    pub queue_failed: i64,
+    pub queue_skipped: i64,
+    pub topics_count: i64,
+    pub is_running: bool,
+}
+
+#[derive(Serialize)]
+pub struct WikiTopicDetail {
+    pub topic: WikiTopic,
+    pub latest_page: Option<WikiPage>,
+    pub source_count: i64,
+}
+
+#[derive(Serialize)]
+pub struct WikiSearchResult {
+    pub topics: Vec<WikiTopic>,
+    pub pages: Vec<WikiPageSearchResult>,
+}
+
+fn mask_api_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 4 {
+        return "*".repeat(chars.len());
+    }
+
+    let visible: String = chars[chars.len() - 4..].iter().collect();
+    format!("{}{}", "*".repeat(chars.len() - 4), visible)
+}
+
+fn count_wiki_topics(store: &crate::store::Store) -> Result<i64, sqlite::Error> {
+    let mut stmt = store.conn().prepare("SELECT COUNT(*) FROM wiki_topics")?;
+    stmt.next()?;
+    stmt.read::<i64, _>(0)
+}
+
+fn count_topic_sources(store: &crate::store::Store, topic_id: i64) -> Result<i64, sqlite::Error> {
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT COUNT(*) FROM wiki_topic_messages WHERE topic_id = ?")?;
+    stmt.bind((1, topic_id))?;
+    stmt.next()?;
+    stmt.read::<i64, _>(0)
 }
 
 /// Read saved API credentials from the database.
@@ -260,6 +314,254 @@ pub async fn start_collection(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+pub fn save_openai_api_key(state: State<AppState>, key: String) -> Result<(), String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .set_meta("openai_api_key", &key)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_openai_api_key(state: State<AppState>) -> Result<Option<String>, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let key = store
+        .get_meta("openai_api_key")
+        .map_err(|e| e.to_string())?;
+    Ok(key.map(|value| mask_api_key(&value)))
+}
+
+#[tauri::command]
+pub async fn validate_openai_api_key(key: String) -> Result<bool, String> {
+    wiki::llm::LlmClient::new(key)
+        .validate_key()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn start_wiki_worker(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+
+    {
+        let mut guard = state.wiki_worker_shutdown.lock().await;
+        if let Some(shutdown) = guard.as_ref() {
+            if !shutdown.load(Ordering::Relaxed) {
+                return Err("Wiki worker is already running".to_string());
+            }
+        }
+        *guard = None;
+    }
+
+    let api_key = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        store
+            .get_meta("openai_api_key")
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "OpenAI API key not configured".to_string())?
+    };
+
+    let shutdown = wiki::worker::start_worker(app.clone(), api_key);
+    let mut guard = state.wiki_worker_shutdown.lock().await;
+    *guard = Some(shutdown);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn stop_wiki_worker(state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state.wiki_worker_shutdown.lock().await;
+    if let Some(shutdown) = guard.take() {
+        shutdown.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_wiki_status(state: State<'_, AppState>) -> Result<WikiStatus, String> {
+    let (queue_stats, topics_count) = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        (
+            store.get_queue_stats().map_err(|e| e.to_string())?,
+            count_wiki_topics(&store).map_err(|e| e.to_string())?,
+        )
+    };
+
+    let is_running = state
+        .wiki_worker_shutdown
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|shutdown| !shutdown.load(Ordering::Relaxed));
+
+    Ok(WikiStatus {
+        queue_pending: queue_stats.pending,
+        queue_processing: queue_stats.processing,
+        queue_done: queue_stats.done,
+        queue_failed: queue_stats.failed,
+        queue_skipped: queue_stats.skipped,
+        topics_count,
+        is_running,
+    })
+}
+
+#[tauri::command]
+pub fn reprocess_wiki(state: State<AppState>) -> Result<(), String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.clear_classify_queue().map_err(|e| e.to_string())?;
+    store.clear_wiki_pages().map_err(|e| e.to_string())?;
+    store.clear_wiki_topics().map_err(|e| e.to_string())?;
+    store.clear_wiki_stats().map_err(|e| e.to_string())?;
+    store.enqueue_all_messages().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clear_wiki_data(state: State<AppState>) -> Result<(), String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.clear_classify_queue().map_err(|e| e.to_string())?;
+    store.clear_wiki_pages().map_err(|e| e.to_string())?;
+    store.clear_wiki_topics().map_err(|e| e.to_string())?;
+    store.clear_wiki_stats().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_trending_topics(
+    state: State<AppState>,
+    limit: usize,
+    offset: usize,
+    category_id: Option<i64>,
+) -> Result<Vec<WikiTopic>, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .get_trending_topics(limit, offset, category_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_wiki_categories(state: State<AppState>) -> Result<Vec<WikiCategory>, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store.get_all_categories().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_topic_detail(state: State<AppState>, topic_id: i64) -> Result<WikiTopicDetail, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let topic = store
+        .get_topic(topic_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Topic not found".to_string())?;
+    let latest_page = store.get_latest_page(topic_id).map_err(|e| e.to_string())?;
+    let source_count = count_topic_sources(&store, topic_id).map_err(|e| e.to_string())?;
+
+    Ok(WikiTopicDetail {
+        topic,
+        latest_page,
+        source_count,
+    })
+}
+
+#[tauri::command]
+pub fn get_topic_sources(
+    state: State<AppState>,
+    topic_id: i64,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<MessageWithChat>, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .get_topic_sources(topic_id, limit, offset)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn search_wiki(
+    state: State<AppState>,
+    query: String,
+    limit: usize,
+) -> Result<WikiSearchResult, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let topics = store
+        .search_topics(&query, limit)
+        .map_err(|e| e.to_string())?;
+    let pages = store
+        .search_wiki_pages(&query, limit)
+        .map_err(|e| e.to_string())?;
+
+    Ok(WikiSearchResult { topics, pages })
+}
+
+#[tauri::command]
+pub async fn generate_topic_summary(app: AppHandle, topic_id: i64) -> Result<WikiPage, String> {
+    let state = app.state::<AppState>();
+
+    let api_key = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        store
+            .get_meta("openai_api_key")
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "OpenAI API key not configured".to_string())?
+    };
+
+    let (topic, latest_page, needs_regeneration, sources, source_ids) = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let topic = store
+            .get_topic(topic_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Topic not found".to_string())?;
+        let latest_page = store.get_latest_page(topic_id).map_err(|e| e.to_string())?;
+        let needs_regeneration = store
+            .needs_regeneration(topic_id)
+            .map_err(|e| e.to_string())?;
+        let sources = store
+            .get_topic_sources(topic_id, 50, 0)
+            .map_err(|e| e.to_string())?;
+        let source_ids: Vec<(i64, i64)> =
+            sources.iter().map(|m| (m.chat_id, m.message_id)).collect();
+        (topic, latest_page, needs_regeneration, sources, source_ids)
+    };
+
+    if !needs_regeneration {
+        if let Some(page) = latest_page {
+            return Ok(page);
+        }
+    }
+
+    let llm = wiki::llm::LlmClient::new(api_key);
+    let source_refs: Vec<(usize, i64, &str, &str)> = sources
+        .iter()
+        .enumerate()
+        .map(|(idx, source)| {
+            (
+                idx + 1,
+                source.timestamp,
+                source.chat_title.as_str(),
+                source.text_plain.as_str(),
+            )
+        })
+        .collect();
+
+    let category = topic.category_name.as_deref().unwrap_or("Other");
+    let (content_ko, content_en) = llm
+        .generate_summary(&topic.title, category, &source_refs)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let page_id = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        store
+            .insert_wiki_page(topic_id, &content_ko, &content_en, &source_ids)
+            .map_err(|e| e.to_string())?
+    };
+
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    store
+        .get_latest_page(topic_id)
+        .map_err(|e| e.to_string())?
+        .filter(|page| page.page_id == page_id)
+        .ok_or_else(|| "Failed to load generated wiki page".to_string())
+}
+
 // Runs on a dedicated thread with a multi-threaded tokio runtime.
 // Network I/O is parallelized (up to 3 concurrent channels via Semaphore).
 // DB writes are serialized in the join_next() loop — no mutex contention.
@@ -384,6 +686,10 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
                         let store = state.store.lock().unwrap();
                         if let Err(e) = store.insert_messages_batch(&rows) {
                             log::warn!("Failed to save messages for {}: {}", chat.title, e);
+                        } else {
+                            let items: Vec<(i64, i64)> =
+                                rows.iter().map(|r| (r.chat_id, r.message_id)).collect();
+                            let _ = store.enqueue_for_classification(&items);
                         }
                     }
                     log::info!("Fetched {} messages for {}", count, chat.title);

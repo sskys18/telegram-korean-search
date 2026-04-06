@@ -10,6 +10,7 @@ pub mod wiki;
 use grammers_client::types::LoginToken;
 use grammers_client::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::sync::Mutex;
 use store::message::Cursor;
 use store::Store;
@@ -22,6 +23,7 @@ pub struct AppState {
     pub login_token: TokioMutex<Option<LoginToken>>,
     pub password_token: TokioMutex<Option<Box<grammers_client::types::PasswordToken>>>,
     pub runner_handle: TokioMutex<Option<tokio::task::JoinHandle<()>>>,
+    pub wiki_worker_shutdown: TokioMutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,6 +106,7 @@ pub fn run() {
             login_token: TokioMutex::new(None),
             password_token: TokioMutex::new(None),
             runner_handle: TokioMutex::new(None),
+            wiki_worker_shutdown: TokioMutex::new(None),
         })
         .setup(|app| {
             #[cfg(desktop)]
@@ -141,6 +144,20 @@ pub fn run() {
             commands::submit_login_code,
             commands::submit_password,
             commands::start_collection,
+            commands::save_openai_api_key,
+            commands::get_openai_api_key,
+            commands::validate_openai_api_key,
+            commands::start_wiki_worker,
+            commands::stop_wiki_worker,
+            commands::get_wiki_status,
+            commands::reprocess_wiki,
+            commands::clear_wiki_data,
+            commands::get_trending_topics,
+            commands::get_wiki_categories,
+            commands::get_topic_detail,
+            commands::get_topic_sources,
+            commands::search_wiki,
+            commands::generate_topic_summary,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -149,6 +166,19 @@ pub fn run() {
                 // Gracefully shut down the Telegram runner on app exit
                 // to prevent stale session files.
                 use tauri::Manager;
+                let shutdown = {
+                    let state = app.state::<AppState>();
+                    state
+                        .wiki_worker_shutdown
+                        .try_lock()
+                        .ok()
+                        .and_then(|mut g| g.take())
+                };
+                if let Some(flag) = shutdown {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    log::info!("Wiki worker shutdown requested on exit");
+                }
+
                 let handle = {
                     let state = app.state::<AppState>();
                     state
