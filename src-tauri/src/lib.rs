@@ -5,6 +5,7 @@ pub mod logging;
 pub mod search;
 pub mod security;
 pub mod store;
+pub mod wiki;
 
 use grammers_client::types::LoginToken;
 use grammers_client::Client;
