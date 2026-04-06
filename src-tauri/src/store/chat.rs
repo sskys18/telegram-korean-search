@@ -67,7 +67,7 @@ impl Store {
     pub fn get_all_chats(&self) -> Result<Vec<ChatRow>, sqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT chat_id, title, chat_type, username, access_hash, is_excluded
-             FROM chats ORDER BY title",
+             FROM chats WHERE TRIM(title) != '' ORDER BY title",
         )?;
         let mut results = Vec::new();
         while let Ok(sqlite::State::Row) = stmt.next() {
