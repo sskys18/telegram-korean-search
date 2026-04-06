@@ -20,25 +20,55 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```
 src-tauri/src/
-  commands.rs       # Tauri command handlers (auth, search, collection)
-  lib.rs            # App state, initialization, graceful shutdown
-  main.rs           # Entry point
-  error.rs          # Error types
-  logging.rs        # flexi_logger setup
-  collector/        # Telegram message fetching (grammers)
-  search/           # FTS5 search engine with highlighting
-  security/         # AES-256-GCM session encryption, Keychain
-  store/            # SQLite data layer (schema, CRUD, FTS5 indexing)
+  commands.rs          # Tauri command handlers (auth, search, collection)
+  lib.rs               # App state, initialization, graceful shutdown
+  main.rs              # Entry point
+  error.rs             # Error types
+  logging.rs           # flexi_logger setup
+  collector/
+    mod.rs             # Module root
+    auth.rs            # Telegram authentication logic
+    link.rs            # Link/invite handling
+    messages.rs        # Message fetching from Telegram
+  search/
+    mod.rs             # Module root
+    engine.rs          # FTS5 search engine
+    highlight.rs       # Search result highlighting (backend)
+  security/
+    mod.rs             # Module root
+    crypto.rs          # AES-256-GCM session encryption
+    keychain.rs        # macOS Keychain integration
+  store/
+    mod.rs             # Module root
+    schema.rs          # DB schema & migrations
+    app_meta.rs        # App metadata (schema_version, etc.)
+    chat.rs            # Chat CRUD operations
+    message.rs         # Message CRUD & FTS5 indexing
+    sync_state.rs      # Per-chat sync state tracking
 
 src/
-  App.tsx           # Root component, auth/search routing
-  App.css           # Global styles
-  hooks/            # useAuth, useSearch hooks
-  pages/            # LoginPage, SearchPage
-  components/       # ChannelSelector, SearchResults, etc.
-  api/              # Tauri invoke wrappers
-  types/            # TypeScript type definitions
-  utils/            # Helpers
+  main.tsx             # React entry point
+  App.tsx              # Root component, auth/search routing
+  App.css              # Global styles
+  api/
+    tauri.ts           # Tauri invoke wrappers
+  components/
+    ChannelSelector.tsx
+    SearchBar.tsx
+    ResultList.tsx     # Search result list
+    ResultItem.tsx     # Individual search result
+  hooks/
+    useAuth.ts
+    useSearch.ts
+    useInfiniteScroll.ts
+  pages/
+    LoginPage.tsx
+    SearchPage.tsx
+  types/
+    index.ts           # TypeScript type definitions
+  utils/
+    format.ts          # Formatting helpers
+    highlight.ts       # Search highlight utility
 ```
 
 ## Build & Run
