@@ -3,6 +3,11 @@ pub mod chat;
 pub mod message;
 pub mod schema;
 pub mod sync_state;
+pub mod wiki_category;
+pub mod wiki_page;
+pub mod wiki_queue;
+pub mod wiki_stats;
+pub mod wiki_topic;
 
 use sqlite::Connection;
 use std::path::PathBuf;
@@ -49,6 +54,12 @@ impl Store {
 
     pub fn commit_transaction(&self) -> Result<(), sqlite::Error> {
         self.conn.execute("COMMIT")
+    }
+
+    pub(crate) fn last_insert_rowid(&self) -> Result<i64, sqlite::Error> {
+        let mut stmt = self.conn.prepare("SELECT last_insert_rowid()")?;
+        stmt.next()?;
+        stmt.read::<i64, _>(0)
     }
 }
 

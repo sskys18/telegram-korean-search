@@ -52,6 +52,9 @@ pub fn run_migrations(conn: &Connection) -> Result<(), sqlite::Error> {
     // Phase 3: Add 'dm' chat_type
     migrate_add_dm_chat_type(conn)?;
 
+    // Phase 4: Wiki feature tables
+    migrate_to_wiki_tables(conn)?;
+
     Ok(())
 }
 
@@ -136,6 +139,148 @@ fn migrate_add_dm_chat_type(conn: &Connection) -> Result<(), sqlite::Error> {
     Ok(())
 }
 
+fn migrate_to_wiki_tables(conn: &Connection) -> Result<(), sqlite::Error> {
+    if get_schema_version(conn) >= 4 {
+        return Ok(());
+    }
+
+    conn.execute(
+        "
+        CREATE TABLE IF NOT EXISTS wiki_categories (
+            category_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+            name         TEXT NOT NULL UNIQUE,
+            name_ko      TEXT,
+            sort_order   INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS wiki_topics (
+            topic_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            title           TEXT NOT NULL UNIQUE,
+            title_ko        TEXT,
+            category_id     INTEGER REFERENCES wiki_categories(category_id),
+            trending_score  REAL NOT NULL DEFAULT 0.0,
+            message_count   INTEGER NOT NULL DEFAULT 0,
+            channel_count   INTEGER NOT NULL DEFAULT 0,
+            first_seen_at   INTEGER,
+            last_seen_at    INTEGER,
+            last_summary_at INTEGER,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_wiki_topics_trending
+            ON wiki_topics (trending_score DESC);
+        CREATE INDEX IF NOT EXISTS idx_wiki_topics_category
+            ON wiki_topics (category_id);
+        CREATE INDEX IF NOT EXISTS idx_wiki_topics_last_seen
+            ON wiki_topics (last_seen_at DESC);
+
+        CREATE TABLE IF NOT EXISTS wiki_topic_aliases (
+            alias_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic_id   INTEGER NOT NULL REFERENCES wiki_topics(topic_id) ON DELETE CASCADE,
+            alias      TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_wiki_aliases_topic
+            ON wiki_topic_aliases (topic_id);
+
+        CREATE TABLE IF NOT EXISTS wiki_topic_messages (
+            topic_id          INTEGER NOT NULL REFERENCES wiki_topics(topic_id) ON DELETE CASCADE,
+            chat_id           INTEGER NOT NULL,
+            message_id        INTEGER NOT NULL,
+            relevance         REAL NOT NULL DEFAULT 1.0,
+            assigned_category TEXT,
+            PRIMARY KEY (topic_id, chat_id, message_id),
+            FOREIGN KEY (chat_id, message_id) REFERENCES messages(chat_id, message_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_topic_messages_msg
+            ON wiki_topic_messages (chat_id, message_id);
+
+        CREATE TABLE IF NOT EXISTS wiki_pages (
+            page_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic_id     INTEGER NOT NULL REFERENCES wiki_topics(topic_id) ON DELETE CASCADE,
+            content_ko   TEXT NOT NULL,
+            content_en   TEXT NOT NULL,
+            source_count INTEGER,
+            source_hash  TEXT,
+            version      INTEGER NOT NULL DEFAULT 1,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (topic_id, version)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_wiki_pages_topic
+            ON wiki_pages (topic_id, version DESC);
+
+        CREATE TABLE IF NOT EXISTS wiki_page_sources (
+            page_id        INTEGER NOT NULL REFERENCES wiki_pages(page_id) ON DELETE CASCADE,
+            citation_index INTEGER NOT NULL,
+            chat_id        INTEGER NOT NULL,
+            message_id     INTEGER NOT NULL,
+            PRIMARY KEY (page_id, citation_index)
+        );
+
+        CREATE TABLE IF NOT EXISTS wiki_classify_queue (
+            chat_id      INTEGER NOT NULL,
+            message_id   INTEGER NOT NULL,
+            status       TEXT NOT NULL DEFAULT 'pending'
+                         CHECK (status IN ('pending', 'processing', 'done', 'failed', 'skipped')),
+            attempts     INTEGER NOT NULL DEFAULT 0,
+            error        TEXT,
+            claimed_at   TEXT,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+            processed_at TEXT,
+            PRIMARY KEY (chat_id, message_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_queue_status
+            ON wiki_classify_queue (status, created_at);
+
+        CREATE TABLE IF NOT EXISTS topic_stats_daily (
+            topic_id  INTEGER NOT NULL REFERENCES wiki_topics(topic_id) ON DELETE CASCADE,
+            date      TEXT NOT NULL,
+            msg_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (topic_id, date)
+        );
+
+        CREATE TABLE IF NOT EXISTS topic_channel_membership (
+            topic_id INTEGER NOT NULL REFERENCES wiki_topics(topic_id) ON DELETE CASCADE,
+            date     TEXT NOT NULL,
+            chat_id  INTEGER NOT NULL,
+            PRIMARY KEY (topic_id, date, chat_id)
+        );
+        ",
+    )?;
+
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS wiki_pages_fts USING fts5(
+            content_ko, content_en,
+            content='wiki_pages',
+            tokenize='trigram case_sensitive 0'
+        )",
+    )?;
+
+    conn.execute(
+        "
+        INSERT OR IGNORE INTO wiki_categories (name, name_ko, sort_order) VALUES
+            ('DeFi', '디파이', 1),
+            ('Trading', '트레이딩', 2),
+            ('L1/L2', '레이어1/2', 3),
+            ('NFT', 'NFT', 4),
+            ('Airdrop', '에어드롭', 5),
+            ('Regulation', '규제', 6),
+            ('Macro', '매크로', 7),
+            ('Scam Alert', '스캠 경고', 8),
+            ('Other', '기타', 99);
+        ",
+    )?;
+
+    conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '4')")?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::store::Store;
@@ -199,5 +344,42 @@ mod tests {
 
         assert!(!tables.contains(&"index_terms".to_string()));
         assert!(!tables.contains(&"postings".to_string()));
+    }
+
+    #[test]
+    fn test_wiki_tables_created() {
+        let store = Store::open_in_memory().unwrap();
+        let mut tables = Vec::new();
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            tables.push(stmt.read::<String, _>("name").unwrap());
+        }
+
+        assert!(tables.contains(&"wiki_categories".to_string()));
+        assert!(tables.contains(&"wiki_topics".to_string()));
+        assert!(tables.contains(&"wiki_topic_aliases".to_string()));
+        assert!(tables.contains(&"wiki_topic_messages".to_string()));
+        assert!(tables.contains(&"wiki_pages".to_string()));
+        assert!(tables.contains(&"wiki_page_sources".to_string()));
+        assert!(tables.contains(&"wiki_classify_queue".to_string()));
+        assert!(tables.contains(&"topic_stats_daily".to_string()));
+        assert!(tables.contains(&"topic_channel_membership".to_string()));
+    }
+
+    #[test]
+    fn test_wiki_seed_categories() {
+        let store = Store::open_in_memory().unwrap();
+        let mut count = 0_i64;
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT COUNT(*) FROM wiki_categories")
+            .unwrap();
+        if let Ok(sqlite::State::Row) = stmt.next() {
+            count = stmt.read::<i64, _>(0).unwrap();
+        }
+        assert_eq!(count, 9);
     }
 }
