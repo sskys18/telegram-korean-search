@@ -226,11 +226,39 @@ pub async fn incremental_sync(
             Ok(rows) => {
                 let count = rows.len();
                 if !rows.is_empty() {
+                    let newest_id = rows.iter().map(|r| r.message_id).max().unwrap();
                     let s = store
                         .lock()
                         .map_err(|e| CollectorError::Api(e.to_string()))?;
                     s.insert_messages_batch(&rows)
                         .map_err(|e| CollectorError::Api(format!("message save error: {}", e)))?;
+
+                    let now = {
+                        let d = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap();
+                        format!("{}", d.as_secs())
+                    };
+                    match s.get_sync_state(chat.chat_id) {
+                        Ok(Some(mut state)) => {
+                            if newest_id > state.last_message_id {
+                                state.last_message_id = newest_id;
+                            }
+                            state.last_sync_at = Some(now);
+                            let _ = s.upsert_sync_state(&state);
+                        }
+                        _ => {
+                            let _ = s.upsert_sync_state(
+                                &crate::store::sync_state::SyncStateRow {
+                                    chat_id: chat.chat_id,
+                                    last_message_id: newest_id,
+                                    oldest_message_id: None,
+                                    initial_done: false,
+                                    last_sync_at: Some(now),
+                                },
+                            );
+                        }
+                    }
                 }
                 total += count;
                 log::info!("Synced {} messages for chat {}", count, chat.title);

@@ -668,10 +668,26 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
 
         let mut join_set = JoinSet::new();
 
+        // Read sync states upfront (single brief lock)
+        let sync_states: std::collections::HashMap<i64, i64> = {
+            let store = state.store.lock().unwrap();
+            chats
+                .iter()
+                .filter_map(|c| {
+                    store
+                        .get_sync_state(c.chat_id)
+                        .ok()
+                        .flatten()
+                        .map(|s| (c.chat_id, s.last_message_id))
+                })
+                .collect()
+        };
+
         for (i, chat) in chats.into_iter().enumerate() {
             let sem = Arc::clone(&semaphore);
             let cli = Arc::clone(&client);
             let titles = Arc::clone(&active_titles);
+            let oldest_id = sync_states.get(&chat.chat_id).copied();
 
             join_set.spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
@@ -685,7 +701,7 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
                 titles.lock().await.push(chat.title.clone());
 
                 let result =
-                    collector::messages::fetch_messages_with_retry(&cli, &chat, None).await;
+                    collector::messages::fetch_messages_with_retry(&cli, &chat, oldest_id).await;
 
                 // Remove from active list
                 titles.lock().await.retain(|t| t != &chat.title);
@@ -708,6 +724,7 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
                 Ok(rows) => {
                     let count = rows.len();
                     if !rows.is_empty() {
+                        let newest_id = rows.iter().map(|r| r.message_id).max().unwrap();
                         let store = state.store.lock().unwrap();
                         if let Err(e) = store.insert_messages_batch(&rows) {
                             log::warn!("Failed to save messages for {}: {}", chat.title, e);
@@ -715,6 +732,35 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
                             let items: Vec<(i64, i64)> =
                                 rows.iter().map(|r| (r.chat_id, r.message_id)).collect();
                             let _ = store.enqueue_for_classification(&items);
+
+                            // Update sync state so next restart skips already-fetched messages
+                            let now = format!(
+                                "{}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs()
+                            );
+                            match store.get_sync_state(chat.chat_id) {
+                                Ok(Some(mut ss)) => {
+                                    if newest_id > ss.last_message_id {
+                                        ss.last_message_id = newest_id;
+                                    }
+                                    ss.last_sync_at = Some(now);
+                                    let _ = store.upsert_sync_state(&ss);
+                                }
+                                _ => {
+                                    let _ = store.upsert_sync_state(
+                                        &crate::store::sync_state::SyncStateRow {
+                                            chat_id: chat.chat_id,
+                                            last_message_id: newest_id,
+                                            oldest_message_id: None,
+                                            initial_done: false,
+                                            last_sync_at: Some(now),
+                                        },
+                                    );
+                                }
+                            }
                         }
                     }
                     log::info!("Fetched {} messages for {}", count, chat.title);

@@ -179,6 +179,10 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
         if processed_count.is_multiple_of(100) {
             let store = state.store.lock().unwrap();
             total_channels = store.get_total_active_channels().unwrap_or(1);
+            let recovered = store.recover_stale_claims().unwrap_or(0);
+            if recovered > 0 {
+                log::info!("Wiki worker: recovered {} stale claims", recovered);
+            }
         }
 
         if processed_count.is_multiple_of(50) {

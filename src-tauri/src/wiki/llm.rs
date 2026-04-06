@@ -75,12 +75,15 @@ pub fn classify_batch_size() -> usize {
     BATCH_SIZE
 }
 
+const CODEX_TIMEOUT_SECS: u64 = 120;
+
 /// Run a prompt through `codex exec` with a specific model.
+/// Times out after CODEX_TIMEOUT_SECS and kills the subprocess.
 fn run_codex(prompt: &str, model: &str) -> Result<String, LlmError> {
     let output_file =
         std::env::temp_dir().join(format!("tg-wiki-codex-{}.txt", std::process::id()));
 
-    let result = Command::new("codex")
+    let mut child = Command::new("codex")
         .args([
             "exec",
             "--ephemeral",
@@ -91,12 +94,48 @@ fn run_codex(prompt: &str, model: &str) -> Result<String, LlmError> {
             output_file.to_str().unwrap_or("/tmp/tg-wiki-codex.txt"),
             prompt,
         ])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| LlmError::Exec(format!("Failed to run codex: {}", e)))?;
 
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        let stdout = String::from_utf8_lossy(&result.stdout);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(CODEX_TIMEOUT_SECS);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_file(&output_file);
+                    return Err(LlmError::Exec(format!(
+                        "codex timed out after {}s",
+                        CODEX_TIMEOUT_SECS
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => return Err(LlmError::Exec(format!("Failed to wait on codex: {}", e))),
+        }
+    };
+
+    if !status.success() {
+        let stderr = child
+            .stderr
+            .map(|mut s| {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut s, &mut buf).ok();
+                buf
+            })
+            .unwrap_or_default();
+        let stdout = child
+            .stdout
+            .map(|mut s| {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut s, &mut buf).ok();
+                buf
+            })
+            .unwrap_or_default();
         return Err(LlmError::Exec(format!(
             "codex exec failed: {}{}",
             stderr, stdout
