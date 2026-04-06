@@ -1,5 +1,8 @@
+import { useState } from "react";
 import { SearchPage } from "./pages/SearchPage";
 import { LoginPage } from "./pages/LoginPage";
+import { WikiPage } from "./pages/WikiPage";
+import { TabBar } from "./components/TabBar";
 import { useAuth } from "./hooks/useAuth";
 import "./App.css";
 
@@ -18,8 +21,19 @@ function App() {
     goBack,
   } = useAuth();
 
+  const [activeTab, setActiveTab] = useState<"search" | "wiki">("search");
+
   if (step === "ready") {
-    return <SearchPage syncing={syncing} progress={progress} />;
+    return (
+      <div className="app-shell">
+        <TabBar activeTab={activeTab} onTabChange={setActiveTab} />
+        {activeTab === "search" ? (
+          <SearchPage syncing={syncing} progress={progress} />
+        ) : (
+          <WikiPage />
+        )}
+      </div>
+    );
   }
 
   return (
