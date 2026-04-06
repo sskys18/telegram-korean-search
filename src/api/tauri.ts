@@ -31,6 +31,13 @@ export async function getChats(): Promise<ChatRow[]> {
   return invoke("get_chats");
 }
 
+export async function setChatExcluded(
+  chatId: number,
+  excluded: boolean,
+): Promise<void> {
+  return invoke("set_chat_excluded", { chatId, excluded });
+}
+
 export async function getDbStats(): Promise<DbStats> {
   return invoke("get_db_stats");
 }

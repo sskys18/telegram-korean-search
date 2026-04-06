@@ -68,6 +68,12 @@ export function useSearch() {
     }
   }, [nextCursor, loading, query, chatId, doSearch]);
 
+  const refresh = useCallback(() => {
+    if (query.trim()) {
+      doSearch(query, chatId);
+    }
+  }, [query, chatId, doSearch]);
+
   return {
     query,
     chatId,
@@ -77,5 +83,6 @@ export function useSearch() {
     setQuery: handleQueryChange,
     setChatId: handleChatChange,
     loadMore,
+    refresh,
   };
 }

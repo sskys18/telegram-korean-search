@@ -12,7 +12,7 @@ interface SearchPageProps {
 }
 
 export function SearchPage({ syncing, progress }: SearchPageProps) {
-  const { query, chatId, items, loading, hasMore, setQuery, setChatId, loadMore } =
+  const { query, chatId, items, loading, hasMore, setQuery, setChatId, loadMore, refresh } =
     useSearch();
 
   useEffect(() => {
@@ -32,6 +32,7 @@ export function SearchPage({ syncing, progress }: SearchPageProps) {
         <ChannelSelector
           value={chatId}
           onChange={setChatId}
+          onExclusionChange={refresh}
           key={syncing ? "s" : "d"}
         />
       </div>

@@ -173,6 +173,29 @@ body {
   cursor: default;
 }
 
+.channel-option {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.channel-check {
+  accent-color: #0078d4;
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.channel-option-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.channel-option.excluded .channel-option-title {
+  color: #666;
+}
+
 /* Result List */
 .result-list {
   flex: 1;
