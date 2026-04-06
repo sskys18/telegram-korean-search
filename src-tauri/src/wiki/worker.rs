@@ -8,11 +8,11 @@ use crate::wiki::llm::{classify_batch_size, ClassifiedTopic, LlmClient, MessageF
 use crate::wiki::trending::calculate_trending_score;
 use crate::AppState;
 
-pub fn start_worker(app: AppHandle) -> Arc<AtomicBool> {
+pub fn start_worker(app: AppHandle) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
 
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -24,7 +24,7 @@ pub fn start_worker(app: AppHandle) -> Arc<AtomicBool> {
         });
     });
 
-    shutdown
+    (shutdown, handle)
 }
 
 async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {

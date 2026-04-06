@@ -248,15 +248,13 @@ pub async fn incremental_sync(
                             let _ = s.upsert_sync_state(&state);
                         }
                         _ => {
-                            let _ = s.upsert_sync_state(
-                                &crate::store::sync_state::SyncStateRow {
-                                    chat_id: chat.chat_id,
-                                    last_message_id: newest_id,
-                                    oldest_message_id: None,
-                                    initial_done: false,
-                                    last_sync_at: Some(now),
-                                },
-                            );
+                            let _ = s.upsert_sync_state(&crate::store::sync_state::SyncStateRow {
+                                chat_id: chat.chat_id,
+                                last_message_id: newest_id,
+                                oldest_message_id: None,
+                                initial_done: false,
+                                last_sync_at: Some(now),
+                            });
                         }
                     }
                 }

@@ -24,6 +24,7 @@ pub struct AppState {
     pub password_token: TokioMutex<Option<Box<grammers_client::types::PasswordToken>>>,
     pub runner_handle: TokioMutex<Option<tokio::task::JoinHandle<()>>>,
     pub wiki_worker_shutdown: TokioMutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    pub wiki_worker_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +108,7 @@ pub fn run() {
             password_token: TokioMutex::new(None),
             runner_handle: TokioMutex::new(None),
             wiki_worker_shutdown: TokioMutex::new(None),
+            wiki_worker_handle: Mutex::new(None),
         })
         .setup(|app| {
             #[cfg(desktop)]

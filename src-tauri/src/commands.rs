@@ -384,19 +384,44 @@ pub async fn start_wiki_worker(app: AppHandle) -> Result<(), String> {
 
     let state = app.state::<AppState>();
 
+    // Check if worker thread is actually alive
     {
-        let mut guard = state.wiki_worker_shutdown.lock().await;
-        if let Some(shutdown) = guard.as_ref() {
-            if !shutdown.load(Ordering::Relaxed) {
-                return Err("Wiki worker is already running".to_string());
+        let thread_alive = {
+            let handle_guard = state.wiki_worker_handle.lock().map_err(|e| e.to_string())?;
+            handle_guard.as_ref().is_some_and(|h| !h.is_finished())
+        };
+
+        if thread_alive {
+            let guard = state.wiki_worker_shutdown.lock().await;
+            if let Some(shutdown) = guard.as_ref() {
+                if !shutdown.load(Ordering::Relaxed) {
+                    return Err("Wiki worker is already running".to_string());
+                }
             }
         }
+
+        // Clean up dead state
+        let mut guard = state.wiki_worker_shutdown.lock().await;
         *guard = None;
     }
 
-    let shutdown = wiki::worker::start_worker(app.clone());
+    // Recover any stale processing items before starting
+    {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let recovered = store.recover_stale_claims().unwrap_or(0);
+        if recovered > 0 {
+            log::info!(
+                "Recovered {} stale claims before starting worker",
+                recovered
+            );
+        }
+    }
+
+    let (shutdown, handle) = wiki::worker::start_worker(app.clone());
     let mut guard = state.wiki_worker_shutdown.lock().await;
     *guard = Some(shutdown);
+    let mut handle_guard = state.wiki_worker_handle.lock().map_err(|e| e.to_string())?;
+    *handle_guard = Some(handle);
     Ok(())
 }
 
@@ -419,12 +444,20 @@ pub async fn get_wiki_status(state: State<'_, AppState>) -> Result<WikiStatus, S
         )
     };
 
-    let is_running = state
-        .wiki_worker_shutdown
+    let thread_alive = state
+        .wiki_worker_handle
         .lock()
-        .await
+        .map_err(|e| e.to_string())?
         .as_ref()
-        .is_some_and(|shutdown| !shutdown.load(Ordering::Relaxed));
+        .is_some_and(|h| !h.is_finished());
+
+    let is_running = thread_alive
+        && state
+            .wiki_worker_shutdown
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|shutdown| !shutdown.load(Ordering::Relaxed));
 
     Ok(WikiStatus {
         queue_pending: queue_stats.pending,
