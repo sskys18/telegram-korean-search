@@ -1,156 +1,176 @@
 import { useState } from "react";
-
-interface WorkerApi {
-  apiKey: string;
-  setApiKey: (key: string) => void;
-  savedKeyMask: string | null;
-  status: {
-    pending: number;
-    done: number;
-    failed: number;
-    skipped: number;
-    topics_count: number;
-    is_running: boolean;
-  };
-  progress: {
-    processed: number;
-    total: number;
-    queue_remaining: number;
-  } | null;
-  error: string | null;
-  validationMessage: string | null;
-  validating: boolean;
-  busy: boolean;
-  saveApiKey: () => Promise<boolean>;
-  validateApiKey: () => Promise<boolean>;
-  startWorker: () => Promise<void>;
-  stopWorker: () => Promise<void>;
-  reprocessWiki: () => Promise<void>;
-  clearWikiData: () => Promise<void>;
-}
+import type { WikiProgress, WikiStatus } from "../../types";
 
 interface WikiSettingsProps {
-  worker: WorkerApi;
+  apiKey: string;
+  setApiKey: (value: string) => void;
+  savedKeyMask: string | null;
+  status: WikiStatus;
+  progress: WikiProgress | null;
+  loading: boolean;
+  busy: boolean;
+  validating: boolean;
+  error: string | null;
+  validationMessage: string | null;
+  onSaveApiKey: () => Promise<boolean>;
+  onValidateApiKey: () => Promise<boolean>;
+  onStartWorker: () => Promise<void>;
+  onStopWorker: () => Promise<void>;
+  onReprocessWiki: () => Promise<void>;
+  onClearWikiData: () => Promise<void>;
 }
 
-export function WikiSettings({ worker }: WikiSettingsProps) {
-  const [expanded, setExpanded] = useState(!worker.savedKeyMask);
-  const hasKey = !!worker.savedKeyMask;
+export function WikiSettings({
+  apiKey,
+  setApiKey,
+  savedKeyMask,
+  status,
+  progress,
+  loading,
+  busy,
+  validating,
+  error,
+  validationMessage,
+  onSaveApiKey,
+  onValidateApiKey,
+  onStartWorker,
+  onStopWorker,
+  onReprocessWiki,
+  onClearWikiData,
+}: WikiSettingsProps) {
+  const [openPanel, setOpenPanel] = useState(false);
+
+  const handleReprocess = async () => {
+    if (window.confirm("Rebuild the wiki queue and summaries from collected messages?")) {
+      await onReprocessWiki();
+    }
+  };
+
+  const handleClear = async () => {
+    if (window.confirm("Clear all wiki topics, pages, and queue data?")) {
+      await onClearWikiData();
+    }
+  };
 
   return (
     <div className="wiki-settings">
       <button
-        className="settings-toggle"
-        onClick={() => setExpanded(!expanded)}
+        type="button"
+        className="wiki-settings-toggle"
+        onClick={() => setOpenPanel((prev) => !prev)}
       >
-        {expanded ? "\u25B2" : "\u2699"} Wiki Settings
+        <span>Wiki Settings</span>
+        <span>{openPanel ? "Hide" : "Show"}</span>
       </button>
-
-      {expanded && (
-        <div className="settings-panel">
-          <div className="settings-row">
-            <label>OpenAI API Key:</label>
-            {hasKey ? (
-              <span className="api-key-display">{worker.savedKeyMask}</span>
-            ) : (
-              <div className="key-input-group">
-                <input
-                  type="password"
-                  value={worker.apiKey}
-                  onChange={(e) => worker.setApiKey(e.target.value)}
-                  placeholder="sk-..."
-                  className="key-input"
-                />
-                <button
-                  onClick={() => worker.saveApiKey()}
-                  disabled={worker.busy || !worker.apiKey.trim()}
-                  className="key-save-btn"
-                >
-                  Save
-                </button>
-                <button
-                  onClick={() => worker.validateApiKey()}
-                  disabled={worker.validating || !worker.apiKey.trim()}
-                  className="action-btn"
-                >
-                  {worker.validating ? "..." : "Validate"}
-                </button>
-              </div>
-            )}
+      {openPanel && (
+        <div className="wiki-settings-panel">
+          <label className="wiki-field">
+            <span className="wiki-field-label">OpenAI API Key</span>
+            <input
+              type="password"
+              className="search-input"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder={savedKeyMask || "sk-..."}
+              spellCheck={false}
+            />
+          </label>
+          <div className="wiki-actions-row">
+            <button
+              type="button"
+              className="wiki-primary-button"
+              disabled={busy || !apiKey.trim()}
+              onClick={() => {
+                void onSaveApiKey();
+              }}
+            >
+              Save Key
+            </button>
+            <button
+              type="button"
+              className="wiki-inline-button"
+              disabled={busy || validating || !apiKey.trim()}
+              onClick={() => {
+                void onValidateApiKey();
+              }}
+            >
+              {validating ? "Validating..." : "Validate"}
+            </button>
           </div>
 
-          {worker.validationMessage && (
-            <div className="settings-stats">{worker.validationMessage}</div>
+          <div className="wiki-queue-grid">
+            <div>
+              <span className="wiki-stat-label">Pending</span>
+              <strong>{loading ? "-" : status.pending}</strong>
+            </div>
+            <div>
+              <span className="wiki-stat-label">Processing</span>
+              <strong>{loading ? "-" : status.processing}</strong>
+            </div>
+            <div>
+              <span className="wiki-stat-label">Done</span>
+              <strong>{loading ? "-" : status.done}</strong>
+            </div>
+            <div>
+              <span className="wiki-stat-label">Failed</span>
+              <strong>{loading ? "-" : status.failed}</strong>
+            </div>
+            <div>
+              <span className="wiki-stat-label">Skipped</span>
+              <strong>{loading ? "-" : status.skipped}</strong>
+            </div>
+            <div>
+              <span className="wiki-stat-label">Topics</span>
+              <strong>{loading ? "-" : status.topics_count}</strong>
+            </div>
+          </div>
+
+          {progress && (
+            <div className="wiki-progress-text">
+              Processed {progress.processed}/{progress.total} with{" "}
+              {progress.queue_remaining} queued.
+            </div>
           )}
 
-          <div className="settings-stats">
-            <div>
-              Queue: {worker.status.pending} pending /{" "}
-              {worker.status.done + worker.status.skipped} done /{" "}
-              {worker.status.failed} failed
-            </div>
-            <div>Topics: {worker.status.topics_count}</div>
-            <div>
-              Worker: {worker.status.is_running ? "Running" : "Stopped"}
-            </div>
+          <div className="wiki-actions-row">
+            <button
+              type="button"
+              className="wiki-primary-button"
+              disabled={busy || loading}
+              onClick={() => {
+                if (status.is_running) {
+                  void onStopWorker();
+                } else {
+                  void onStartWorker();
+                }
+              }}
+            >
+              {status.is_running ? "Stop Worker" : "Start Worker"}
+            </button>
+            <button
+              type="button"
+              className="wiki-inline-button"
+              disabled={busy}
+              onClick={() => {
+                void handleReprocess();
+              }}
+            >
+              Reprocess
+            </button>
+            <button
+              type="button"
+              className="wiki-danger-button"
+              disabled={busy}
+              onClick={() => {
+                void handleClear();
+              }}
+            >
+              Clear
+            </button>
           </div>
 
-          {worker.progress && (
-            <div className="settings-progress">
-              <div className="progress-bar-container">
-                <div
-                  className="progress-bar-fill"
-                  style={{
-                    width: `${worker.progress.total > 0 ? (worker.progress.processed / worker.progress.total) * 100 : 0}%`,
-                  }}
-                />
-              </div>
-              <div className="progress-text">
-                {worker.progress.processed} / {worker.progress.total} (
-                {worker.progress.queue_remaining} remaining)
-              </div>
-            </div>
-          )}
-
-          {worker.error && <div className="settings-error">{worker.error}</div>}
-
-          <div className="settings-actions">
-            {hasKey && (
-              <>
-                {worker.status.is_running ? (
-                  <button
-                    onClick={worker.stopWorker}
-                    disabled={worker.busy}
-                    className="action-btn"
-                  >
-                    Stop Worker
-                  </button>
-                ) : (
-                  <button
-                    onClick={worker.startWorker}
-                    disabled={worker.busy}
-                    className="action-btn action-primary"
-                  >
-                    Start Worker
-                  </button>
-                )}
-                <button
-                  onClick={worker.reprocessWiki}
-                  disabled={worker.busy}
-                  className="action-btn"
-                >
-                  Reprocess All
-                </button>
-                <button
-                  onClick={worker.clearWikiData}
-                  disabled={worker.busy}
-                  className="action-btn action-danger"
-                >
-                  Clear Wiki
-                </button>
-              </>
-            )}
-          </div>
+          {validationMessage && <div className="wiki-note">{validationMessage}</div>}
+          {error && <div className="wiki-error">{error}</div>}
         </div>
       )}
     </div>

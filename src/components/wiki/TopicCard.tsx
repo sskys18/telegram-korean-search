@@ -1,36 +1,61 @@
 import type { WikiTopic } from "../../types";
 
+function parseDate(value: string): number | null {
+  if (!value) {
+    return null;
+  }
+  if (/^\d+$/.test(value)) {
+    return Number(value) * 1000;
+  }
+  const parsed = Date.parse(value.replace(" ", "T"));
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function formatRelativeTime(value: string): string {
+  const timestamp = parseDate(value);
+  if (timestamp == null) {
+    return "Unknown";
+  }
+  const diffMs = Date.now() - timestamp;
+  const diffMinutes = Math.max(1, Math.round(diffMs / 60000));
+  if (diffMinutes < 60) {
+    return `${diffMinutes}m ago`;
+  }
+  const diffHours = Math.round(diffMinutes / 60);
+  if (diffHours < 24) {
+    return `${diffHours}h ago`;
+  }
+  const diffDays = Math.round(diffHours / 24);
+  return `${diffDays}d ago`;
+}
+
 interface TopicCardProps {
   topic: WikiTopic;
-  rank: number;
-  onClick: () => void;
+  onSelect: (topicId: number) => void;
 }
 
-function formatTimeAgo(timestamp: string | null): string {
-  if (!timestamp) return "";
-  const seconds = Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000);
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-  return `${Math.floor(seconds / 86400)}d ago`;
-}
-
-export function TopicCard({ topic, rank, onClick }: TopicCardProps) {
-  const trendPct = Math.min(Math.round(topic.trending_score * 100), 999);
-
+export function TopicCard({ topic, onSelect }: TopicCardProps) {
   return (
-    <div className="topic-card" onClick={onClick} role="button" tabIndex={0} onKeyDown={(e) => e.key === "Enter" && onClick()}>
+    <button
+      type="button"
+      className="topic-card"
+      onClick={() => onSelect(topic.topic_id)}
+    >
       <div className="topic-card-header">
-        <span className="topic-rank">{rank}.</span>
-        <span className="topic-title">{topic.title}</span>
-        {trendPct > 0 && <span className="topic-trend">+{trendPct}%</span>}
+        <h3 className="topic-card-title">{topic.title_ko || topic.title}</h3>
+        {topic.category_name && (
+          <span className="topic-card-badge">
+            {topic.category_name_ko || topic.category_name}
+          </span>
+        )}
       </div>
-      <div className="topic-card-meta">
-        {topic.category_name && <span className="topic-category-badge">{topic.category_name}</span>}
-        <span>{topic.message_count} msgs</span>
+      <div className="topic-card-subtitle">{topic.title_ko ? topic.title : ""}</div>
+      <div className="topic-card-stats">
+        <span>{Math.round(topic.trending_score * 100)}% trending</span>
+        <span>{topic.message_count} messages</span>
         <span>{topic.channel_count} channels</span>
-        <span>{formatTimeAgo(topic.last_seen_at)}</span>
+        <span>{formatRelativeTime(topic.last_seen_at)}</span>
       </div>
-      {topic.title_ko && <div className="topic-title-ko">{topic.title_ko}</div>}
-    </div>
+    </button>
   );
 }

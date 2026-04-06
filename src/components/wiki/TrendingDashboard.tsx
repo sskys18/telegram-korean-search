@@ -1,104 +1,63 @@
-import type { WikiTopic, WikiCategory, WikiSearchResult } from "../../types";
+import type { WikiCategory, WikiSearchResult, WikiTopic } from "../../types";
 import { CategoryFilter } from "./CategoryFilter";
 import { TopicCard } from "./TopicCard";
 import { WikiSearch } from "./WikiSearch";
 
 interface TrendingDashboardProps {
-  topics: WikiTopic[];
   categories: WikiCategory[];
-  selectedCategory: number | undefined;
-  searchQuery: string;
-  searchResults: WikiSearchResult | null;
+  categoryId?: number;
+  topics: WikiTopic[];
+  searchResults: WikiSearchResult;
   loading: boolean;
-  onSelectCategory: (id: number | undefined) => void;
-  onSelectTopic: (id: number) => void;
+  searching: boolean;
+  onCategoryChange: (categoryId?: number) => void;
   onSearch: (query: string) => void;
-  onRefresh: () => void;
+  onSelectTopic: (topicId: number) => void;
 }
 
 export function TrendingDashboard({
-  topics,
   categories,
-  selectedCategory,
-  searchQuery,
+  categoryId,
+  topics,
   searchResults,
   loading,
-  onSelectCategory,
-  onSelectTopic,
+  searching,
+  onCategoryChange,
   onSearch,
-  onRefresh,
+  onSelectTopic,
 }: TrendingDashboardProps) {
-  const showSearch = searchResults && searchQuery.trim().length >= 2;
-
   return (
     <div className="trending-dashboard">
-      <WikiSearch query={searchQuery} onSearch={onSearch} />
       <CategoryFilter
         categories={categories}
-        selected={selectedCategory}
-        onSelect={onSelectCategory}
+        activeCategoryId={categoryId}
+        onChange={onCategoryChange}
       />
-
-      {showSearch ? (
-        <div className="search-results-section">
-          <h3 className="section-title">Search Results</h3>
-          {searchResults.topics.length === 0 && searchResults.pages.length === 0 ? (
-            <div className="empty-state">No results found</div>
-          ) : (
-            <>
-              {searchResults.topics.map((t, i) => (
-                <TopicCard
-                  key={t.topic_id}
-                  topic={t}
-                  rank={i + 1}
-                  onClick={() => onSelectTopic(t.topic_id)}
-                />
-              ))}
-              {searchResults.pages.map((p) => (
-                <div
-                  key={`page-${p.topic_id}`}
-                  className="topic-card"
-                  onClick={() => onSelectTopic(p.topic_id)}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(e) => e.key === "Enter" && onSelectTopic(p.topic_id)}
-                >
-                  <div className="topic-card-header">
-                    <span className="topic-title">{p.topic_title}</span>
-                  </div>
-                  <div className="topic-card-meta">
-                    {/* Snippet contains pre-sanitized highlight HTML from backend */}
-                    <span dangerouslySetInnerHTML={{ __html: p.snippet }} />
-                  </div>
-                </div>
-              ))}
-            </>
-          )}
-        </div>
-      ) : (
-        <div className="trending-section">
-          <div className="section-header">
-            <h3 className="section-title">Trending</h3>
-            <button className="refresh-btn" onClick={onRefresh}>Refresh</button>
-          </div>
-          {loading ? (
-            <div className="empty-state">Loading...</div>
-          ) : topics.length === 0 ? (
-            <div className="empty-state">No topics yet. Collect messages and start the wiki worker.</div>
-          ) : (
-            <div className="topic-list">
-              {topics.map((t, i) => (
-                <TopicCard
-                  key={t.topic_id}
-                  topic={t}
-                  rank={i + 1}
-                  onClick={() => onSelectTopic(t.topic_id)}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+      <WikiSearch
+        results={searchResults}
+        loading={searching}
+        onSearch={onSearch}
+        onSelectTopic={onSelectTopic}
+      />
+      <div className="wiki-section-header">
+        <h2>Trending Topics</h2>
+        <span>{topics.length}</span>
+      </div>
+      <div className="wiki-topic-list">
+        {loading ? (
+          <div className="wiki-empty">Loading trending topics...</div>
+        ) : topics.length === 0 ? (
+          <div className="wiki-empty">No wiki topics yet.</div>
+        ) : (
+          topics.map((topic) => (
+            <TopicCard
+              key={topic.topic_id}
+              topic={topic}
+              onSelect={onSelectTopic}
+            />
+          ))
+        )}
+      </div>
     </div>
   );
 }

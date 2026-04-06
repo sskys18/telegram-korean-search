@@ -2,26 +2,40 @@ import type { WikiCategory } from "../../types";
 
 interface CategoryFilterProps {
   categories: WikiCategory[];
-  selected: number | undefined;
-  onSelect: (id: number | undefined) => void;
+  activeCategoryId?: number;
+  onChange: (categoryId?: number) => void;
 }
 
-export function CategoryFilter({ categories, selected, onSelect }: CategoryFilterProps) {
+export function CategoryFilter({
+  categories,
+  activeCategoryId,
+  onChange,
+}: CategoryFilterProps) {
   return (
-    <div className="category-filter">
+    <div className="category-filter" aria-label="Wiki categories">
       <button
-        className={`category-pill ${selected === undefined ? "category-active" : ""}`}
-        onClick={() => onSelect(undefined)}
+        type="button"
+        className={
+          activeCategoryId == null
+            ? "category-pill category-pill-active"
+            : "category-pill"
+        }
+        onClick={() => onChange(undefined)}
       >
         All
       </button>
-      {categories.map((cat) => (
+      {categories.map((category) => (
         <button
-          key={cat.category_id}
-          className={`category-pill ${selected === cat.category_id ? "category-active" : ""}`}
-          onClick={() => onSelect(cat.category_id)}
+          key={category.category_id}
+          type="button"
+          className={
+            activeCategoryId === category.category_id
+              ? "category-pill category-pill-active"
+              : "category-pill"
+          }
+          onClick={() => onChange(category.category_id)}
         >
-          {cat.name}
+          {category.name_ko || category.name}
         </button>
       ))}
     </div>

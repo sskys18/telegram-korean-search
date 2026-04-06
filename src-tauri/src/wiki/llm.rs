@@ -1,9 +1,46 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+const CODEX_AUTH_PATH: &str = ".codex/auth.json";
+const OPENAI_AUTH_URL: &str = "https://auth.openai.com/oauth2/token";
+const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+/// Tokens read from ~/.codex/auth.json
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CodexAuth {
+    auth_mode: String,
+    #[serde(rename = "OPENAI_API_KEY")]
+    api_key: Option<String>,
+    tokens: Option<CodexTokens>,
+    last_refresh: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CodexTokens {
+    access_token: String,
+    refresh_token: String,
+    #[allow(dead_code)]
+    id_token: Option<String>,
+    #[allow(dead_code)]
+    account_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefreshResponse {
+    access_token: String,
+    #[allow(dead_code)]
+    token_type: Option<String>,
+    #[allow(dead_code)]
+    expires_in: Option<u64>,
+}
 
 #[derive(Debug, Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
-    api_key: String,
+    access_token: Arc<Mutex<String>>,
+    refresh_token: String,
     model: String,
 }
 
@@ -62,6 +99,7 @@ pub enum LlmError {
     Http(reqwest::Error),
     Parse(String),
     Api(String),
+    Auth(String),
 }
 
 impl std::fmt::Display for LlmError {
@@ -70,22 +108,108 @@ impl std::fmt::Display for LlmError {
             LlmError::Http(e) => write!(f, "HTTP error: {}", e),
             LlmError::Parse(e) => write!(f, "Parse error: {}", e),
             LlmError::Api(e) => write!(f, "API error: {}", e),
+            LlmError::Auth(e) => write!(f, "Auth error: {}", e),
         }
     }
 }
 
 impl std::error::Error for LlmError {}
 
+/// Get the path to ~/.codex/auth.json
+fn codex_auth_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(CODEX_AUTH_PATH)
+}
+
+/// Read Codex OAuth tokens from ~/.codex/auth.json
+pub fn read_codex_auth() -> Result<(String, String), LlmError> {
+    let path = codex_auth_path();
+    let data = std::fs::read_to_string(&path).map_err(|e| {
+        LlmError::Auth(format!(
+            "Cannot read {}: {}. Run 'codex login' first.",
+            path.display(),
+            e
+        ))
+    })?;
+    let auth: CodexAuth = serde_json::from_str(&data)
+        .map_err(|e| LlmError::Auth(format!("Invalid auth.json: {}", e)))?;
+
+    match auth.tokens {
+        Some(tokens) => Ok((tokens.access_token, tokens.refresh_token)),
+        None => Err(LlmError::Auth(
+            "No OAuth tokens in auth.json. Run 'codex login' first.".to_string(),
+        )),
+    }
+}
+
+/// Check if Codex auth is available
+pub fn is_codex_auth_available() -> bool {
+    codex_auth_path().exists()
+}
+
 impl LlmClient {
-    pub fn new(api_key: String) -> Self {
-        Self {
+    /// Create a new LLM client from Codex OAuth tokens.
+    pub fn from_codex() -> Result<Self, LlmError> {
+        let (access_token, refresh_token) = read_codex_auth()?;
+        Ok(Self {
             http: reqwest::Client::new(),
-            api_key,
+            access_token: Arc::new(Mutex::new(access_token)),
+            refresh_token,
             model: "gpt-4o-mini".to_string(),
-        }
+        })
     }
 
-    pub async fn validate_key(&self) -> Result<bool, LlmError> {
+    /// Refresh the access token using the refresh token.
+    async fn refresh_access_token(&self) -> Result<String, LlmError> {
+        let resp = self
+            .http
+            .post(OPENAI_AUTH_URL)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &self.refresh_token),
+                ("client_id", CODEX_CLIENT_ID),
+            ])
+            .send()
+            .await
+            .map_err(LlmError::Http)?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LlmError::Auth(format!(
+                "Token refresh failed: {}. Run 'codex login' to re-authenticate.",
+                body
+            )));
+        }
+
+        let refresh_resp: RefreshResponse = resp.json().await.map_err(LlmError::Http)?;
+        let new_token = refresh_resp.access_token;
+
+        // Update in-memory token
+        *self.access_token.lock().await = new_token.clone();
+
+        // Update auth.json on disk
+        if let Ok(data) = std::fs::read_to_string(codex_auth_path()) {
+            if let Ok(mut auth) = serde_json::from_str::<CodexAuth>(&data) {
+                if let Some(ref mut tokens) = auth.tokens {
+                    tokens.access_token = new_token.clone();
+                    auth.last_refresh = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| format!("{}", d.as_secs()))
+                            .unwrap_or_default(),
+                    );
+                    if let Ok(updated) = serde_json::to_string_pretty(&auth) {
+                        let _ = std::fs::write(codex_auth_path(), updated);
+                    }
+                }
+            }
+        }
+
+        Ok(new_token)
+    }
+
+    pub async fn validate(&self) -> Result<bool, LlmError> {
         let req = ChatRequest {
             model: self.model.clone(),
             messages: vec![ChatMessage {
@@ -259,15 +383,45 @@ Rules:
         })
     }
 
+    /// Call the OpenAI API. Automatically refreshes token on 401.
     async fn call_api(&self, req: &ChatRequest) -> Result<String, LlmError> {
+        let token = self.access_token.lock().await.clone();
         let resp = self
             .http
             .post("https://api.openai.com/v1/chat/completions")
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", token))
             .json(req)
             .send()
             .await
             .map_err(LlmError::Http)?;
+
+        // Auto-refresh on 401
+        if resp.status() == 401 {
+            log::info!("Access token expired, refreshing...");
+            let new_token = self.refresh_access_token().await?;
+
+            let resp = self
+                .http
+                .post("https://api.openai.com/v1/chat/completions")
+                .header("Authorization", format!("Bearer {}", new_token))
+                .json(req)
+                .send()
+                .await
+                .map_err(LlmError::Http)?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(LlmError::Api(format!("{}: {}", status, body)));
+            }
+
+            let chat_resp: ChatResponse = resp.json().await.map_err(LlmError::Http)?;
+            return chat_resp
+                .choices
+                .first()
+                .map(|c| c.message.content.clone())
+                .ok_or_else(|| LlmError::Api("No choices in response".to_string()));
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -318,5 +472,11 @@ mod tests {
         let (ko, en) = split_bilingual(text);
         assert!(ko.contains("한국어"));
         assert!(en.contains("English"));
+    }
+
+    #[test]
+    fn test_codex_auth_path() {
+        let path = codex_auth_path();
+        assert!(path.to_string_lossy().contains(".codex/auth.json"));
     }
 }

@@ -1,33 +1,96 @@
-import { useState, useCallback, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { WikiSearchResult } from "../../types";
 
-interface WikiSearchProps {
-  query: string;
-  onSearch: (query: string) => void;
+function renderSnippet(snippet: string) {
+  const parts = snippet.split(/(<b>.*?<\/b>)/g).filter(Boolean);
+  return parts.map((part, index) => {
+    const match = part.match(/^<b>(.*)<\/b>$/);
+    if (match) {
+      return <mark key={index}>{match[1]}</mark>;
+    }
+    return <span key={index}>{part}</span>;
+  });
 }
 
-export function WikiSearch({ query, onSearch }: WikiSearchProps) {
-  const [value, setValue] = useState(query);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+interface WikiSearchProps {
+  results: WikiSearchResult;
+  loading: boolean;
+  onSearch: (query: string) => void;
+  onSelectTopic: (topicId: number) => void;
+}
 
-  const handleChange = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      const v = e.target.value;
-      setValue(v);
-      if (timerRef.current) clearTimeout(timerRef.current);
-      timerRef.current = setTimeout(() => onSearch(v), 300);
-    },
-    [onSearch],
-  );
+export function WikiSearch({
+  results,
+  loading,
+  onSearch,
+  onSelectTopic,
+}: WikiSearchProps) {
+  const [query, setQuery] = useState("");
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (timerRef.current) {
+      window.clearTimeout(timerRef.current);
+    }
+    timerRef.current = window.setTimeout(() => {
+      onSearch(query);
+    }, 300);
+
+    return () => {
+      if (timerRef.current) {
+        window.clearTimeout(timerRef.current);
+      }
+    };
+  }, [onSearch, query]);
+
+  const hasResults = results.topics.length > 0 || results.pages.length > 0;
 
   return (
     <div className="wiki-search">
       <input
         type="text"
-        className="wiki-search-input"
-        placeholder="Search wiki..."
-        value={value}
-        onChange={handleChange}
+        className="search-input wiki-search-input"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="Search wiki topics and summaries..."
+        spellCheck={false}
       />
+      {(loading || query.trim() || hasResults) && (
+        <div className="wiki-search-results">
+          {loading && <div className="wiki-search-state">Searching...</div>}
+          {!loading && !hasResults && query.trim() && (
+            <div className="wiki-search-state">No matching wiki results.</div>
+          )}
+          {!loading &&
+            results.topics.map((topic) => (
+              <button
+                key={`topic-${topic.topic_id}`}
+                type="button"
+                className="wiki-search-result"
+                onClick={() => onSelectTopic(topic.topic_id)}
+              >
+                <div className="wiki-search-result-title">
+                  {topic.title_ko || topic.title}
+                </div>
+                <div className="wiki-search-result-subtitle">Topic</div>
+              </button>
+            ))}
+          {!loading &&
+            results.pages.map((page) => (
+              <button
+                key={`page-${page.topic_id}`}
+                type="button"
+                className="wiki-search-result"
+                onClick={() => onSelectTopic(page.topic_id)}
+              >
+                <div className="wiki-search-result-title">{page.topic_title}</div>
+                <div className="wiki-search-result-snippet">
+                  {renderSnippet(page.snippet)}
+                </div>
+              </button>
+            ))}
+        </div>
+      )}
     </div>
   );
 }

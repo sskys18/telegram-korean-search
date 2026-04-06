@@ -8,7 +8,7 @@ use crate::wiki::llm::{ClassifiedTopic, LlmClient, LlmError};
 use crate::wiki::trending::calculate_trending_score;
 use crate::AppState;
 
-pub fn start_worker(app: AppHandle, api_key: String) -> Arc<AtomicBool> {
+pub fn start_worker(app: AppHandle) -> Arc<AtomicBool> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
 
@@ -20,16 +20,33 @@ pub fn start_worker(app: AppHandle, api_key: String) -> Arc<AtomicBool> {
             .unwrap();
 
         rt.block_on(async {
-            run_worker(app, api_key, shutdown_clone).await;
+            run_worker(app, shutdown_clone).await;
         });
     });
 
     shutdown
 }
 
-async fn run_worker(app: AppHandle, api_key: String, shutdown: Arc<AtomicBool>) {
+async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
     let state = app.state::<AppState>();
-    let llm = LlmClient::new(api_key);
+    let llm = match LlmClient::from_codex() {
+        Ok(client) => client,
+        Err(e) => {
+            log::error!("Wiki worker: failed to load Codex auth: {}", e);
+            let _ = app.emit(
+                "wiki-worker-error",
+                serde_json::json!({
+                    "message": e.to_string(),
+                    "recoverable": false,
+                }),
+            );
+            let _ = app.emit(
+                "wiki-worker-stopped",
+                serde_json::json!({"reason": "auth_failed"}),
+            );
+            return;
+        }
+    };
     let mut processed_count: usize = 0;
 
     {
@@ -103,7 +120,7 @@ async fn run_worker(app: AppHandle, api_key: String, shutdown: Arc<AtomicBool>) 
                 continue;
             }
 
-            let classify_result =
+            let classify_result: Result<crate::wiki::llm::ClassifyResponse, LlmError> =
                 retry_classify(&llm, &chat_title, msg.timestamp, &msg.text_plain).await;
 
             match classify_result {

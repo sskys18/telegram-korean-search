@@ -1,59 +1,57 @@
 import { useState } from "react";
+import { open } from "@tauri-apps/plugin-shell";
 import type { WikiSourceMessage } from "../../types";
-import { getTopicSources } from "../../api/tauri";
+import { formatTimestamp, truncate } from "../../utils/format";
 
 interface SourceMessagesProps {
-  topicId: number;
-  sourceCount: number;
+  sources: WikiSourceMessage[];
 }
 
-function formatTime(ts: number): string {
-  const d = new Date(ts * 1000);
-  return (
-    d.toLocaleDateString() +
-    " " +
-    d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-  );
-}
-
-export function SourceMessages({ topicId, sourceCount }: SourceMessagesProps) {
-  const [expanded, setExpanded] = useState(false);
-  const [messages, setMessages] = useState<WikiSourceMessage[]>([]);
-  const [loaded, setLoaded] = useState(false);
-
-  const toggle = async () => {
-    if (!expanded && !loaded) {
-      try {
-        const msgs = await getTopicSources(topicId, 50, 0);
-        setMessages(msgs);
-        setLoaded(true);
-      } catch {
-        // ignore
-      }
-    }
-    setExpanded(!expanded);
-  };
+export function SourceMessages({ sources }: SourceMessagesProps) {
+  const [openPanel, setOpenPanel] = useState(false);
 
   return (
     <div className="source-messages">
-      <button className="source-toggle" onClick={toggle}>
-        {expanded ? "\u25B2" : "\u25BC"} View {sourceCount} source messages
+      <button
+        type="button"
+        className="source-toggle"
+        onClick={() => setOpenPanel((prev) => !prev)}
+      >
+        <span>Source Messages</span>
+        <span>{openPanel ? "Hide" : `Show ${sources.length}`}</span>
       </button>
-      {expanded && (
+      {openPanel && (
         <div className="source-list">
-          {messages.map((msg, i) => (
-            <div
-              key={`${msg.chat_id}-${msg.message_id}`}
-              className="source-item"
-            >
-              <div className="source-item-header">
-                <span className="source-index">[{i + 1}]</span>
-                <span className="source-chat">{msg.chat_title}</span>
-                <span className="source-time">{formatTime(msg.timestamp)}</span>
-              </div>
-              <div className="source-item-text">{msg.text_plain}</div>
-            </div>
-          ))}
+          {sources.length === 0 ? (
+            <div className="wiki-empty">No source messages linked yet.</div>
+          ) : (
+            <ol>
+              {sources.map((source, index) => (
+                <li key={`${source.chat_id}-${source.message_id}`} className="source-item">
+                  <div className="source-meta">
+                    <span>
+                      {index + 1}. {source.chat_title}
+                    </span>
+                    <span>{formatTimestamp(source.timestamp)}</span>
+                  </div>
+                  <div className="source-text">{truncate(source.text_plain, 280)}</div>
+                  {source.link && (
+                    <button
+                      type="button"
+                      className="wiki-inline-button"
+                      onClick={() =>
+                        open(source.link!).catch((err) =>
+                          console.error("Failed to open source link:", err),
+                        )
+                      }
+                    >
+                      Open Message
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ol>
+          )}
         </div>
       )}
     </div>

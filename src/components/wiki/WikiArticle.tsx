@@ -1,85 +1,103 @@
-import type { WikiTopicDetail } from "../../types";
+import { markdownToHtml } from "../../utils/markdown";
+import type { WikiSourceMessage, WikiTopicDetail } from "../../types";
 import { SourceMessages } from "./SourceMessages";
+
+function formatDate(value: string | null): string {
+  if (!value) {
+    return "Never";
+  }
+  const parsed = Date.parse(value.replace(" ", "T"));
+  if (Number.isNaN(parsed)) {
+    return value;
+  }
+  return new Date(parsed).toLocaleString();
+}
 
 interface WikiArticleProps {
   detail: WikiTopicDetail;
-  onBack: () => void;
-  onGenerate: () => void;
+  sources: WikiSourceMessage[];
+  loading: boolean;
   generating: boolean;
+  onBack: () => void;
+  onGenerateSummary: () => Promise<void>;
 }
 
-function formatTimeAgo(timestamp: string | null): string {
-  if (!timestamp) return "never";
-  const seconds = Math.floor((Date.now() - new Date(timestamp).getTime()) / 1000);
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-  return `${Math.floor(seconds / 86400)}d ago`;
-}
-
-/**
- * Converts markdown content to HTML for rendering wiki articles.
- * Content is generated locally by the wiki worker from trusted sources,
- * and HTML entities are escaped before any other transformations.
- */
-function markdownToHtml(md: string): string {
-  return md
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/^### (.+)$/gm, "<h3>$1</h3>")
-    .replace(/^## (.+)$/gm, "<h2>$1</h2>")
-    .replace(/^# (.+)$/gm, "<h1>$1</h1>")
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.+?)\*/g, "<em>$1</em>")
-    .replace(/^- (.+)$/gm, "<li>$1</li>")
-    .replace(/(<li>.*<\/li>\n?)+/g, "<ul>$&</ul>")
-    .replace(/\[(\d+)\]/g, '<sup class="citation">[$1]</sup>')
-    .replace(/\n\n/g, "</p><p>")
-    .replace(/\n/g, "<br>")
-    .replace(/^/, "<p>")
-    .replace(/$/, "</p>");
-}
-
-export function WikiArticle({ detail, onBack, onGenerate, generating }: WikiArticleProps) {
-  const { topic, page, source_count } = detail;
+export function WikiArticle({
+  detail,
+  sources,
+  loading,
+  generating,
+  onBack,
+  onGenerateSummary,
+}: WikiArticleProps) {
+  const page = detail.page;
 
   return (
     <div className="wiki-article">
-      <button className="back-btn" onClick={onBack}>
-        ← Back to Trending
-      </button>
-
-      <div className="article-header">
-        <h1 className="article-title">{topic.title}</h1>
-        {topic.title_ko && <div className="article-title-ko">{topic.title_ko}</div>}
-        <div className="article-meta">
-          {topic.category_name && <span className="topic-category-badge">{topic.category_name}</span>}
-          <span>{source_count} sources</span>
-          <span>Updated {formatTimeAgo(topic.last_summary_at)}</span>
+      <div className="wiki-article-header">
+        <button type="button" className="wiki-inline-button" onClick={onBack}>
+          Back
+        </button>
+        <div className="wiki-article-title-block">
+          <h2>{detail.topic.title_ko || detail.topic.title}</h2>
+          {detail.topic.title_ko && (
+            <div className="wiki-article-subtitle">{detail.topic.title}</div>
+          )}
         </div>
+        <button
+          type="button"
+          className="wiki-primary-button"
+          disabled={generating || loading}
+          onClick={() => {
+            void onGenerateSummary();
+          }}
+        >
+          {generating ? "Generating..." : page ? "Refresh Summary" : "Generate Summary"}
+        </button>
       </div>
 
-      {page ? (
-        <div className="article-content">
-          {/* Content is sanitized via HTML entity escaping in markdownToHtml before rendering */}
-          <div className="article-section" dangerouslySetInnerHTML={{
-            __html: markdownToHtml(page.content_ko)
-          }} />
-          <hr className="article-divider" />
-          <div className="article-section" dangerouslySetInnerHTML={{
-            __html: markdownToHtml(page.content_en ?? "")
-          }} />
+      <div className="wiki-metadata-row">
+        <span>
+          {detail.topic.category_name_ko ||
+            detail.topic.category_name ||
+            "Uncategorized"}
+        </span>
+        <span>{detail.source_count} sources</span>
+        <span>{detail.topic.message_count} messages</span>
+        <span>
+          Updated {formatDate(detail.topic.last_summary_at || detail.topic.updated_at)}
+        </span>
+      </div>
+
+      {loading ? (
+        <div className="wiki-empty">Loading topic details...</div>
+      ) : page ? (
+        <div className="wiki-article-content">
+          <section>
+            <h3>한국어</h3>
+            <div
+              className="wiki-markdown"
+              dangerouslySetInnerHTML={{ __html: markdownToHtml(page.content_ko) }}
+            />
+          </section>
+          {page.content_en && (
+            <section>
+              <h3>English</h3>
+              <div
+                className="wiki-markdown"
+                dangerouslySetInnerHTML={{ __html: markdownToHtml(page.content_en) }}
+              />
+            </section>
+          )}
         </div>
       ) : (
-        <div className="article-empty">
-          <p>No wiki article generated yet.</p>
-          <button className="generate-btn" onClick={onGenerate} disabled={generating}>
-            {generating ? "Generating..." : "Generate Summary"}
-          </button>
+        <div className="wiki-empty">
+          No generated article yet. Generate a summary from the linked source
+          messages.
         </div>
       )}
 
-      <SourceMessages topicId={topic.topic_id} sourceCount={source_count} />
+      <SourceMessages sources={sources} />
     </div>
   );
 }

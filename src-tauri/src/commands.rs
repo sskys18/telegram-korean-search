@@ -56,16 +56,6 @@ pub struct WikiSearchResult {
     pub pages: Vec<WikiPageSearchResult>,
 }
 
-fn mask_api_key(key: &str) -> String {
-    let chars: Vec<char> = key.chars().collect();
-    if chars.len() <= 4 {
-        return "*".repeat(chars.len());
-    }
-
-    let visible: String = chars[chars.len() - 4..].iter().collect();
-    format!("{}{}", "*".repeat(chars.len() - 4), visible)
-}
-
 fn count_wiki_topics(store: &crate::store::Store) -> Result<i64, sqlite::Error> {
     let mut stmt = store.conn().prepare("SELECT COUNT(*) FROM wiki_topics")?;
     stmt.next()?;
@@ -314,33 +304,26 @@ pub async fn start_collection(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Check if Codex OAuth is available (~/.codex/auth.json exists).
 #[tauri::command]
-pub fn save_openai_api_key(state: State<AppState>, key: String) -> Result<(), String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
-    store
-        .set_meta("openai_api_key", &key)
-        .map_err(|e| e.to_string())
+pub fn check_codex_auth() -> Result<bool, String> {
+    Ok(wiki::llm::is_codex_auth_available())
 }
 
+/// Validate Codex OAuth tokens by making a test API call.
 #[tauri::command]
-pub fn get_openai_api_key(state: State<AppState>) -> Result<Option<String>, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
-    let key = store
-        .get_meta("openai_api_key")
-        .map_err(|e| e.to_string())?;
-    Ok(key.map(|value| mask_api_key(&value)))
-}
-
-#[tauri::command]
-pub async fn validate_openai_api_key(key: String) -> Result<bool, String> {
-    wiki::llm::LlmClient::new(key)
-        .validate_key()
-        .await
-        .map_err(|e| e.to_string())
+pub async fn validate_codex_auth() -> Result<bool, String> {
+    let client = wiki::llm::LlmClient::from_codex().map_err(|e| e.to_string())?;
+    client.validate().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn start_wiki_worker(app: AppHandle) -> Result<(), String> {
+    // Check Codex auth is available
+    if !wiki::llm::is_codex_auth_available() {
+        return Err("Codex OAuth not found. Run 'codex login' in terminal first.".to_string());
+    }
+
     let state = app.state::<AppState>();
 
     {
@@ -353,15 +336,7 @@ pub async fn start_wiki_worker(app: AppHandle) -> Result<(), String> {
         *guard = None;
     }
 
-    let api_key = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
-        store
-            .get_meta("openai_api_key")
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "OpenAI API key not configured".to_string())?
-    };
-
-    let shutdown = wiki::worker::start_worker(app.clone(), api_key);
+    let shutdown = wiki::worker::start_worker(app.clone());
     let mut guard = state.wiki_worker_shutdown.lock().await;
     *guard = Some(shutdown);
     Ok(())
@@ -495,14 +470,6 @@ pub fn search_wiki(
 pub async fn generate_topic_summary(app: AppHandle, topic_id: i64) -> Result<WikiPage, String> {
     let state = app.state::<AppState>();
 
-    let api_key = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
-        store
-            .get_meta("openai_api_key")
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "OpenAI API key not configured".to_string())?
-    };
-
     let (topic, latest_page, needs_regeneration, sources, source_ids) = {
         let store = state.store.lock().map_err(|e| e.to_string())?;
         let topic = store
@@ -527,7 +494,7 @@ pub async fn generate_topic_summary(app: AppHandle, topic_id: i64) -> Result<Wik
         }
     }
 
-    let llm = wiki::llm::LlmClient::new(api_key);
+    let llm = wiki::llm::LlmClient::from_codex().map_err(|e| e.to_string())?;
     let source_refs: Vec<(usize, i64, &str, &str)> = sources
         .iter()
         .enumerate()
