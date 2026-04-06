@@ -155,16 +155,12 @@ function normalizePage(page: {
 
 // Wiki API
 
-export async function saveOpenaiApiKey(key: string): Promise<void> {
-  return invoke("save_openai_api_key", { key });
+export async function checkCodexAuth(): Promise<boolean> {
+  return invoke("check_codex_auth");
 }
 
-export async function getOpenaiApiKey(): Promise<string | null> {
-  return invoke("get_openai_api_key");
-}
-
-export async function validateOpenaiApiKey(key: string): Promise<boolean> {
-  return invoke("validate_openai_api_key", { key });
+export async function validateCodexAuth(): Promise<boolean> {
+  return invoke("validate_codex_auth");
 }
 
 export async function startWikiWorker(): Promise<void> {

@@ -2,53 +2,35 @@ import { useState } from "react";
 import type { WikiProgress, WikiStatus } from "../../types";
 
 interface WikiSettingsProps {
-  apiKey: string;
-  setApiKey: (value: string) => void;
-  savedKeyMask: string | null;
-  status: WikiStatus;
-  progress: WikiProgress | null;
-  loading: boolean;
-  busy: boolean;
-  validating: boolean;
-  error: string | null;
-  validationMessage: string | null;
-  onSaveApiKey: () => Promise<boolean>;
-  onValidateApiKey: () => Promise<boolean>;
-  onStartWorker: () => Promise<void>;
-  onStopWorker: () => Promise<void>;
-  onReprocessWiki: () => Promise<void>;
-  onClearWikiData: () => Promise<void>;
+  worker: {
+    codexAvailable: boolean | null;
+    codexValid: boolean | null;
+    status: WikiStatus;
+    progress: WikiProgress | null;
+    loading: boolean;
+    busy: boolean;
+    validating: boolean;
+    error: string | null;
+    validateCodex: () => Promise<void>;
+    startWorker: () => Promise<void>;
+    stopWorker: () => Promise<void>;
+    reprocessWiki: () => Promise<void>;
+    clearWikiData: () => Promise<void>;
+  };
 }
 
-export function WikiSettings({
-  apiKey,
-  setApiKey,
-  savedKeyMask,
-  status,
-  progress,
-  loading,
-  busy,
-  validating,
-  error,
-  validationMessage,
-  onSaveApiKey,
-  onValidateApiKey,
-  onStartWorker,
-  onStopWorker,
-  onReprocessWiki,
-  onClearWikiData,
-}: WikiSettingsProps) {
+export function WikiSettings({ worker }: WikiSettingsProps) {
   const [openPanel, setOpenPanel] = useState(false);
 
   const handleReprocess = async () => {
     if (window.confirm("Rebuild the wiki queue and summaries from collected messages?")) {
-      await onReprocessWiki();
+      await worker.reprocessWiki();
     }
   };
 
   const handleClear = async () => {
     if (window.confirm("Clear all wiki topics, pages, and queue data?")) {
-      await onClearWikiData();
+      await worker.clearWikiData();
     }
   };
 
@@ -64,113 +46,120 @@ export function WikiSettings({
       </button>
       {openPanel && (
         <div className="wiki-settings-panel">
-          <label className="wiki-field">
-            <span className="wiki-field-label">OpenAI API Key</span>
-            <input
-              type="password"
-              className="search-input"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder={savedKeyMask || "sk-..."}
-              spellCheck={false}
-            />
-          </label>
-          <div className="wiki-actions-row">
-            <button
-              type="button"
-              className="wiki-primary-button"
-              disabled={busy || !apiKey.trim()}
-              onClick={() => {
-                void onSaveApiKey();
-              }}
-            >
-              Save Key
-            </button>
-            <button
-              type="button"
-              className="wiki-inline-button"
-              disabled={busy || validating || !apiKey.trim()}
-              onClick={() => {
-                void onValidateApiKey();
-              }}
-            >
-              {validating ? "Validating..." : "Validate"}
-            </button>
+          {/* Codex OAuth Status */}
+          <div className="wiki-field">
+            <span className="wiki-field-label">Codex OAuth</span>
+            {worker.codexAvailable === null || worker.loading ? (
+              <span>Checking...</span>
+            ) : worker.codexAvailable ? (
+              <div className="wiki-actions-row">
+                <span style={{ color: "#4caf50" }}>
+                  ~/.codex/auth.json found
+                </span>
+                <button
+                  type="button"
+                  className="wiki-inline-button"
+                  disabled={worker.validating}
+                  onClick={() => { void worker.validateCodex(); }}
+                >
+                  {worker.validating ? "Validating..." : "Validate Token"}
+                </button>
+                {worker.codexValid === true && (
+                  <span style={{ color: "#4caf50" }}>Valid</span>
+                )}
+                {worker.codexValid === false && (
+                  <span style={{ color: "#ff6b6b" }}>Invalid</span>
+                )}
+              </div>
+            ) : (
+              <div>
+                <span style={{ color: "#ff6b6b" }}>
+                  Not found. Run{" "}
+                  <code style={{ background: "#2d2d2d", padding: "2px 6px", borderRadius: 4 }}>
+                    codex login
+                  </code>{" "}
+                  in terminal first.
+                </span>
+              </div>
+            )}
           </div>
 
+          {/* Queue Stats */}
           <div className="wiki-queue-grid">
             <div>
               <span className="wiki-stat-label">Pending</span>
-              <strong>{loading ? "-" : status.pending}</strong>
+              <strong>{worker.loading ? "-" : worker.status.pending}</strong>
             </div>
             <div>
               <span className="wiki-stat-label">Processing</span>
-              <strong>{loading ? "-" : status.processing}</strong>
+              <strong>{worker.loading ? "-" : worker.status.processing}</strong>
             </div>
             <div>
               <span className="wiki-stat-label">Done</span>
-              <strong>{loading ? "-" : status.done}</strong>
+              <strong>{worker.loading ? "-" : worker.status.done}</strong>
             </div>
             <div>
               <span className="wiki-stat-label">Failed</span>
-              <strong>{loading ? "-" : status.failed}</strong>
+              <strong>{worker.loading ? "-" : worker.status.failed}</strong>
             </div>
             <div>
               <span className="wiki-stat-label">Skipped</span>
-              <strong>{loading ? "-" : status.skipped}</strong>
+              <strong>{worker.loading ? "-" : worker.status.skipped}</strong>
             </div>
             <div>
               <span className="wiki-stat-label">Topics</span>
-              <strong>{loading ? "-" : status.topics_count}</strong>
+              <strong>{worker.loading ? "-" : worker.status.topics_count}</strong>
             </div>
           </div>
 
-          {progress && (
+          {/* Progress */}
+          {worker.progress && (
             <div className="wiki-progress-text">
-              Processed {progress.processed}/{progress.total} with{" "}
-              {progress.queue_remaining} queued.
+              Processed {worker.progress.processed}/{worker.progress.total} with{" "}
+              {worker.progress.queue_remaining} queued.
             </div>
           )}
 
-          <div className="wiki-actions-row">
-            <button
-              type="button"
-              className="wiki-primary-button"
-              disabled={busy || loading}
-              onClick={() => {
-                if (status.is_running) {
-                  void onStopWorker();
-                } else {
-                  void onStartWorker();
-                }
-              }}
-            >
-              {status.is_running ? "Stop Worker" : "Start Worker"}
-            </button>
-            <button
-              type="button"
-              className="wiki-inline-button"
-              disabled={busy}
-              onClick={() => {
-                void handleReprocess();
-              }}
-            >
-              Reprocess
-            </button>
-            <button
-              type="button"
-              className="wiki-danger-button"
-              disabled={busy}
-              onClick={() => {
-                void handleClear();
-              }}
-            >
-              Clear
-            </button>
-          </div>
+          {/* Error */}
+          {worker.error && <div className="wiki-error">{worker.error}</div>}
 
-          {validationMessage && <div className="wiki-note">{validationMessage}</div>}
-          {error && <div className="wiki-error">{error}</div>}
+          {/* Actions */}
+          <div className="wiki-actions-row">
+            {worker.codexAvailable && (
+              <>
+                <button
+                  type="button"
+                  className="wiki-primary-button"
+                  disabled={worker.busy || worker.loading}
+                  onClick={() => {
+                    if (worker.status.is_running) {
+                      void worker.stopWorker();
+                    } else {
+                      void worker.startWorker();
+                    }
+                  }}
+                >
+                  {worker.status.is_running ? "Stop Worker" : "Start Worker"}
+                </button>
+                <button
+                  type="button"
+                  className="wiki-inline-button"
+                  disabled={worker.busy}
+                  onClick={() => { void handleReprocess(); }}
+                >
+                  Reprocess
+                </button>
+                <button
+                  type="button"
+                  className="wiki-danger-button"
+                  disabled={worker.busy}
+                  onClick={() => { void handleClear(); }}
+                >
+                  Clear
+                </button>
+              </>
+            )}
+          </div>
         </div>
       )}
     </div>

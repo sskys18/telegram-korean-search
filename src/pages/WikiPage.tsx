@@ -10,24 +10,7 @@ export function WikiPage() {
 
   return (
     <div className="wiki-page">
-      <WikiSettings
-        apiKey={worker.apiKey}
-        setApiKey={worker.setApiKey}
-        savedKeyMask={worker.savedKeyMask}
-        status={worker.status}
-        progress={worker.progress}
-        loading={worker.loading}
-        busy={worker.busy}
-        validating={worker.validating}
-        error={worker.error}
-        validationMessage={worker.validationMessage}
-        onSaveApiKey={worker.saveApiKey}
-        onValidateApiKey={worker.validateApiKey}
-        onStartWorker={worker.startWorker}
-        onStopWorker={worker.stopWorker}
-        onReprocessWiki={worker.reprocessWiki}
-        onClearWikiData={worker.clearWikiData}
-      />
+      <WikiSettings worker={worker} />
 
       {wiki.error && <div className="wiki-banner-error">{wiki.error}</div>}
 

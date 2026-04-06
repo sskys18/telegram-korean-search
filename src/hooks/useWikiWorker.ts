@@ -1,16 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  checkCodexAuth,
+  validateCodexAuth,
   clearWikiData,
-  getOpenaiApiKey,
   getWikiStatus,
   onWikiWorkerError,
   onWikiWorkerProgress,
   onWikiWorkerStopped,
   reprocessWiki,
-  saveOpenaiApiKey,
   startWikiWorker,
   stopWikiWorker,
-  validateOpenaiApiKey,
 } from "../api/tauri";
 import type { WikiProgress, WikiStatus } from "../types";
 
@@ -25,14 +24,13 @@ const DEFAULT_STATUS: WikiStatus = {
 };
 
 export function useWikiWorker() {
-  const [apiKey, setApiKey] = useState("");
-  const [savedKeyMask, setSavedKeyMask] = useState<string | null>(null);
+  const [codexAvailable, setCodexAvailable] = useState<boolean | null>(null); // null = loading
+  const [codexValid, setCodexValid] = useState<boolean | null>(null);
   const [status, setStatus] = useState<WikiStatus>(DEFAULT_STATUS);
   const [progress, setProgress] = useState<WikiProgress | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [validationMessage, setValidationMessage] = useState<string | null>(null);
   const [validating, setValidating] = useState(false);
 
   const refreshStatus = useCallback(async () => {
@@ -43,14 +41,15 @@ export function useWikiWorker() {
     }
   }, []);
 
+  // On mount: check Codex auth + wiki status
   useEffect(() => {
     (async () => {
       try {
-        const [maskedKey, nextStatus] = await Promise.all([
-          getOpenaiApiKey(),
+        const [available, nextStatus] = await Promise.all([
+          checkCodexAuth(),
           getWikiStatus(),
         ]);
-        setSavedKeyMask(maskedKey);
+        setCodexAvailable(available);
         setStatus(nextStatus);
       } catch (err) {
         setError(String(err).replace(/^Error:\s*/i, ""));
@@ -60,6 +59,7 @@ export function useWikiWorker() {
     })();
   }, []);
 
+  // Event listeners
   useEffect(() => {
     const unsubs: Promise<() => void>[] = [];
 
@@ -77,17 +77,13 @@ export function useWikiWorker() {
     unsubs.push(
       onWikiWorkerError((event) => {
         setError(event.message);
-        refreshStatus().catch((err) =>
-          console.error("Failed to refresh wiki status:", err),
-        );
+        refreshStatus().catch(() => {});
       }),
     );
     unsubs.push(
       onWikiWorkerStopped(() => {
         setProgress(null);
-        refreshStatus().catch((err) =>
-          console.error("Failed to refresh wiki status:", err),
-        );
+        refreshStatus().catch(() => {});
       }),
     );
 
@@ -98,60 +94,27 @@ export function useWikiWorker() {
     };
   }, [refreshStatus]);
 
-  const saveApiKey = useCallback(async () => {
-    const trimmed = apiKey.trim();
-    if (!trimmed) {
-      setError("Enter an OpenAI API key.");
-      return false;
-    }
-
-    setBusy(true);
-    setError(null);
-    try {
-      await saveOpenaiApiKey(trimmed);
-      const maskedKey = await getOpenaiApiKey();
-      setSavedKeyMask(maskedKey);
-      setValidationMessage("API key saved.");
-      return true;
-    } catch (err) {
-      setError(String(err).replace(/^Error:\s*/i, ""));
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }, [apiKey]);
-
-  const validateApiKey = useCallback(async () => {
-    const trimmed = apiKey.trim();
-    if (!trimmed) {
-      setValidationMessage("Enter an API key to validate.");
-      return false;
-    }
-
+  const handleValidate = useCallback(async () => {
     setValidating(true);
-    setValidationMessage(null);
     setError(null);
     try {
-      const valid = await validateOpenaiApiKey(trimmed);
-      setValidationMessage(valid ? "API key is valid." : "API key validation failed.");
-      return valid;
+      const valid = await validateCodexAuth();
+      setCodexValid(valid);
+      if (!valid) {
+        setError("Codex OAuth token is invalid or expired. Run 'codex login' in terminal.");
+      }
     } catch (err) {
-      setValidationMessage(String(err).replace(/^Error:\s*/i, ""));
-      return false;
+      setCodexValid(false);
+      setError(String(err).replace(/^Error:\s*/i, ""));
     } finally {
       setValidating(false);
     }
-  }, [apiKey]);
+  }, []);
 
-  const startWorker = useCallback(async () => {
+  const handleStart = useCallback(async () => {
     setBusy(true);
     setError(null);
     try {
-      if (apiKey.trim()) {
-        await saveOpenaiApiKey(apiKey.trim());
-        const maskedKey = await getOpenaiApiKey();
-        setSavedKeyMask(maskedKey);
-      }
       await startWikiWorker();
       await refreshStatus();
     } catch (err) {
@@ -159,9 +122,9 @@ export function useWikiWorker() {
     } finally {
       setBusy(false);
     }
-  }, [apiKey, refreshStatus]);
+  }, [refreshStatus]);
 
-  const stopWorker = useCallback(async () => {
+  const handleStop = useCallback(async () => {
     setBusy(true);
     setError(null);
     try {
@@ -174,13 +137,12 @@ export function useWikiWorker() {
     }
   }, [refreshStatus]);
 
-  const reprocessAll = useCallback(async () => {
+  const handleReprocess = useCallback(async () => {
     setBusy(true);
     setError(null);
     try {
       await reprocessWiki();
       await refreshStatus();
-      setValidationMessage("Wiki queue reset and re-enqueued.");
     } catch (err) {
       setError(String(err).replace(/^Error:\s*/i, ""));
     } finally {
@@ -188,13 +150,12 @@ export function useWikiWorker() {
     }
   }, [refreshStatus]);
 
-  const clearAll = useCallback(async () => {
+  const handleClear = useCallback(async () => {
     setBusy(true);
     setError(null);
     try {
       await clearWikiData();
       await refreshStatus();
-      setValidationMessage("Wiki data cleared.");
     } catch (err) {
       setError(String(err).replace(/^Error:\s*/i, ""));
     } finally {
@@ -203,22 +164,19 @@ export function useWikiWorker() {
   }, [refreshStatus]);
 
   return {
-    apiKey,
-    setApiKey,
-    savedKeyMask,
+    codexAvailable,
+    codexValid,
     status,
     progress,
     loading,
     busy,
     error,
-    validationMessage,
     validating,
-    saveApiKey,
-    validateApiKey,
-    startWorker,
-    stopWorker,
-    reprocessWiki: reprocessAll,
-    clearWikiData: clearAll,
+    validateCodex: handleValidate,
+    startWorker: handleStart,
+    stopWorker: handleStop,
+    reprocessWiki: handleReprocess,
+    clearWikiData: handleClear,
     refreshStatus,
   };
 }
