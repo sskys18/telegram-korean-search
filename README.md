@@ -11,9 +11,12 @@
 - **영어 검색** -- 영어 부분 문자열 검색도 동일하게 지원
 - **빠른 검색** -- FTS5 인덱스 기반, 300ms 이내 응답
 - **글로벌 단축키** -- `Cmd+Shift+F`로 어디서든 검색창 열기/닫기
-- **메시지 바로가기** -- 검색 결과 클릭 시 텔레그램 데스크톱 해당 메시지로 이동
+- **메시지 미리보기** -- 검색 결과 클릭 시 메시지 전문 모달 표시, "텔레그램에서 열기" 버튼
 - **로컬 전용** -- 모든 데이터는 내 맥에만 저장. 외부 서버 없음
 - **백그라운드 동기화** -- 메시지 수집 중에도 검색 가능
+- **위키 자동 생성** -- LLM이 메시지를 분류하여 트렌딩 토픽 + 이중언어 위키 문서 자동 생성
+- **트렌딩 대시보드** -- 채널 전체에서 화제인 토픽을 한눈에 확인
+- **Codex CLI 연동** -- OpenAI API 키 불필요, ChatGPT 구독으로 바로 사용
 
 ## Screenshots
 
@@ -98,6 +101,7 @@ cargo tauri build
 | Frontend | React + TypeScript + Vite |
 | Telegram | grammers (MTProto) |
 | Search | SQLite FTS5 trigram tokenizer |
+| Wiki/LLM | Codex CLI (o4-mini classification, gpt-5.4 summaries) |
 | Storage | SQLite (WAL mode) |
 | Security | AES-256-GCM session encryption, macOS Keychain |
 
@@ -108,23 +112,6 @@ cargo tauri build
 ## Contributing
 
 [CONTRIBUTING.md](CONTRIBUTING.md)를 참고하세요.
-
-## Code Signing (선택사항)
-
-코드 서명 없이도 앱은 정상 작동합니다. 향후 코드 서명을 추가하려면:
-
-1. [Apple Developer Program](https://developer.apple.com/programs/) 등록 (연 $99)
-2. **Developer ID Application** 인증서 생성
-3. 인증서를 `.p12`로 내보내고 base64 인코딩: `base64 -i cert.p12 | pbcopy`
-4. [appleid.apple.com](https://appleid.apple.com)에서 앱 전용 비밀번호 생성
-5. GitHub Secrets 추가:
-   - `APPLE_CERTIFICATE` — base64 인코딩된 `.p12`
-   - `APPLE_CERTIFICATE_PASSWORD` — `.p12` 비밀번호
-   - `APPLE_SIGNING_IDENTITY` — 예: `Developer ID Application: Name (TEAM_ID)`
-   - `APPLE_ID` — Apple ID 이메일
-   - `APPLE_PASSWORD` — 앱 전용 비밀번호
-   - `APPLE_TEAM_ID` — 10자리 팀 ID
-6. release workflow의 `tauri-action` 단계에 환경변수 추가
 
 ## License
 
