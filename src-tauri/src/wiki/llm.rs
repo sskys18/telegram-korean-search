@@ -1,8 +1,11 @@
 use serde::Deserialize;
 use std::process::Command;
 
+const CLASSIFY_MODEL: &str = "o4-mini";
+const SUMMARY_MODEL: &str = "gpt-5.4";
+const BATCH_SIZE: usize = 20;
+
 /// LLM client that shells out to `codex exec` CLI.
-/// No API keys or OAuth needed — uses whatever auth codex has configured.
 #[derive(Debug, Clone)]
 pub struct LlmClient;
 
@@ -20,6 +23,20 @@ pub struct ClassifiedTopic {
     pub category: String,
     pub category_ko: Option<String>,
     pub relevance: f64,
+}
+
+/// Batch classification result — one ClassifyResponse per message index.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchClassifyResponse {
+    pub results: Vec<BatchClassifyItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchClassifyItem {
+    pub index: usize,
+    pub skip: bool,
+    #[serde(default)]
+    pub topics: Vec<ClassifiedTopic>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,8 +70,13 @@ pub fn is_codex_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Run a prompt through `codex exec` and return the text output.
-fn run_codex(prompt: &str) -> Result<String, LlmError> {
+/// The recommended batch size for classification.
+pub fn classify_batch_size() -> usize {
+    BATCH_SIZE
+}
+
+/// Run a prompt through `codex exec` with a specific model.
+fn run_codex(prompt: &str, model: &str) -> Result<String, LlmError> {
     let output_file =
         std::env::temp_dir().join(format!("tg-wiki-codex-{}.txt", std::process::id()));
 
@@ -63,6 +85,8 @@ fn run_codex(prompt: &str) -> Result<String, LlmError> {
             "exec",
             "--ephemeral",
             "--skip-git-repo-check",
+            "-m",
+            model,
             "-o",
             output_file.to_str().unwrap_or("/tmp/tg-wiki-codex.txt"),
             prompt,
@@ -79,7 +103,6 @@ fn run_codex(prompt: &str) -> Result<String, LlmError> {
         )));
     }
 
-    // Read from output file (cleaner than parsing stdout which has metadata)
     let text = std::fs::read_to_string(&output_file)
         .map_err(|e| LlmError::Exec(format!("Failed to read codex output: {}", e)))?;
     let _ = std::fs::remove_file(&output_file);
@@ -92,9 +115,8 @@ fn run_codex(prompt: &str) -> Result<String, LlmError> {
     Ok(trimmed)
 }
 
-/// Async wrapper — runs codex in a blocking task to not block tokio.
-async fn run_codex_async(prompt: String) -> Result<String, LlmError> {
-    tokio::task::spawn_blocking(move || run_codex(&prompt))
+async fn run_codex_async(prompt: String, model: String) -> Result<String, LlmError> {
+    tokio::task::spawn_blocking(move || run_codex(&prompt, &model))
         .await
         .map_err(|e| LlmError::Exec(format!("Task join error: {}", e)))?
 }
@@ -105,18 +127,107 @@ impl Default for LlmClient {
     }
 }
 
+/// A message to classify in a batch.
+pub struct MessageForClassify {
+    pub index: usize,
+    pub chat_title: String,
+    pub timestamp: i64,
+    pub text: String,
+}
+
 impl LlmClient {
     pub fn new() -> Self {
         Self
     }
 
     pub async fn validate(&self) -> Result<bool, LlmError> {
-        match run_codex_async("Reply with ONLY the word ok".to_string()).await {
+        match run_codex_async(
+            "Reply with ONLY the word ok".to_string(),
+            CLASSIFY_MODEL.to_string(),
+        )
+        .await
+        {
             Ok(text) => Ok(text.contains("ok")),
             Err(_) => Ok(false),
         }
     }
 
+    /// Classify a batch of messages in a single codex call.
+    /// Returns one ClassifyResponse per input message (matched by index).
+    pub async fn classify_batch(
+        &self,
+        messages: &[MessageForClassify],
+    ) -> Result<Vec<(usize, ClassifyResponse)>, LlmError> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build the batch message list
+        let mut msg_list = String::new();
+        for msg in messages {
+            let truncated = if msg.text.len() > 300 {
+                &msg.text[..300]
+            } else {
+                &msg.text
+            };
+            msg_list.push_str(&format!(
+                "[{}] [Channel: {}] [{}]: {}\n",
+                msg.index, msg.chat_title, msg.timestamp, truncated
+            ));
+        }
+
+        let prompt = format!(
+            r#"Classify these {} Telegram messages from crypto/finance channels. Return ONLY valid JSON.
+
+For each message, determine:
+- skip: true if greeting, spam, bot command, emoji-only, no info value
+- topics: array of 1-3 topics with:
+  - topic: concise English title
+  - topic_ko: Korean title if Korean message, else null
+  - category: short domain label (e.g. "Bitcoin", "DeFi", "Regulation", "Airdrop", "Memecoin", "AI", "L1/L2", "Trading" — pick whatever fits, no fixed list)
+  - category_ko: Korean category name or null
+  - relevance: 0.0-1.0
+
+Messages:
+{}
+Return JSON: {{"results": [{{"index": 0, "skip": false, "topics": [...]}}]}}"#,
+            messages.len(),
+            msg_list
+        );
+
+        let response = run_codex_async(prompt, CLASSIFY_MODEL.to_string()).await?;
+
+        let json_str = extract_json(&response).ok_or_else(|| {
+            LlmError::Parse(format!(
+                "No JSON found in batch response: {}",
+                &response[..response.len().min(200)]
+            ))
+        })?;
+
+        let batch: BatchClassifyResponse = serde_json::from_str(json_str).map_err(|e| {
+            LlmError::Parse(format!(
+                "Batch JSON parse error: {} — raw: {}",
+                e,
+                &json_str[..json_str.len().min(500)]
+            ))
+        })?;
+
+        Ok(batch
+            .results
+            .into_iter()
+            .map(|item| {
+                (
+                    item.index,
+                    ClassifyResponse {
+                        skip: item.skip,
+                        topics: item.topics,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Single message classification (fallback if batch fails for a specific message).
     pub async fn classify_message(
         &self,
         chat_title: &str,
@@ -126,28 +237,20 @@ impl LlmClient {
         let truncated = if text.len() > 500 { &text[..500] } else { text };
 
         let prompt = format!(
-            r#"You are a Telegram message classifier for crypto/finance channels. Classify this message into topics. Return ONLY valid JSON.
+            r#"Classify this Telegram message from a crypto/finance channel. Return ONLY valid JSON.
 
 Rules:
-- topics: array of 1-3 topics this message discusses
-- topic: concise English title (e.g. "Ethereum ETF Approval", "Solana DeFi Growth")
-- topic_ko: Korean title if the message is Korean, else null
-- category: a short label that best describes the domain (e.g. "Bitcoin", "DeFi", "Regulation", "Airdrop", "Memecoin", "AI", "L1/L2", "Trading", "NFT", "CEX", "Stablecoin", etc.) — pick whatever fits best, you are not limited to a fixed list
-- category_ko: Korean category name if you can provide one, else null
-- relevance: 0.0-1.0 how on-topic this message is
-- skip: true if the message is a greeting, spam, bot command, emoji-only, or has no informational value
+- skip: true if greeting, spam, bot command, emoji-only, no info value
+- topics: array of 1-3 topics with topic, topic_ko, category, category_ko, relevance
 
 Message: [Channel: {}] [{}]
 {}
 
-Return JSON: {{"skip": false, "topics": [{{"topic": "...", "topic_ko": "...", "category": "...", "category_ko": "...", "relevance": 0.8}}]}}
-If skip: {{"skip": true, "topics": []}}"#,
+Return: {{"skip": false, "topics": [{{"topic": "...", "topic_ko": null, "category": "...", "category_ko": null, "relevance": 0.8}}]}}"#,
             chat_title, timestamp, truncated
         );
 
-        let response = run_codex_async(prompt).await?;
-
-        // Extract JSON from response (codex might add extra text)
+        let response = run_codex_async(prompt, CLASSIFY_MODEL.to_string()).await?;
         let json_str = extract_json(&response)
             .ok_or_else(|| LlmError::Parse(format!("No JSON found in: {}", response)))?;
 
@@ -201,7 +304,8 @@ Source messages ({} total):
             sources_text
         );
 
-        let response = run_codex_async(prompt).await?;
+        // Use the bigger model for summary generation
+        let response = run_codex_async(prompt, SUMMARY_MODEL.to_string()).await?;
         let (ko, en) = split_bilingual(&response);
         Ok((ko, en))
     }
@@ -219,7 +323,7 @@ Reply: {{"same": true/false, "confidence": 0.0-1.0}}"#,
             new_title, existing_title
         );
 
-        let response = run_codex_async(prompt).await?;
+        let response = run_codex_async(prompt, CLASSIFY_MODEL.to_string()).await?;
         let json_str = extract_json(&response)
             .ok_or_else(|| LlmError::Parse(format!("No JSON found in: {}", response)))?;
 
@@ -228,7 +332,7 @@ Reply: {{"same": true/false, "confidence": 0.0-1.0}}"#,
     }
 }
 
-/// Extract the first JSON object from a string (codex may add surrounding text).
+/// Extract the first JSON object from a string.
 fn extract_json(text: &str) -> Option<&str> {
     let start = text.find('{')?;
     let mut depth = 0;

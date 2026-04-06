@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::store::wiki_topic::{normalize_topic_title, NewTopic, TopicMessageLink};
-use crate::wiki::llm::{ClassifiedTopic, LlmClient, LlmError};
+use crate::wiki::llm::{classify_batch_size, ClassifiedTopic, LlmClient, MessageForClassify};
 use crate::wiki::trending::calculate_trending_score;
 use crate::AppState;
 
@@ -30,8 +30,10 @@ pub fn start_worker(app: AppHandle) -> Arc<AtomicBool> {
 async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
     let state = app.state::<AppState>();
     let llm = LlmClient::new();
+    let batch_size = classify_batch_size();
     let mut processed_count: usize = 0;
 
+    // Recover stale claims on startup
     {
         let store = state.store.lock().unwrap();
         let recovered = store.recover_stale_claims().unwrap_or(0);
@@ -55,9 +57,10 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
             break;
         }
 
+        // Dequeue a batch of items
         let items = {
             let store = state.store.lock().unwrap();
-            store.dequeue_classify_batch(5).unwrap_or_default()
+            store.dequeue_classify_batch(batch_size).unwrap_or_default()
         };
 
         if items.is_empty() {
@@ -65,145 +68,151 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
             continue;
         }
 
-        for item in &items {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
+        // Build batch: read message text + chat titles for all items
+        let mut batch_messages: Vec<MessageForClassify> = Vec::new();
+        let mut item_map: Vec<(i64, i64, i64)> = Vec::new(); // (chat_id, message_id, timestamp)
 
-            let msg_data = {
+        for (i, item) in items.iter().enumerate() {
+            let (msg_data, chat_title) = {
                 let store = state.store.lock().unwrap();
-                store
+                let msg = store
                     .get_message(item.chat_id, item.message_id)
                     .ok()
+                    .flatten();
+                let title = store
+                    .get_chat(item.chat_id)
+                    .ok()
                     .flatten()
+                    .map(|c| c.title)
+                    .unwrap_or_else(|| "Unknown".to_string());
+                (msg, title)
             };
 
             let msg = match msg_data {
-                Some(m) => m,
-                None => {
+                Some(m) if !m.text_plain.trim().is_empty() => m,
+                _ => {
+                    // Skip empty/missing messages
                     let store = state.store.lock().unwrap();
                     let _ = store.mark_queue_skipped(item.chat_id, item.message_id);
                     continue;
                 }
             };
 
-            let chat_title = {
+            batch_messages.push(MessageForClassify {
+                index: i,
+                chat_title,
+                timestamp: msg.timestamp,
+                text: msg.text_plain.clone(),
+            });
+            item_map.push((item.chat_id, item.message_id, msg.timestamp));
+        }
+
+        if batch_messages.is_empty() {
+            continue;
+        }
+
+        log::info!(
+            "Wiki worker: classifying batch of {} messages",
+            batch_messages.len()
+        );
+
+        // Call LLM batch classification
+        let batch_result = llm.classify_batch(&batch_messages).await;
+
+        match batch_result {
+            Ok(results) => {
                 let store = state.store.lock().unwrap();
-                store
-                    .get_chat(item.chat_id)
-                    .ok()
-                    .flatten()
-                    .map(|c| c.title)
-                    .unwrap_or_else(|| "Unknown".to_string())
-            };
+                // Process each result
+                for (index, response) in &results {
+                    if *index >= item_map.len() {
+                        continue;
+                    }
+                    let (chat_id, message_id, timestamp) = item_map[*index];
 
-            if msg.text_plain.trim().is_empty() {
-                let store = state.store.lock().unwrap();
-                let _ = store.mark_queue_skipped(item.chat_id, item.message_id);
-                continue;
-            }
-
-            let classify_result: Result<crate::wiki::llm::ClassifyResponse, LlmError> =
-                retry_classify(&llm, &chat_title, msg.timestamp, &msg.text_plain).await;
-
-            match classify_result {
-                Ok(response) => {
                     if response.skip || response.topics.is_empty() {
-                        let store = state.store.lock().unwrap();
-                        let _ = store.mark_queue_skipped(item.chat_id, item.message_id);
+                        let _ = store.mark_queue_skipped(chat_id, message_id);
                     } else {
-                        let store = state.store.lock().unwrap();
                         for classified in &response.topics {
                             if let Err(e) = process_classified_topic(
-                                &store,
-                                classified,
-                                item.chat_id,
-                                item.message_id,
-                                msg.timestamp,
+                                &store, classified, chat_id, message_id, timestamp,
                             ) {
                                 log::warn!("Failed to process topic '{}': {}", classified.topic, e);
                             }
                         }
-                        let _ = store.mark_queue_done(item.chat_id, item.message_id);
+                        let _ = store.mark_queue_done(chat_id, message_id);
                     }
                 }
-                Err(e) => {
-                    log::warn!(
-                        "Classification failed for ({}, {}): {}",
-                        item.chat_id,
-                        item.message_id,
-                        e
-                    );
-                    let store = state.store.lock().unwrap();
-                    let _ = store.mark_queue_failed(item.chat_id, item.message_id, &e.to_string());
-                    let _ = app.emit(
-                        "wiki-worker-error",
-                        serde_json::json!({
-                            "message": e.to_string(),
-                            "recoverable": true,
-                        }),
-                    );
+
+                // Mark any items not in the response as needing retry
+                let returned_indices: std::collections::HashSet<usize> =
+                    results.iter().map(|(idx, _)| *idx).collect();
+                for (i, &(chat_id, message_id, _)) in item_map.iter().enumerate() {
+                    if !returned_indices.contains(&i) {
+                        let _ = store.mark_queue_failed(
+                            chat_id,
+                            message_id,
+                            "Missing from batch response",
+                        );
+                    }
                 }
+
+                processed_count += results.len();
             }
-
-            processed_count += 1;
-
-            if processed_count.is_multiple_of(100) {
-                let store = state.store.lock().unwrap();
-                total_channels = store.get_total_active_channels().unwrap_or(1);
-            }
-
-            if processed_count.is_multiple_of(50) {
-                recalculate_trending(&state, total_channels);
-            }
-
-            let stats = {
-                let store = state.store.lock().unwrap();
-                store
-                    .get_queue_stats()
-                    .unwrap_or(crate::store::wiki_queue::QueueStats {
-                        pending: 0,
-                        processing: 0,
-                        done: 0,
-                        failed: 0,
-                        skipped: 0,
-                    })
-            };
-            let _ = app.emit(
-                "wiki-worker-progress",
-                serde_json::json!({
-                    "processed": stats.done + stats.skipped,
-                    "total": stats.done + stats.skipped + stats.pending + stats.failed,
-                    "queue_remaining": stats.pending,
-                }),
-            );
-
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-    }
-
-    recalculate_trending(&state, total_channels);
-}
-
-async fn retry_classify(
-    llm: &LlmClient,
-    chat_title: &str,
-    timestamp: i64,
-    text: &str,
-) -> Result<crate::wiki::llm::ClassifyResponse, LlmError> {
-    let mut last_err = None;
-    for attempt in 0..3 {
-        match llm.classify_message(chat_title, timestamp, text).await {
-            Ok(resp) => return Ok(resp),
             Err(e) => {
-                log::warn!("Classify attempt {} failed: {}", attempt + 1, e);
-                last_err = Some(e);
-                let delay = std::time::Duration::from_millis(500 * 2u64.pow(attempt));
-                tokio::time::sleep(delay).await;
+                log::warn!("Batch classification failed: {}", e);
+                // Fall back to marking all as failed (will retry)
+                let store = state.store.lock().unwrap();
+                for &(chat_id, message_id, _) in &item_map {
+                    let _ = store.mark_queue_failed(chat_id, message_id, &e.to_string());
+                }
+                let _ = app.emit(
+                    "wiki-worker-error",
+                    serde_json::json!({
+                        "message": e.to_string(),
+                        "recoverable": true,
+                    }),
+                );
             }
         }
+
+        // Periodic maintenance
+        if processed_count.is_multiple_of(100) {
+            let store = state.store.lock().unwrap();
+            total_channels = store.get_total_active_channels().unwrap_or(1);
+        }
+
+        if processed_count.is_multiple_of(50) {
+            recalculate_trending(&state, total_channels);
+        }
+
+        // Emit progress
+        let stats = {
+            let store = state.store.lock().unwrap();
+            store
+                .get_queue_stats()
+                .unwrap_or(crate::store::wiki_queue::QueueStats {
+                    pending: 0,
+                    processing: 0,
+                    done: 0,
+                    failed: 0,
+                    skipped: 0,
+                })
+        };
+        let _ = app.emit(
+            "wiki-worker-progress",
+            serde_json::json!({
+                "processed": stats.done + stats.skipped,
+                "total": stats.done + stats.skipped + stats.pending + stats.failed,
+                "queue_remaining": stats.pending,
+            }),
+        );
+
+        // Brief pause between batches
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    Err(last_err.unwrap())
+
+    // Final trending recalculation
+    recalculate_trending(&state, total_channels);
 }
 
 fn process_classified_topic(
