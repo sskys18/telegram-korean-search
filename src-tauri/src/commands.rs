@@ -363,24 +363,23 @@ pub async fn start_collection(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Check if Codex OAuth is available (~/.codex/auth.json exists).
+/// Check if `codex` CLI is available on PATH.
 #[tauri::command]
 pub fn check_codex_auth() -> Result<bool, String> {
-    Ok(wiki::llm::is_codex_auth_available())
+    Ok(wiki::llm::is_codex_available())
 }
 
-/// Validate Codex OAuth tokens by making a test API call.
+/// Validate codex CLI by running a test prompt.
 #[tauri::command]
 pub async fn validate_codex_auth() -> Result<bool, String> {
-    let client = wiki::llm::LlmClient::from_codex().map_err(|e| e.to_string())?;
+    let client = wiki::llm::LlmClient::new();
     client.validate().await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn start_wiki_worker(app: AppHandle) -> Result<(), String> {
-    // Check Codex auth is available
-    if !wiki::llm::is_codex_auth_available() {
-        return Err("Codex OAuth not found. Run 'codex login' in terminal first.".to_string());
+    if !wiki::llm::is_codex_available() {
+        return Err("Codex CLI not found. Install with: npm i -g @openai/codex".to_string());
     }
 
     let state = app.state::<AppState>();
@@ -553,7 +552,7 @@ pub async fn generate_topic_summary(app: AppHandle, topic_id: i64) -> Result<Wik
         }
     }
 
-    let llm = wiki::llm::LlmClient::from_codex().map_err(|e| e.to_string())?;
+    let llm = wiki::llm::LlmClient::new();
     let source_refs: Vec<(usize, i64, &str, &str)> = sources
         .iter()
         .enumerate()

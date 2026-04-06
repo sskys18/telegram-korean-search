@@ -25,7 +25,6 @@ grammers-session = "0.8"
 grammers-tl-types = "0.8"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 flexi_logger = "0.29"
-reqwest = { version = "0.12", features = ["json"] }
 sha2 = "0.10"
 tauri-plugin-shell = "2"
 

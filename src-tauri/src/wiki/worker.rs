@@ -29,24 +29,7 @@ pub fn start_worker(app: AppHandle) -> Arc<AtomicBool> {
 
 async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
     let state = app.state::<AppState>();
-    let llm = match LlmClient::from_codex() {
-        Ok(client) => client,
-        Err(e) => {
-            log::error!("Wiki worker: failed to load Codex auth: {}", e);
-            let _ = app.emit(
-                "wiki-worker-error",
-                serde_json::json!({
-                    "message": e.to_string(),
-                    "recoverable": false,
-                }),
-            );
-            let _ = app.emit(
-                "wiki-worker-stopped",
-                serde_json::json!({"reason": "auth_failed"}),
-            );
-            return;
-        }
-    };
+    let llm = LlmClient::new();
     let mut processed_count: usize = 0;
 
     {

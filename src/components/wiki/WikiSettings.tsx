@@ -48,13 +48,13 @@ export function WikiSettings({ worker }: WikiSettingsProps) {
         <div className="wiki-settings-panel">
           {/* Codex OAuth Status */}
           <div className="wiki-field">
-            <span className="wiki-field-label">Codex OAuth</span>
+            <span className="wiki-field-label">Codex CLI</span>
             {worker.codexAvailable === null || worker.loading ? (
               <span>Checking...</span>
             ) : worker.codexAvailable ? (
               <div className="wiki-actions-row">
                 <span style={{ color: "#4caf50" }}>
-                  ~/.codex/auth.json found
+                  codex CLI found
                 </span>
                 <button
                   type="button"
@@ -74,9 +74,9 @@ export function WikiSettings({ worker }: WikiSettingsProps) {
             ) : (
               <div>
                 <span style={{ color: "#ff6b6b" }}>
-                  Not found. Run{" "}
+                  Not found. Install with{" "}
                   <code style={{ background: "#2d2d2d", padding: "2px 6px", borderRadius: 4 }}>
-                    codex login
+                    npm i -g @openai/codex
                   </code>{" "}
                   in terminal first.
                 </span>

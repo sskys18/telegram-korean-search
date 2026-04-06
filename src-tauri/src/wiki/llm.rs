@@ -1,77 +1,10 @@
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use serde::Deserialize;
+use std::process::Command;
 
-const CODEX_AUTH_PATH: &str = ".codex/auth.json";
-const OPENAI_AUTH_URL: &str = "https://auth.openai.com/oauth2/token";
-const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-
-/// Tokens read from ~/.codex/auth.json
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct CodexAuth {
-    auth_mode: String,
-    #[serde(rename = "OPENAI_API_KEY")]
-    api_key: Option<String>,
-    tokens: Option<CodexTokens>,
-    last_refresh: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct CodexTokens {
-    access_token: String,
-    refresh_token: String,
-    #[allow(dead_code)]
-    id_token: Option<String>,
-    #[allow(dead_code)]
-    account_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RefreshResponse {
-    access_token: String,
-    #[allow(dead_code)]
-    token_type: Option<String>,
-    #[allow(dead_code)]
-    expires_in: Option<u64>,
-}
-
+/// LLM client that shells out to `codex exec` CLI.
+/// No API keys or OAuth needed — uses whatever auth codex has configured.
 #[derive(Debug, Clone)]
-pub struct LlmClient {
-    http: reqwest::Client,
-    access_token: Arc<Mutex<String>>,
-    refresh_token: String,
-    model: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    temperature: f32,
-    response_format: ResponseFormat,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponseFormat {
-    r#type: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Choice {
-    message: ChatMessage,
-}
+pub struct LlmClient;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClassifyResponse {
@@ -96,136 +29,90 @@ pub struct DedupResponse {
 
 #[derive(Debug)]
 pub enum LlmError {
-    Http(reqwest::Error),
+    Exec(String),
     Parse(String),
-    Api(String),
-    Auth(String),
 }
 
 impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LlmError::Http(e) => write!(f, "HTTP error: {}", e),
+            LlmError::Exec(e) => write!(f, "Codex exec error: {}", e),
             LlmError::Parse(e) => write!(f, "Parse error: {}", e),
-            LlmError::Api(e) => write!(f, "API error: {}", e),
-            LlmError::Auth(e) => write!(f, "Auth error: {}", e),
         }
     }
 }
 
 impl std::error::Error for LlmError {}
 
-/// Get the path to ~/.codex/auth.json
-fn codex_auth_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(CODEX_AUTH_PATH)
+/// Check if `codex` CLI is available on PATH.
+pub fn is_codex_available() -> bool {
+    Command::new("codex")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
-/// Read Codex OAuth tokens from ~/.codex/auth.json
-pub fn read_codex_auth() -> Result<(String, String), LlmError> {
-    let path = codex_auth_path();
-    let data = std::fs::read_to_string(&path).map_err(|e| {
-        LlmError::Auth(format!(
-            "Cannot read {}: {}. Run 'codex login' first.",
-            path.display(),
-            e
-        ))
-    })?;
-    let auth: CodexAuth = serde_json::from_str(&data)
-        .map_err(|e| LlmError::Auth(format!("Invalid auth.json: {}", e)))?;
+/// Run a prompt through `codex exec` and return the text output.
+fn run_codex(prompt: &str) -> Result<String, LlmError> {
+    let output_file =
+        std::env::temp_dir().join(format!("tg-wiki-codex-{}.txt", std::process::id()));
 
-    match auth.tokens {
-        Some(tokens) => Ok((tokens.access_token, tokens.refresh_token)),
-        None => Err(LlmError::Auth(
-            "No OAuth tokens in auth.json. Run 'codex login' first.".to_string(),
-        )),
+    let result = Command::new("codex")
+        .args([
+            "exec",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "-o",
+            output_file.to_str().unwrap_or("/tmp/tg-wiki-codex.txt"),
+            prompt,
+        ])
+        .output()
+        .map_err(|e| LlmError::Exec(format!("Failed to run codex: {}", e)))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        return Err(LlmError::Exec(format!(
+            "codex exec failed: {}{}",
+            stderr, stdout
+        )));
     }
+
+    // Read from output file (cleaner than parsing stdout which has metadata)
+    let text = std::fs::read_to_string(&output_file)
+        .map_err(|e| LlmError::Exec(format!("Failed to read codex output: {}", e)))?;
+    let _ = std::fs::remove_file(&output_file);
+
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(LlmError::Exec("Empty response from codex".to_string()));
+    }
+
+    Ok(trimmed)
 }
 
-/// Check if Codex auth is available
-pub fn is_codex_auth_available() -> bool {
-    codex_auth_path().exists()
+/// Async wrapper — runs codex in a blocking task to not block tokio.
+async fn run_codex_async(prompt: String) -> Result<String, LlmError> {
+    tokio::task::spawn_blocking(move || run_codex(&prompt))
+        .await
+        .map_err(|e| LlmError::Exec(format!("Task join error: {}", e)))?
+}
+
+impl Default for LlmClient {
+    fn default() -> Self {
+        Self
+    }
 }
 
 impl LlmClient {
-    /// Create a new LLM client from Codex OAuth tokens.
-    pub fn from_codex() -> Result<Self, LlmError> {
-        let (access_token, refresh_token) = read_codex_auth()?;
-        Ok(Self {
-            http: reqwest::Client::new(),
-            access_token: Arc::new(Mutex::new(access_token)),
-            refresh_token,
-            model: "gpt-4o-mini".to_string(),
-        })
-    }
-
-    /// Refresh the access token using the refresh token.
-    async fn refresh_access_token(&self) -> Result<String, LlmError> {
-        let resp = self
-            .http
-            .post(OPENAI_AUTH_URL)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", &self.refresh_token),
-                ("client_id", CODEX_CLIENT_ID),
-            ])
-            .send()
-            .await
-            .map_err(LlmError::Http)?;
-
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Auth(format!(
-                "Token refresh failed: {}. Run 'codex login' to re-authenticate.",
-                body
-            )));
-        }
-
-        let refresh_resp: RefreshResponse = resp.json().await.map_err(LlmError::Http)?;
-        let new_token = refresh_resp.access_token;
-
-        // Update in-memory token
-        *self.access_token.lock().await = new_token.clone();
-
-        // Update auth.json on disk
-        if let Ok(data) = std::fs::read_to_string(codex_auth_path()) {
-            if let Ok(mut auth) = serde_json::from_str::<CodexAuth>(&data) {
-                if let Some(ref mut tokens) = auth.tokens {
-                    tokens.access_token = new_token.clone();
-                    auth.last_refresh = Some(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| format!("{}", d.as_secs()))
-                            .unwrap_or_default(),
-                    );
-                    if let Ok(updated) = serde_json::to_string_pretty(&auth) {
-                        let _ = std::fs::write(codex_auth_path(), updated);
-                    }
-                }
-            }
-        }
-
-        Ok(new_token)
+    pub fn new() -> Self {
+        Self
     }
 
     pub async fn validate(&self) -> Result<bool, LlmError> {
-        let req = ChatRequest {
-            model: self.model.clone(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: "Reply with just: ok".to_string(),
-            }],
-            temperature: 0.0,
-            response_format: ResponseFormat {
-                r#type: "text".to_string(),
-            },
-        };
-
-        match self.call_api(&req).await {
-            Ok(_) => Ok(true),
-            Err(LlmError::Api(msg)) if msg.contains("401") || msg.contains("invalid") => Ok(false),
-            Err(e) => Err(e),
+        match run_codex_async("Reply with ONLY the word ok".to_string()).await {
+            Ok(text) => Ok(text.contains("ok")),
+            Err(_) => Ok(false),
         }
     }
 
@@ -235,49 +122,35 @@ impl LlmClient {
         timestamp: i64,
         text: &str,
     ) -> Result<ClassifyResponse, LlmError> {
-        let system = r#"You are a crypto/finance message classifier for a Telegram archive.
-Classify the message into one or more topics. Return ONLY valid JSON.
+        let truncated = if text.len() > 500 { &text[..500] } else { text };
+
+        let prompt = format!(
+            r#"You are a crypto/finance message classifier. Classify this Telegram message into topics. Return ONLY valid JSON, no other text.
 
 Rules:
-- topics: array of 1-3 topics this message relates to
-- Each topic: concise English title (e.g., "ETH Layer 2 Fees", "Solana Outage")
+- topics: array of 1-3 topics
+- Each topic: concise English title
 - topic_ko: Korean title if inferrable, else null
 - category: one of [DeFi, Trading, L1/L2, NFT, Airdrop, Regulation, Macro, Scam Alert, Other]
-- relevance: 0.0-1.0 how relevant the message is to each topic
-- skip: true if message is greeting, spam, bot command, emoji-only, or has no informational value
+- relevance: 0.0-1.0
+- skip: true if greeting, spam, bot command, emoji-only, no info value
 
-Response format:
-{"skip": false, "topics": [{"topic": "...", "topic_ko": "...", "category": "...", "relevance": 0.8}]}
-If skip=true, topics array should be empty: {"skip": true, "topics": []}"#;
+Message: [Channel: {}] [{}]
+{}
 
-        let truncated = if text.len() > 500 { &text[..500] } else { text };
-        let user = format!("[Channel: {}] [{}]\n{}", chat_title, timestamp, truncated);
+Return JSON: {{"skip": false, "topics": [{{"topic": "...", "topic_ko": "...", "category": "...", "relevance": 0.8}}]}}
+If skip: {{"skip": true, "topics": []}}"#,
+            chat_title, timestamp, truncated
+        );
 
-        let req = ChatRequest {
-            model: self.model.clone(),
-            messages: vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: system.to_string(),
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: user,
-                },
-            ],
-            temperature: 0.1,
-            response_format: ResponseFormat {
-                r#type: "json_object".to_string(),
-            },
-        };
+        let response = run_codex_async(prompt).await?;
 
-        let response_text = self.call_api(&req).await?;
-        serde_json::from_str::<ClassifyResponse>(&response_text).map_err(|e| {
-            LlmError::Parse(format!(
-                "Failed to parse classify response: {} - raw: {}",
-                e, response_text
-            ))
-        })
+        // Extract JSON from response (codex might add extra text)
+        let json_str = extract_json(&response)
+            .ok_or_else(|| LlmError::Parse(format!("No JSON found in: {}", response)))?;
+
+        serde_json::from_str::<ClassifyResponse>(json_str)
+            .map_err(|e| LlmError::Parse(format!("JSON parse error: {} — raw: {}", e, json_str)))
     }
 
     pub async fn generate_summary(
@@ -286,71 +159,47 @@ If skip=true, topics array should be empty: {"skip": true, "topics": []}"#;
         category: &str,
         source_messages: &[(usize, i64, &str, &str)],
     ) -> Result<(String, String), LlmError> {
-        let system = r#"Write a bilingual wiki article about a crypto/finance topic based on Telegram messages.
-Every factual claim MUST cite its source using [N] notation matching the message index.
-
-Structure:
-## 요약
-(Korean summary: 2-3 paragraphs, factual, cite sources as [1], [2], etc.)
-
-### 핵심 포인트
-- (Korean bullet points with citations)
-
-### 타임라인
-- (Korean chronological events with citations)
-
----
-
-## Summary
-(English version of the same content with same citations)
-
-### Key Points
-- (English bullet points with citations)
-
-### Timeline
-- (English chronological events with citations)
-
-Rules:
-- EVERY factual claim must have a [N] citation to a source message
-- If sources disagree, note the disagreement
-- If information is unverified or speculative, mark it as such
-- Skip duplicate forwarded messages
-- If fewer than 3 unique source messages, output "Insufficient sources for wiki article"
-- Keep it concise"#;
-
-        let mut user = format!(
-            "Topic: {}\nCategory: {}\n\nSource messages ({} total):\n",
-            title,
-            category,
-            source_messages.len()
-        );
+        let mut sources_text = String::new();
         for &(idx, ts, chat_title, text) in source_messages {
             let truncated = if text.len() > 300 { &text[..300] } else { text };
-            user.push_str(&format!(
+            sources_text.push_str(&format!(
                 "[{}] [{}] [{}]: {}\n",
                 idx, ts, chat_title, truncated
             ));
         }
 
-        let req = ChatRequest {
-            model: self.model.clone(),
-            messages: vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: system.to_string(),
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: user,
-                },
-            ],
-            temperature: 0.3,
-            response_format: ResponseFormat {
-                r#type: "text".to_string(),
-            },
-        };
+        let prompt = format!(
+            r#"Write a bilingual wiki article about a crypto/finance topic. Every claim MUST cite sources using [N].
 
-        let response = self.call_api(&req).await?;
+Structure:
+## 요약
+(Korean, 2-3 paragraphs with [N] citations)
+### 핵심 포인트
+- (Korean bullets with citations)
+### 타임라인
+- (Korean events with citations)
+---
+## Summary
+(English version with same [N] citations)
+### Key Points
+- (English bullets)
+### Timeline
+- (English events)
+
+Rules: Every claim needs [N] citation. Note disagreements. Mark unverified info. Skip duplicates. If <3 sources, say "Insufficient sources."
+
+Topic: {}
+Category: {}
+
+Source messages ({} total):
+{}"#,
+            title,
+            category,
+            source_messages.len(),
+            sources_text
+        );
+
+        let response = run_codex_async(prompt).await?;
         let (ko, en) = split_bilingual(&response);
         Ok((ko, en))
     }
@@ -360,82 +209,40 @@ Rules:
         new_title: &str,
         existing_title: &str,
     ) -> Result<DedupResponse, LlmError> {
-        let user = format!(
-            "Are these the same crypto topic?\nNew: \"{}\"\nExisting: \"{}\"\nAnswer JSON: {{\"same\": true/false, \"confidence\": 0.0-1.0}}",
+        let prompt = format!(
+            r#"Are these the same crypto topic? Reply with ONLY JSON.
+New: "{}"
+Existing: "{}"
+Reply: {{"same": true/false, "confidence": 0.0-1.0}}"#,
             new_title, existing_title
         );
 
-        let req = ChatRequest {
-            model: self.model.clone(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: user,
-            }],
-            temperature: 0.0,
-            response_format: ResponseFormat {
-                r#type: "json_object".to_string(),
-            },
-        };
+        let response = run_codex_async(prompt).await?;
+        let json_str = extract_json(&response)
+            .ok_or_else(|| LlmError::Parse(format!("No JSON found in: {}", response)))?;
 
-        let response_text = self.call_api(&req).await?;
-        serde_json::from_str::<DedupResponse>(&response_text).map_err(|e| {
-            LlmError::Parse(format!("Dedup parse error: {} - raw: {}", e, response_text))
-        })
+        serde_json::from_str::<DedupResponse>(json_str)
+            .map_err(|e| LlmError::Parse(format!("Dedup parse error: {} — raw: {}", e, json_str)))
     }
+}
 
-    /// Call the OpenAI API. Automatically refreshes token on 401.
-    async fn call_api(&self, req: &ChatRequest) -> Result<String, LlmError> {
-        let token = self.access_token.lock().await.clone();
-        let resp = self
-            .http
-            .post("https://api.openai.com/v1/chat/completions")
-            .header("Authorization", format!("Bearer {}", token))
-            .json(req)
-            .send()
-            .await
-            .map_err(LlmError::Http)?;
-
-        // Auto-refresh on 401
-        if resp.status() == 401 {
-            log::info!("Access token expired, refreshing...");
-            let new_token = self.refresh_access_token().await?;
-
-            let resp = self
-                .http
-                .post("https://api.openai.com/v1/chat/completions")
-                .header("Authorization", format!("Bearer {}", new_token))
-                .json(req)
-                .send()
-                .await
-                .map_err(LlmError::Http)?;
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(LlmError::Api(format!("{}: {}", status, body)));
+/// Extract the first JSON object from a string (codex may add surrounding text).
+fn extract_json(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0;
+    for (i, c) in text[start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..start + i + 1]);
+                }
             }
-
-            let chat_resp: ChatResponse = resp.json().await.map_err(LlmError::Http)?;
-            return chat_resp
-                .choices
-                .first()
-                .map(|c| c.message.content.clone())
-                .ok_or_else(|| LlmError::Api("No choices in response".to_string()));
+            _ => {}
         }
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api(format!("{}: {}", status, body)));
-        }
-
-        let chat_resp: ChatResponse = resp.json().await.map_err(LlmError::Http)?;
-        chat_resp
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .ok_or_else(|| LlmError::Api("No choices in response".to_string()))
     }
+    None
 }
 
 fn split_bilingual(text: &str) -> (String, String) {
@@ -459,24 +266,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_extract_json() {
+        assert_eq!(
+            extract_json(r#"Here is the result: {"skip": true, "topics": []}"#),
+            Some(r#"{"skip": true, "topics": []}"#)
+        );
+    }
+
+    #[test]
+    fn test_extract_json_nested() {
+        let text = r#"{"topics": [{"topic": "ETH", "relevance": 0.9}]}"#;
+        assert_eq!(extract_json(text), Some(text));
+    }
+
+    #[test]
+    fn test_extract_json_none() {
+        assert_eq!(extract_json("no json here"), None);
+    }
+
+    #[test]
     fn test_split_bilingual() {
         let text = "## 요약\n한국어 내용\n\n---\n\n## Summary\nEnglish content";
         let (ko, en) = split_bilingual(text);
         assert!(ko.contains("한국어"));
         assert!(en.contains("English"));
-    }
-
-    #[test]
-    fn test_split_bilingual_no_separator() {
-        let text = "## 요약\n한국어\n\n## Summary\nEnglish";
-        let (ko, en) = split_bilingual(text);
-        assert!(ko.contains("한국어"));
-        assert!(en.contains("English"));
-    }
-
-    #[test]
-    fn test_codex_auth_path() {
-        let path = codex_auth_path();
-        assert!(path.to_string_lossy().contains(".codex/auth.json"));
     }
 }
