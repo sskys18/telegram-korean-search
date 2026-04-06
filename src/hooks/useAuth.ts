@@ -83,12 +83,57 @@ export function useAuth() {
         if (!creds) {
           // No saved credentials — check .env for pre-fill
           const env = await readEnvCredentials().catch(() => null);
+          const envApiId = env?.api_id ?? "";
+          const envApiHash = env?.api_hash ?? "";
+          const envPhone = env?.phone ?? "";
+
+          // Auto-login if all 3 .env values are present
+          if (envApiId && envApiHash && envPhone) {
+            const id = parseInt(envApiId, 10);
+            if (!isNaN(id)) {
+              setState((s) => ({
+                ...s,
+                step: "connecting",
+                savedApiId: envApiId,
+                savedApiHash: envApiHash,
+                savedPhone: envPhone,
+              }));
+              try {
+                await saveApiCredentials(id, envApiHash);
+                await connectTelegram();
+                const normalized = envPhone
+                  .replace(/[^\d+]/g, "")
+                  .replace(/(?!^)\+/g, "");
+                await requestLoginCode(normalized);
+                setState((s) => ({
+                  ...s,
+                  step: "code",
+                  savedApiId: envApiId,
+                  savedApiHash: envApiHash,
+                  savedPhone: envPhone,
+                }));
+                return;
+              } catch (err) {
+                // Fall through to login form on error
+                setState((s) => ({
+                  ...s,
+                  step: "login",
+                  error: friendlyError(err),
+                  savedApiId: envApiId,
+                  savedApiHash: envApiHash,
+                  savedPhone: envPhone,
+                }));
+                return;
+              }
+            }
+          }
+
           setState((s) => ({
             ...s,
             step: "login",
-            savedApiId: env?.api_id ?? "",
-            savedApiHash: env?.api_hash ?? "",
-            savedPhone: env?.phone ?? "",
+            savedApiId: envApiId,
+            savedApiHash: envApiHash,
+            savedPhone: envPhone,
           }));
           return;
         }

@@ -82,9 +82,13 @@ fn count_topic_sources(store: &crate::store::Store, topic_id: i64) -> Result<i64
 /// Looks for TG_API_ID, TG_API_HASH, TG_PHONE.
 #[tauri::command]
 pub fn read_env_credentials() -> Result<Option<EnvCredentials>, String> {
-    // Try .env in the current directory, then next to the executable
+    // Try .env in current dir, parent dir (project root during cargo tauri dev),
+    // and next to the executable
     let candidates = [
         std::env::current_dir().ok().map(|p| p.join(".env")),
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(".env"))),
         std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join(".env"))),
