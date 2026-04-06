@@ -45,6 +45,16 @@ src-tauri/src/
     chat.rs            # Chat CRUD operations
     message.rs         # Message CRUD & FTS5 indexing
     sync_state.rs      # Per-chat sync state tracking
+    wiki_category.rs   # Wiki category storage
+    wiki_queue.rs      # Wiki classification queue storage
+    wiki_topic.rs      # Wiki topic storage
+    wiki_page.rs       # Wiki page storage
+    wiki_stats.rs      # Wiki stats storage
+  wiki/
+    mod.rs             # Module root
+    llm.rs             # codex exec integration
+    worker.rs          # Background wiki processing worker
+    trending.rs        # Wiki trending calculations
 
 src/
   main.tsx             # React entry point
@@ -57,13 +67,18 @@ src/
     SearchBar.tsx
     ResultList.tsx     # Search result list
     ResultItem.tsx     # Individual search result
+    TabBar.tsx         # Top-level tab navigation
+    wiki/              # Wiki UI components
   hooks/
     useAuth.ts
     useSearch.ts
     useInfiniteScroll.ts
+    useWiki.ts
+    useWikiWorker.ts
   pages/
     LoginPage.tsx
     SearchPage.tsx
+    WikiPage.tsx
   types/
     index.ts           # TypeScript type definitions
   utils/
@@ -103,15 +118,31 @@ cargo clippy -- -D warnings                 # Lint check
 - Tauri commands in `commands.rs` are the bridge between frontend and backend
 - Frontend calls backend via `@tauri-apps/api` invoke
 - `Store` is wrapped in `std::sync::Mutex` and shared via Tauri state
-- Schema migrations are versioned via `app_meta.schema_version` (currently v3)
+- Schema migrations are versioned via `app_meta.schema_version` (currently v4)
 - Collection functions are split: `fetch_chats`/`fetch_messages` (network-only) + brief lock for DB writes
 - Stale sessions detected by `AUTH_KEY_UNREGISTERED` error, auto-recovered by deleting session and reconnecting
+
+## Wiki Feature
+
+- **LLM backend**: codex exec CLI (not direct API). No API keys needed -- uses ChatGPT subscription via codex auth.
+- **Classification model**: o4-mini (fast). **Summary model**: gpt-5.4 (quality).
+- **Batch processing**: 20 messages per codex call. Worker runs on dedicated thread with tokio runtime.
+- **Categories are dynamic**: LLM picks freely, backend deduplicates via known aliases (20 groups) + fuzzy matching. No hardcoded seed categories.
+- **Decoupled from sync**: Collection enqueues message IDs into `wiki_classify_queue`. Worker processes independently.
+- **Schema migrations are one-shot**: Changing migration code does NOT affect existing databases. To reset wiki data: `sqlite3 tg-korean-search.db "DELETE FROM wiki_categories; DELETE FROM wiki_topics; DELETE FROM wiki_classify_queue;"`
+
+## Gotchas
+
+- `cargo tauri dev` runs from `src-tauri/` directory, not project root. File lookups (like `.env`) must check parent dir.
+- Stale `telegram.session` causes grammers panics ("cannot commit", "readonly database"). Fix: delete `~/Library/Application Support/telegram-korean-search/telegram.session`.
+- ChatGPT OAuth tokens do NOT work with `api.openai.com/v1/chat/completions` (requires separate API billing). Use `codex exec` subprocess instead.
+- Clippy enforces `format!()` not `&format!()` for args accepting `impl AsRef<str>`, and `.is_multiple_of(N)` instead of `% N == 0`.
 
 ## Data Location
 
 ```
 ~/Library/Application Support/telegram-korean-search/
-  session.bin              # Encrypted Telegram session
+  telegram.session         # Telegram session (grammers SQLite)
   tg-korean-search.db      # SQLite DB (includes FTS5 index)
 ```
 
@@ -130,5 +161,7 @@ cargo clippy -- -D warnings                 # Lint check
 - Do not add `lindera` or `unicode-segmentation` -- removed in favor of FTS5 trigram
 - Do not hold store mutex during network I/O -- causes UI freeze
 - Do not use OFFSET pagination -- use cursor-based pagination
-- Do not commit `.env`, `session.bin`, `*.key`, or files in `.gitignore`
+- Do not commit `.env`, `telegram.session`, `*.key`, or files in `.gitignore`
 - Do not skip `cargo fmt` and `cargo clippy` before pushing
+- Do not call OpenAI API directly -- use codex exec CLI for all LLM calls
+- Do not hardcode wiki categories -- they are LLM-decided and auto-created
