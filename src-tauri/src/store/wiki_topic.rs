@@ -399,7 +399,7 @@ mod tests {
         let topic = NewTopic {
             title: "ETH Layer 2 Fees".to_string(),
             title_ko: Some("이더리움 L2 수수료".to_string()),
-            category_id: 1,
+            category_id: store.resolve_category("Test", None).unwrap(),
         };
         let id = store.create_topic(&topic).unwrap();
         assert!(id > 0);
@@ -414,10 +414,11 @@ mod tests {
     #[test]
     fn test_get_topic_with_category() {
         let store = Store::open_in_memory().unwrap();
+        let cat_id = store.resolve_category("DeFi", Some("디파이")).unwrap();
         let topic = NewTopic {
             title: "DeFi Test".to_string(),
             title_ko: None,
-            category_id: 1,
+            category_id: cat_id,
         };
         let id = store.create_topic(&topic).unwrap();
         let loaded = store.get_topic(id).unwrap().unwrap();

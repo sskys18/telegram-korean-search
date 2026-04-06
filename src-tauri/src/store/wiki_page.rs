@@ -242,7 +242,7 @@ mod tests {
         let topic = crate::store::wiki_topic::NewTopic {
             title: "Test Topic".to_string(),
             title_ko: None,
-            category_id: 1,
+            category_id: store.resolve_category("Test", None).unwrap(),
         };
         let topic_id = store.create_topic(&topic).unwrap();
 
@@ -274,7 +274,7 @@ mod tests {
         let topic = crate::store::wiki_topic::NewTopic {
             title: "Regen Test".to_string(),
             title_ko: None,
-            category_id: 1,
+            category_id: store.resolve_category("Test", None).unwrap(),
         };
         let topic_id = store.create_topic(&topic).unwrap();
 

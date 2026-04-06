@@ -261,20 +261,8 @@ fn migrate_to_wiki_tables(conn: &Connection) -> Result<(), sqlite::Error> {
         )",
     )?;
 
-    conn.execute(
-        "
-        INSERT OR IGNORE INTO wiki_categories (name, name_ko, sort_order) VALUES
-            ('DeFi', '디파이', 1),
-            ('Trading', '트레이딩', 2),
-            ('L1/L2', '레이어1/2', 3),
-            ('NFT', 'NFT', 4),
-            ('Airdrop', '에어드롭', 5),
-            ('Regulation', '규제', 6),
-            ('Macro', '매크로', 7),
-            ('Scam Alert', '스캠 경고', 8),
-            ('Other', '기타', 99);
-        ",
-    )?;
+    // No seed categories — categories are auto-created by the LLM classifier.
+    // Known aliases are handled in wiki_category.rs resolve_category().
 
     conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '4')")?;
 
@@ -370,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wiki_seed_categories() {
+    fn test_wiki_categories_table_empty() {
         let store = Store::open_in_memory().unwrap();
         let mut count = 0_i64;
         let mut stmt = store
@@ -380,6 +368,7 @@ mod tests {
         if let Ok(sqlite::State::Row) = stmt.next() {
             count = stmt.read::<i64, _>(0).unwrap();
         }
-        assert_eq!(count, 9);
+        // No seed categories — auto-created by LLM classifier
+        assert_eq!(count, 0);
     }
 }

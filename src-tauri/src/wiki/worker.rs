@@ -223,7 +223,8 @@ fn process_classified_topic(
             id
         }
         None => {
-            let category_id = store.normalize_category(&classified.category)?;
+            let category_id =
+                store.resolve_category(&classified.category, classified.category_ko.as_deref())?;
             let new_topic = NewTopic {
                 title: classified.topic.clone(),
                 title_ko: classified.topic_ko.clone(),

@@ -93,9 +93,13 @@ mod tests {
     #[test]
     fn test_record_and_query_stats() {
         let store = Store::open_in_memory().unwrap();
+        let cat_id = store.resolve_category("Test", None).unwrap();
         store
             .conn()
-            .execute("INSERT INTO wiki_topics (title, category_id) VALUES ('Test', 1)")
+            .execute(format!(
+                "INSERT INTO wiki_topics (title, category_id) VALUES ('Test', {})",
+                cat_id
+            ))
             .unwrap();
         let topic_id = 1;
 

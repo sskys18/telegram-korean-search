@@ -18,6 +18,7 @@ pub struct ClassifiedTopic {
     pub topic: String,
     pub topic_ko: Option<String>,
     pub category: String,
+    pub category_ko: Option<String>,
     pub relevance: f64,
 }
 
@@ -125,20 +126,21 @@ impl LlmClient {
         let truncated = if text.len() > 500 { &text[..500] } else { text };
 
         let prompt = format!(
-            r#"You are a crypto/finance message classifier. Classify this Telegram message into topics. Return ONLY valid JSON, no other text.
+            r#"You are a Telegram message classifier for crypto/finance channels. Classify this message into topics. Return ONLY valid JSON.
 
 Rules:
-- topics: array of 1-3 topics
-- Each topic: concise English title
-- topic_ko: Korean title if inferrable, else null
-- category: one of [DeFi, Trading, L1/L2, NFT, Airdrop, Regulation, Macro, Scam Alert, Other]
-- relevance: 0.0-1.0
-- skip: true if greeting, spam, bot command, emoji-only, no info value
+- topics: array of 1-3 topics this message discusses
+- topic: concise English title (e.g. "Ethereum ETF Approval", "Solana DeFi Growth")
+- topic_ko: Korean title if the message is Korean, else null
+- category: a short label that best describes the domain (e.g. "Bitcoin", "DeFi", "Regulation", "Airdrop", "Memecoin", "AI", "L1/L2", "Trading", "NFT", "CEX", "Stablecoin", etc.) — pick whatever fits best, you are not limited to a fixed list
+- category_ko: Korean category name if you can provide one, else null
+- relevance: 0.0-1.0 how on-topic this message is
+- skip: true if the message is a greeting, spam, bot command, emoji-only, or has no informational value
 
 Message: [Channel: {}] [{}]
 {}
 
-Return JSON: {{"skip": false, "topics": [{{"topic": "...", "topic_ko": "...", "category": "...", "relevance": 0.8}}]}}
+Return JSON: {{"skip": false, "topics": [{{"topic": "...", "topic_ko": "...", "category": "...", "category_ko": "...", "relevance": 0.8}}]}}
 If skip: {{"skip": true, "topics": []}}"#,
             chat_title, timestamp, truncated
         );
