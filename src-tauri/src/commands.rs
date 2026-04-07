@@ -133,7 +133,7 @@ pub fn read_env_credentials() -> Result<Option<EnvCredentials>, String> {
 /// Read saved API credentials from the database.
 #[tauri::command]
 pub fn get_api_credentials(state: State<AppState>) -> Result<Option<ApiCredentials>, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     let api_id = store.get_meta("tg_api_id").map_err(|e| e.to_string())?;
     let api_hash = store.get_meta("tg_api_hash").map_err(|e| e.to_string())?;
     match (api_id, api_hash) {
@@ -157,7 +157,7 @@ pub fn save_api_credentials(
     api_id: i32,
     api_hash: String,
 ) -> Result<(), String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store
         .set_meta("tg_api_id", &api_id.to_string())
         .map_err(|e| e.to_string())?;
@@ -174,7 +174,7 @@ pub fn save_api_credentials(
 pub async fn connect_telegram(state: State<'_, AppState>) -> Result<ConnectResult, String> {
     // Read api_id and auth flag from DB
     let (api_id, was_authenticated) = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         let id_str = store
             .get_meta("tg_api_id")
             .map_err(|e| e.to_string())?
@@ -222,7 +222,7 @@ pub async fn connect_telegram(state: State<'_, AppState>) -> Result<ConnectResul
                 runner.abort();
                 let _ = std::fs::remove_file(&session_path);
                 // Clear the authenticated flag since session is no longer valid.
-                let store = state.store.lock().map_err(|e| e.to_string())?;
+                let store = state.lock_store();
                 let _ = store.delete_meta("tg_authenticated");
                 log::info!("Session expired, reconnecting fresh");
             }
@@ -253,7 +253,7 @@ pub async fn request_login_code(state: State<'_, AppState>, phone: String) -> Re
 
     // Read api_hash from DB for the login code request
     let api_hash = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         store
             .get_meta("tg_api_hash")
             .map_err(|e| e.to_string())?
@@ -296,7 +296,7 @@ pub async fn submit_login_code(
     match result {
         collector::auth::SignInResult::Success => {
             // Mark as authenticated so we can reuse the session on next launch.
-            let store = state.store.lock().map_err(|e| e.to_string())?;
+            let store = state.lock_store();
             let _ = store.set_meta("tg_authenticated", "1");
             Ok(SignInResponse {
                 success: true,
@@ -338,7 +338,7 @@ pub async fn submit_password(state: State<'_, AppState>, password: String) -> Re
         .map_err(|e| e.to_string())?;
 
     // Mark as authenticated so we can reuse the session on next launch.
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     let _ = store.set_meta("tg_authenticated", "1");
     Ok(())
 }
@@ -407,7 +407,7 @@ pub async fn start_wiki_worker(app: AppHandle) -> Result<(), String> {
 
     // Recover any stale processing items before starting
     {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         let recovered = store.recover_stale_claims().unwrap_or(0);
         if recovered > 0 {
             log::info!(
@@ -437,7 +437,7 @@ pub async fn stop_wiki_worker(state: State<'_, AppState>) -> Result<(), String> 
 #[tauri::command]
 pub async fn get_wiki_status(state: State<'_, AppState>) -> Result<WikiStatus, String> {
     let (queue_stats, topics_count) = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         (
             store.get_queue_stats().map_err(|e| e.to_string())?,
             count_wiki_topics(&store).map_err(|e| e.to_string())?,
@@ -502,7 +502,7 @@ async fn ensure_worker_stopped(state: &AppState) {
 #[tauri::command]
 pub async fn reprocess_wiki(state: State<'_, AppState>) -> Result<(), String> {
     ensure_worker_stopped(&state).await;
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store.clear_classify_queue().map_err(|e| e.to_string())?;
     store.clear_wiki_pages().map_err(|e| e.to_string())?;
     store.clear_wiki_topics().map_err(|e| e.to_string())?;
@@ -515,7 +515,7 @@ pub async fn reprocess_wiki(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub async fn clear_wiki_data(state: State<'_, AppState>) -> Result<(), String> {
     ensure_worker_stopped(&state).await;
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store.clear_classify_queue().map_err(|e| e.to_string())?;
     store.clear_wiki_pages().map_err(|e| e.to_string())?;
     store.clear_wiki_topics().map_err(|e| e.to_string())?;
@@ -531,7 +531,7 @@ pub fn get_trending_topics(
     offset: usize,
     category_id: Option<i64>,
 ) -> Result<Vec<WikiTopic>, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store
         .get_trending_topics(limit, offset, category_id)
         .map_err(|e| e.to_string())
@@ -539,13 +539,13 @@ pub fn get_trending_topics(
 
 #[tauri::command]
 pub fn get_wiki_categories(state: State<AppState>) -> Result<Vec<WikiCategory>, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store.get_all_categories().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn get_topic_detail(state: State<AppState>, topic_id: i64) -> Result<WikiTopicDetail, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     let topic = store
         .get_topic(topic_id)
         .map_err(|e| e.to_string())?
@@ -567,7 +567,7 @@ pub fn get_topic_sources(
     limit: usize,
     offset: usize,
 ) -> Result<Vec<MessageWithChat>, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store
         .get_topic_sources(topic_id, limit, offset)
         .map_err(|e| e.to_string())
@@ -579,7 +579,7 @@ pub fn search_wiki(
     query: String,
     limit: usize,
 ) -> Result<WikiSearchResult, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     let topics = store
         .search_topics(&query, limit)
         .map_err(|e| e.to_string())?;
@@ -595,7 +595,7 @@ pub async fn generate_topic_summary(app: AppHandle, topic_id: i64) -> Result<Wik
     let state = app.state::<AppState>();
 
     let (topic, latest_page, needs_regeneration, sources, source_ids) = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         let topic = store
             .get_topic(topic_id)
             .map_err(|e| e.to_string())?
@@ -639,13 +639,13 @@ pub async fn generate_topic_summary(app: AppHandle, topic_id: i64) -> Result<Wik
         .map_err(|e| e.to_string())?;
 
     let page_id = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
+        let store = state.lock_store();
         store
             .insert_wiki_page(topic_id, &content_ko, &content_en, &source_ids)
             .map_err(|e| e.to_string())?
     };
 
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store
         .get_latest_page(topic_id)
         .map_err(|e| e.to_string())?
@@ -686,7 +686,7 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
 
         // Brief lock: save chats and read excluded set
         let excluded_ids: std::collections::HashSet<i64> = {
-            let store = state.store.lock().unwrap();
+            let store = state.lock_store();
             for row in &chat_rows {
                 if let Err(e) = store.upsert_chat(row) {
                     log::warn!("Failed to save chat {}: {}", row.title, e);
@@ -736,7 +736,7 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
 
         // Read sync states upfront (single brief lock)
         let sync_states: std::collections::HashMap<i64, i64> = {
-            let store = state.store.lock().unwrap();
+            let store = state.lock_store();
             chats
                 .iter()
                 .filter_map(|c| {
@@ -791,7 +791,7 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
                     let count = rows.len();
                     if !rows.is_empty() {
                         let newest_id = rows.iter().map(|r| r.message_id).max().unwrap();
-                        let store = state.store.lock().unwrap();
+                        let store = state.lock_store();
                         if let Err(e) = store.insert_messages_batch(&rows) {
                             log::warn!("Failed to save messages for {}: {}", chat.title, e);
                         } else {

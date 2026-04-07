@@ -27,6 +27,13 @@ pub struct AppState {
     pub wiki_worker_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+impl AppState {
+    /// Lock the store, recovering from poison if a thread previously panicked.
+    pub fn lock_store(&self) -> std::sync::MutexGuard<'_, Store> {
+        self.store.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct DbStats {
     pub chats: i64,
@@ -35,7 +42,7 @@ pub struct DbStats {
 
 #[tauri::command]
 fn get_db_stats(state: State<AppState>) -> Result<DbStats, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     Ok(DbStats {
         chats: store.chat_count().map_err(|e| e.to_string())?,
         messages: store.message_count().map_err(|e| e.to_string())?,
@@ -55,7 +62,7 @@ fn search_messages(
     state: State<AppState>,
     params: SearchQuery,
 ) -> Result<search::SearchResult, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     let scope = match params.chat_id {
         Some(id) => search::engine::SearchScope::Chat(id),
         None => search::engine::SearchScope::All,
@@ -72,13 +79,13 @@ fn search_messages(
 
 #[tauri::command]
 fn get_chats(state: State<AppState>) -> Result<Vec<store::chat::ChatRow>, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store.get_all_chats().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn set_chat_excluded(state: State<AppState>, chat_id: i64, excluded: bool) -> Result<(), String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let store = state.lock_store();
     store
         .set_chat_excluded(chat_id, excluded)
         .map_err(|e| e.to_string())

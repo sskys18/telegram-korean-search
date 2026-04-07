@@ -35,7 +35,7 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
 
     // Recover stale claims on startup
     {
-        let store = state.store.lock().unwrap();
+        let store = state.lock_store();
         let recovered = store.recover_stale_claims().unwrap_or(0);
         if recovered > 0 {
             log::info!("Wiki worker: recovered {} stale queue items", recovered);
@@ -43,7 +43,7 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
     }
 
     let mut total_channels = {
-        let store = state.store.lock().unwrap();
+        let store = state.lock_store();
         store.get_total_active_channels().unwrap_or(1)
     };
 
@@ -59,7 +59,7 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
 
         // Dequeue a batch of items
         let items = {
-            let store = state.store.lock().unwrap();
+            let store = state.lock_store();
             store.dequeue_classify_batch(batch_size).unwrap_or_default()
         };
 
@@ -74,7 +74,7 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
 
         for (i, item) in items.iter().enumerate() {
             let (msg_data, chat_title) = {
-                let store = state.store.lock().unwrap();
+                let store = state.lock_store();
                 let msg = store
                     .get_message(item.chat_id, item.message_id)
                     .ok()
@@ -92,7 +92,7 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
                 Some(m) if !m.text_plain.trim().is_empty() => m,
                 _ => {
                     // Skip empty/missing messages
-                    let store = state.store.lock().unwrap();
+                    let store = state.lock_store();
                     let _ = store.mark_queue_skipped(item.chat_id, item.message_id);
                     continue;
                 }
@@ -118,7 +118,7 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
 
         // Fetch existing category + topic names so LLM prefers reusing them
         let (existing_categories, existing_topics) = {
-            let store = state.store.lock().unwrap();
+            let store = state.lock_store();
             let cats: Vec<String> = store
                 .get_all_categories()
                 .unwrap_or_default()
@@ -141,7 +141,7 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
 
         match batch_result {
             Ok(results) => {
-                let store = state.store.lock().unwrap();
+                let store = state.lock_store();
                 // Process each result
                 for (index, response) in &results {
                     if *index >= item_map.len() {
@@ -181,7 +181,7 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
             Err(e) => {
                 log::warn!("Batch classification failed: {}", e);
                 // Fall back to marking all as failed (will retry)
-                let store = state.store.lock().unwrap();
+                let store = state.lock_store();
                 for &(chat_id, message_id, _) in &item_map {
                     let _ = store.mark_queue_failed(chat_id, message_id, &e.to_string());
                 }
@@ -197,7 +197,7 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
 
         // Periodic maintenance
         if processed_count.is_multiple_of(100) {
-            let store = state.store.lock().unwrap();
+            let store = state.lock_store();
             total_channels = store.get_total_active_channels().unwrap_or(1);
             let recovered = store.recover_stale_claims().unwrap_or(0);
             if recovered > 0 {
@@ -211,7 +211,7 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
 
         // Emit progress
         let stats = {
-            let store = state.store.lock().unwrap();
+            let store = state.lock_store();
             store
                 .get_queue_stats()
                 .unwrap_or(crate::store::wiki_queue::QueueStats {
@@ -303,7 +303,7 @@ fn process_classified_topic(
 }
 
 fn recalculate_trending(state: &tauri::State<AppState>, total_channels: i64) {
-    let store = state.store.lock().unwrap();
+    let store = state.lock_store();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
