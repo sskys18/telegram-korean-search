@@ -28,15 +28,10 @@ export function WikiPage() {
         />
       ) : (
         <TrendingDashboard
-          categories={wiki.categories}
-          categoryId={wiki.categoryId}
           topics={wiki.topics}
           searchResults={wiki.searchResults}
           loading={wiki.loading}
           searching={wiki.searching}
-          onCategoryChange={(categoryId) => {
-            void wiki.setCategory(categoryId);
-          }}
           onSearch={(query) => {
             void wiki.searchWiki(query);
           }}

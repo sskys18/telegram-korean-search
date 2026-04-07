@@ -1,38 +1,26 @@
-import type { WikiCategory, WikiSearchResult, WikiTopic } from "../../types";
-import { CategoryFilter } from "./CategoryFilter";
+import type { WikiSearchResult, WikiTopic } from "../../types";
 import { TopicCard } from "./TopicCard";
 import { WikiSearch } from "./WikiSearch";
 
 interface TrendingDashboardProps {
-  categories: WikiCategory[];
-  categoryId?: number;
   topics: WikiTopic[];
   searchResults: WikiSearchResult;
   loading: boolean;
   searching: boolean;
-  onCategoryChange: (categoryId?: number) => void;
   onSearch: (query: string) => void;
   onSelectTopic: (topicId: number) => void;
 }
 
 export function TrendingDashboard({
-  categories,
-  categoryId,
   topics,
   searchResults,
   loading,
   searching,
-  onCategoryChange,
   onSearch,
   onSelectTopic,
 }: TrendingDashboardProps) {
   return (
     <div className="trending-dashboard">
-      <CategoryFilter
-        categories={categories}
-        activeCategoryId={categoryId}
-        onChange={onCategoryChange}
-      />
       <WikiSearch
         results={searchResults}
         loading={searching}

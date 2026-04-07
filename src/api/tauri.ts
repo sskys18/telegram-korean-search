@@ -11,7 +11,6 @@ import type {
   CollectionProgress,
   WikiTopic,
   WikiPage,
-  WikiCategory,
   WikiTopicDetail,
   WikiSearchResult,
   WikiStatus,
@@ -222,10 +221,6 @@ export async function getTrendingTopics(
   return topics.map(normalizeTopic);
 }
 
-export async function getWikiCategories(): Promise<WikiCategory[]> {
-  return invoke("get_wiki_categories");
-}
-
 export async function getTopicDetail(topicId: number): Promise<WikiTopicDetail> {
   const detail = await invoke<{
     topic: Parameters<typeof normalizeTopic>[0];
@@ -250,27 +245,15 @@ export async function getTopicSources(
 
 export async function searchWiki(
   query: string,
-  categoryId?: number,
 ): Promise<WikiSearchResult> {
   const result = await invoke<{
     topics: Array<Parameters<typeof normalizeTopic>[0]>;
     pages: WikiSearchResult["pages"];
   }>("search_wiki", { query, limit: 8 });
 
-  const topics = result.topics.map(normalizeTopic);
-  if (categoryId == null) {
-    return { topics, pages: result.pages };
-  }
-
-  const allowedTopicIds = new Set(
-    topics
-      .filter((topic) => topic.category_id === categoryId)
-      .map((topic) => topic.topic_id),
-  );
-
   return {
-    topics: topics.filter((topic) => allowedTopicIds.has(topic.topic_id)),
-    pages: result.pages.filter((page) => allowedTopicIds.has(page.topic_id)),
+    topics: result.topics.map(normalizeTopic),
+    pages: result.pages,
   };
 }
 

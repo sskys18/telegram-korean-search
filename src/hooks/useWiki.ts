@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
 import type {
-  WikiCategory,
   WikiPage,
   WikiSearchResult,
   WikiSourceMessage,
@@ -12,16 +11,13 @@ import {
   getTopicDetail,
   getTopicSources,
   getTrendingTopics,
-  getWikiCategories,
   searchWiki as searchWikiApi,
 } from "../api/tauri";
 
 export function useWiki() {
-  const [categories, setCategories] = useState<WikiCategory[]>([]);
   const [topics, setTopics] = useState<WikiTopic[]>([]);
   const [selectedTopic, setSelectedTopic] = useState<WikiTopicDetail | null>(null);
   const [selectedSources, setSelectedSources] = useState<WikiSourceMessage[]>([]);
-  const [categoryId, setCategoryId] = useState<number | undefined>(undefined);
   const [searchResults, setSearchResults] = useState<WikiSearchResult>({
     topics: [],
     pages: [],
@@ -32,27 +28,22 @@ export function useWiki() {
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const loadTrending = useCallback(async (nextCategoryId?: number) => {
-    const nextTopics = await getTrendingTopics(nextCategoryId);
+  const loadTrending = useCallback(async () => {
+    const nextTopics = await getTrendingTopics();
     setTopics(nextTopics);
   }, []);
 
   useEffect(() => {
     (async () => {
       try {
-        const [loadedCategories, loadedTopics] = await Promise.all([
-          getWikiCategories(),
-          getTrendingTopics(),
-        ]);
-        setCategories(loadedCategories);
-        setTopics(loadedTopics);
+        await loadTrending();
       } catch (err) {
         setError(String(err).replace(/^Error:\s*/i, ""));
       } finally {
         setLoading(false);
       }
     })();
-  }, []);
+  }, [loadTrending]);
 
   const selectTopic = useCallback(async (topicId: number) => {
     setDetailLoading(true);
@@ -76,65 +67,40 @@ export function useWiki() {
     setSelectedSources([]);
   }, []);
 
-  const setCategory = useCallback(
-    async (nextCategoryId?: number) => {
-      setCategoryId(nextCategoryId);
-      setLoading(true);
-      setError(null);
-      try {
-        await loadTrending(nextCategoryId);
-        setSearchResults({ topics: [], pages: [] });
-      } catch (err) {
-        setError(String(err).replace(/^Error:\s*/i, ""));
-      } finally {
-        setLoading(false);
-      }
-    },
-    [loadTrending],
-  );
+  const searchWiki = useCallback(async (query: string) => {
+    const trimmed = query.trim();
+    if (!trimmed) {
+      setSearchResults({ topics: [], pages: [] });
+      return;
+    }
 
-  const searchWiki = useCallback(
-    async (query: string) => {
-      const trimmed = query.trim();
-      if (!trimmed) {
-        setSearchResults({ topics: [], pages: [] });
-        return;
-      }
-
-      setSearching(true);
-      setError(null);
-      try {
-        const results = await searchWikiApi(trimmed, categoryId);
-        setSearchResults(results);
-      } catch (err) {
-        setError(String(err).replace(/^Error:\s*/i, ""));
-      } finally {
-        setSearching(false);
-      }
-    },
-    [categoryId],
-  );
+    setSearching(true);
+    setError(null);
+    try {
+      const results = await searchWikiApi(trimmed);
+      setSearchResults(results);
+    } catch (err) {
+      setError(String(err).replace(/^Error:\s*/i, ""));
+    } finally {
+      setSearching(false);
+    }
+  }, []);
 
   const refreshTrending = useCallback(async () => {
     setLoading(true);
     try {
-      await loadTrending(categoryId);
+      await loadTrending();
     } catch (err) {
       setError(String(err).replace(/^Error:\s*/i, ""));
     } finally {
       setLoading(false);
     }
-  }, [categoryId, loadTrending]);
+  }, [loadTrending]);
 
   const refreshAll = useCallback(async () => {
     setLoading(true);
     try {
-      const [loadedCategories, loadedTopics] = await Promise.all([
-        getWikiCategories(),
-        getTrendingTopics(categoryId),
-      ]);
-      setCategories(loadedCategories);
-      setTopics(loadedTopics);
+      await loadTrending();
       setSearchResults({ topics: [], pages: [] });
       setSelectedTopic(null);
       setSelectedSources([]);
@@ -143,7 +109,7 @@ export function useWiki() {
     } finally {
       setLoading(false);
     }
-  }, [categoryId]);
+  }, [loadTrending]);
 
   const refreshSelectedTopic = useCallback(async () => {
     if (!selectedTopic) {
@@ -172,11 +138,9 @@ export function useWiki() {
   }, [refreshTrending, selectedTopic]);
 
   return {
-    categories,
     topics,
     selectedTopic,
     selectedSources,
-    categoryId,
     searchResults,
     searching,
     loading,
@@ -185,7 +149,6 @@ export function useWiki() {
     error,
     selectTopic,
     goBack,
-    setCategory,
     searchWiki,
     refreshAll,
     refreshTrending,
