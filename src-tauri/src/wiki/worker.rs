@@ -141,14 +141,15 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
 
         match batch_result {
             Ok(results) => {
-                let store = state.lock_store();
-                // Process each result
+                // Process each result with a short-lived lock per item
+                // so clear/reprocess commands can acquire the lock between items
                 for (index, response) in &results {
                     if *index >= item_map.len() {
                         continue;
                     }
                     let (chat_id, message_id, timestamp) = item_map[*index];
 
+                    let store = state.lock_store();
                     if response.skip || response.topics.is_empty() {
                         let _ = store.mark_queue_skipped(chat_id, message_id);
                     } else {
@@ -161,18 +162,22 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
                         }
                         let _ = store.mark_queue_done(chat_id, message_id);
                     }
+                    drop(store);
                 }
 
                 // Mark any items not in the response as needing retry
-                let returned_indices: std::collections::HashSet<usize> =
-                    results.iter().map(|(idx, _)| *idx).collect();
-                for (i, &(chat_id, message_id, _)) in item_map.iter().enumerate() {
-                    if !returned_indices.contains(&i) {
-                        let _ = store.mark_queue_failed(
-                            chat_id,
-                            message_id,
-                            "Missing from batch response",
-                        );
+                {
+                    let returned_indices: std::collections::HashSet<usize> =
+                        results.iter().map(|(idx, _)| *idx).collect();
+                    let store = state.lock_store();
+                    for (i, &(chat_id, message_id, _)) in item_map.iter().enumerate() {
+                        if !returned_indices.contains(&i) {
+                            let _ = store.mark_queue_failed(
+                                chat_id,
+                                message_id,
+                                "Missing from batch response",
+                            );
+                        }
                     }
                 }
 
@@ -180,11 +185,11 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
             }
             Err(e) => {
                 log::warn!("Batch classification failed: {}", e);
-                // Fall back to marking all as failed (will retry)
                 let store = state.lock_store();
                 for &(chat_id, message_id, _) in &item_map {
                     let _ = store.mark_queue_failed(chat_id, message_id, &e.to_string());
                 }
+                drop(store);
                 let _ = app.emit(
                     "wiki-worker-error",
                     serde_json::json!({
@@ -303,15 +308,18 @@ fn process_classified_topic(
 }
 
 fn recalculate_trending(state: &tauri::State<AppState>, total_channels: i64) {
-    let store = state.lock_store();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
 
-    let topic_ids = store.get_active_topic_ids(30).unwrap_or_default();
+    let topic_ids = {
+        let store = state.lock_store();
+        store.get_active_topic_ids(30).unwrap_or_default()
+    };
 
     for topic_id in topic_ids {
+        let store = state.lock_store();
         let topic = match store.get_topic(topic_id) {
             Ok(Some(t)) => t,
             _ => continue,
