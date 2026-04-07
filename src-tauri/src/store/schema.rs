@@ -336,6 +336,8 @@ fn migrate_merge_duplicate_categories(conn: &Connection) -> Result<(), sqlite::E
     }
 
     let merge_count = merge_to.len();
+    conn.execute("BEGIN")?;
+
     if merge_count > 0 {
         log::info!(
             "Wiki migration v5: merging {} duplicate categories",
@@ -343,12 +345,10 @@ fn migrate_merge_duplicate_categories(conn: &Connection) -> Result<(), sqlite::E
         );
 
         for (&from_id, &to_id) in &merge_to {
-            // Reassign topics
             conn.execute(format!(
                 "UPDATE wiki_topics SET category_id = {} WHERE category_id = {}",
                 to_id, from_id
             ))?;
-            // Delete the duplicate category
             conn.execute(format!(
                 "DELETE FROM wiki_categories WHERE category_id = {}",
                 from_id
@@ -356,7 +356,6 @@ fn migrate_merge_duplicate_categories(conn: &Connection) -> Result<(), sqlite::E
         }
     }
 
-    // Also delete orphaned categories with zero topics
     conn.execute(
         "DELETE FROM wiki_categories WHERE category_id NOT IN (
             SELECT DISTINCT category_id FROM wiki_topics WHERE category_id IS NOT NULL
@@ -364,6 +363,7 @@ fn migrate_merge_duplicate_categories(conn: &Connection) -> Result<(), sqlite::E
     )?;
 
     conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '5')")?;
+    conn.execute("COMMIT")?;
 
     Ok(())
 }

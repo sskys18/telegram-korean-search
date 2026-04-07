@@ -24,10 +24,29 @@ pub async fn connect(api_id: i32) -> Result<(Client, tokio::task::JoinHandle<()>
         std::fs::create_dir_all(parent).map_err(CollectorError::Io)?;
     }
 
-    let session = Arc::new(
-        SqliteSession::open(path.to_str().ok_or(CollectorError::InvalidPath)?)
-            .map_err(|e| CollectorError::Session(e.to_string()))?,
-    );
+    // Try to open session; if it's corrupted (locked/IO error), delete and retry
+    let session = match SqliteSession::open(path.to_str().ok_or(CollectorError::InvalidPath)?) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("locked") || err_str.contains("I/O") || err_str.contains("disk") {
+                log::warn!(
+                    "Session file corrupted ({}), deleting and creating fresh",
+                    err_str
+                );
+                // Delete session and WAL/SHM files
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(path.with_extension("session-wal"));
+                let _ = std::fs::remove_file(path.with_extension("session-shm"));
+                Arc::new(
+                    SqliteSession::open(path.to_str().ok_or(CollectorError::InvalidPath)?)
+                        .map_err(|e2| CollectorError::Session(e2.to_string()))?,
+                )
+            } else {
+                return Err(CollectorError::Session(err_str));
+            }
+        }
+    };
 
     let pool = SenderPool::new(Arc::clone(&session), api_id);
     let client = Client::new(&pool);
