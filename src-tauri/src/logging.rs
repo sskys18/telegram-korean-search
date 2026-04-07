@@ -9,11 +9,11 @@ pub fn init(log_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         .basename("tg-korean-search");
 
     let logger = if cfg!(debug_assertions) {
-        Logger::try_with_env_or_str("debug")?
+        Logger::try_with_env_or_str("info, grammers_mtsender=warn")?
             .log_to_file(file_spec)
             .duplicate_to_stdout(flexi_logger::Duplicate::All)
     } else {
-        Logger::try_with_str("error")?
+        Logger::try_with_str("info, grammers_mtsender=warn")?
             .log_to_file(file_spec)
             .rotate(
                 flexi_logger::Criterion::Size(10_000_000), // 10MB

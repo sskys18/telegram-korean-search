@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::process::Command;
 
-const CLASSIFY_MODEL: &str = "o4-mini";
+const CLASSIFY_MODEL: &str = "gpt-5.4";
 const SUMMARY_MODEL: &str = "gpt-5.4";
 const BATCH_SIZE: usize = 20;
 
@@ -204,11 +204,7 @@ impl LlmClient {
         // Build the batch message list
         let mut msg_list = String::new();
         for msg in messages {
-            let truncated = if msg.text.len() > 300 {
-                &msg.text[..300]
-            } else {
-                &msg.text
-            };
+            let truncated = truncate_str(&msg.text, 300);
             msg_list.push_str(&format!(
                 "[{}] [Channel: {}] [{}]: {}\n",
                 msg.index, msg.chat_title, msg.timestamp, truncated
@@ -273,7 +269,7 @@ Return JSON: {{"results": [{{"index": 0, "skip": false, "topics": [...]}}]}}"#,
         timestamp: i64,
         text: &str,
     ) -> Result<ClassifyResponse, LlmError> {
-        let truncated = if text.len() > 500 { &text[..500] } else { text };
+        let truncated = truncate_str(text, 500);
 
         let prompt = format!(
             r#"Classify this Telegram message from a crypto/finance channel. Return ONLY valid JSON.
@@ -305,7 +301,7 @@ Return: {{"skip": false, "topics": [{{"topic": "...", "topic_ko": null, "categor
     ) -> Result<(String, String), LlmError> {
         let mut sources_text = String::new();
         for &(idx, ts, chat_title, text) in source_messages {
-            let truncated = if text.len() > 300 { &text[..300] } else { text };
+            let truncated = truncate_str(text, 300);
             sources_text.push_str(&format!(
                 "[{}] [{}] [{}]: {}\n",
                 idx, ts, chat_title, truncated
@@ -369,6 +365,18 @@ Reply: {{"same": true/false, "confidence": 0.0-1.0}}"#,
         serde_json::from_str::<DedupResponse>(json_str)
             .map_err(|e| LlmError::Parse(format!("Dedup parse error: {} — raw: {}", e, json_str)))
     }
+}
+
+/// Truncate a string at a char boundary, not exceeding `max_bytes`.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Extract the first JSON object from a string.
