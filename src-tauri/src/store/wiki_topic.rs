@@ -96,6 +96,36 @@ impl Store {
         Ok(results)
     }
 
+    /// Fuzzy-match a new topic title against existing topics using word overlap.
+    /// Returns the best-matching topic_id if similarity exceeds the threshold.
+    pub fn find_topic_fuzzy(&self, raw_title: &str) -> Result<Option<i64>, sqlite::Error> {
+        let new_words = extract_significant_words(raw_title);
+        if new_words.len() < 2 {
+            return Ok(None);
+        }
+
+        // Get recent active topics to compare against
+        let mut stmt = self.conn().prepare(
+            "SELECT topic_id, title FROM wiki_topics
+             WHERE message_count >= 2
+             ORDER BY last_seen_at DESC LIMIT 500",
+        )?;
+        let mut best: Option<(i64, f64)> = None;
+        while let sqlite::State::Row = stmt.next()? {
+            let topic_id = stmt.read::<i64, _>("topic_id")?;
+            let title = stmt.read::<String, _>("title")?;
+            let existing_words = extract_significant_words(&title);
+            if existing_words.is_empty() {
+                continue;
+            }
+            let score = word_overlap_score(&new_words, &existing_words);
+            if score >= 0.6 && (best.is_none() || score > best.unwrap().1) {
+                best = Some((topic_id, score));
+            }
+        }
+        Ok(best.map(|(id, _)| id))
+    }
+
     pub fn add_topic_alias(&self, topic_id: i64, alias: &str) -> Result<(), sqlite::Error> {
         let mut stmt = self
             .conn()
@@ -378,10 +408,58 @@ pub fn normalize_topic_title(title: &str) -> String {
     s
 }
 
+/// Stop words filtered out for fuzzy matching.
+const STOP_WORDS: &[&str] = &[
+    "the", "a", "an", "of", "in", "on", "for", "to", "and", "is", "are", "was", "were", "with",
+    "by", "at", "from", "as", "or", "its", "it", "this", "that", "new", "more", "most", "will",
+    "may", "can", "has", "had", "have", "been", "about", "after", "before", "into",
+];
+
+/// Extract significant words from a title for fuzzy matching.
+fn extract_significant_words(title: &str) -> Vec<String> {
+    title
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| w.len() >= 2 && !STOP_WORDS.contains(w))
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// Jaccard-like word overlap score between two word sets.
+fn word_overlap_score(a: &[String], b: &[String]) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let set_a: std::collections::HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
+    let set_b: std::collections::HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
+    let intersection = set_a.intersection(&set_b).count() as f64;
+    let smaller = set_a.len().min(set_b.len()) as f64;
+    // Use overlap coefficient (intersection / min) instead of Jaccard
+    // This handles cases where one title is a subset of another
+    intersection / smaller
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::Store;
+
+    #[test]
+    fn test_word_overlap_score() {
+        // Same subject, different phrasing — high overlap
+        let a = extract_significant_words("Strategy Bitcoin Purchases");
+        let b = extract_significant_words("Strategy Buys More Bitcoin");
+        assert!(word_overlap_score(&a, &b) >= 0.5);
+
+        // Subset match: "Bitcoin ETF Approval" vs "Bitcoin ETF"
+        let e = extract_significant_words("Bitcoin ETF Approval");
+        let f = extract_significant_words("Bitcoin ETF Inflows");
+        assert!(word_overlap_score(&e, &f) >= 0.6);
+
+        // Unrelated topics should score low
+        let d = extract_significant_words("Ethereum Gas Fee Reduction");
+        assert!(word_overlap_score(&a, &d) < 0.3);
+    }
 
     #[test]
     fn test_normalize_topic_title() {

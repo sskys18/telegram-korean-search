@@ -193,9 +193,12 @@ impl LlmClient {
 
     /// Classify a batch of messages in a single codex call.
     /// Returns one ClassifyResponse per input message (matched by index).
+    /// `existing_categories` and `existing_topics` guide the LLM to reuse them.
     pub async fn classify_batch(
         &self,
         messages: &[MessageForClassify],
+        existing_categories: &[String],
+        existing_topics: &[String],
     ) -> Result<Vec<(usize, ClassifyResponse)>, LlmError> {
         if messages.is_empty() {
             return Ok(Vec::new());
@@ -211,22 +214,51 @@ impl LlmClient {
             ));
         }
 
+        // Build category hint — show top categories so LLM reuses them
+        let cat_hint = if existing_categories.is_empty() {
+            String::from("e.g. Bitcoin, DeFi, Regulation, Airdrop, Memecoin, AI, L1/L2, Trading")
+        } else {
+            let shown: Vec<&str> = existing_categories
+                .iter()
+                .take(60)
+                .map(|s| s.as_str())
+                .collect();
+            shown.join(", ")
+        };
+
+        // Build topic hint — show recent trending topics so LLM merges into them
+        let topic_hint = if existing_topics.is_empty() {
+            String::new()
+        } else {
+            let shown: Vec<&str> = existing_topics
+                .iter()
+                .take(80)
+                .map(|s| s.as_str())
+                .collect();
+            format!(
+                "\nExisting topics (REUSE these when the message is about the same subject — do NOT create a near-duplicate): [{}]",
+                shown.join(", ")
+            )
+        };
+
         let prompt = format!(
             r#"Classify these {} Telegram messages from crypto/finance channels. Return ONLY valid JSON.
 
 For each message, determine:
 - skip: true if greeting, spam, bot command, emoji-only, no info value
 - topics: array of 1-3 topics with:
-  - topic: concise English title
+  - topic: concise English title — use BROAD, reusable names (e.g. "Strategy Bitcoin Purchases" not "Strategy buys 4,871 BTC"). Merge events about the same subject into ONE topic.
   - topic_ko: Korean title if Korean message, else null
-  - category: short domain label (e.g. "Bitcoin", "DeFi", "Regulation", "Airdrop", "Memecoin", "AI", "L1/L2", "Trading" — pick whatever fits, no fixed list)
+  - category: MUST pick from existing categories when possible: [{}]. Only create a new category if none fit.
   - category_ko: Korean category name or null
   - relevance: 0.0-1.0
-
+{}
 Messages:
 {}
 Return JSON: {{"results": [{{"index": 0, "skip": false, "topics": [...]}}]}}"#,
             messages.len(),
+            cat_hint,
+            topic_hint,
             msg_list
         );
 

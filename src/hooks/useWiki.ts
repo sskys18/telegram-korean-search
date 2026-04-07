@@ -126,6 +126,25 @@ export function useWiki() {
     }
   }, [categoryId, loadTrending]);
 
+  const refreshAll = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [loadedCategories, loadedTopics] = await Promise.all([
+        getWikiCategories(),
+        getTrendingTopics(categoryId),
+      ]);
+      setCategories(loadedCategories);
+      setTopics(loadedTopics);
+      setSearchResults({ topics: [], pages: [] });
+      setSelectedTopic(null);
+      setSelectedSources([]);
+    } catch (err) {
+      setError(String(err).replace(/^Error:\s*/i, ""));
+    } finally {
+      setLoading(false);
+    }
+  }, [categoryId]);
+
   const refreshSelectedTopic = useCallback(async () => {
     if (!selectedTopic) {
       return;
@@ -168,6 +187,7 @@ export function useWiki() {
     goBack,
     setCategory,
     searchWiki,
+    refreshAll,
     refreshTrending,
     refreshSelectedTopic,
     generateSummary,

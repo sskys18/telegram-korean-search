@@ -55,6 +55,9 @@ pub fn run_migrations(conn: &Connection) -> Result<(), sqlite::Error> {
     // Phase 4: Wiki feature tables
     migrate_to_wiki_tables(conn)?;
 
+    // Phase 5: Merge duplicate wiki categories
+    migrate_merge_duplicate_categories(conn)?;
+
     Ok(())
 }
 
@@ -265,6 +268,102 @@ fn migrate_to_wiki_tables(conn: &Connection) -> Result<(), sqlite::Error> {
     // Known aliases are handled in wiki_category.rs resolve_category().
 
     conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '4')")?;
+
+    Ok(())
+}
+
+/// Migration v5: Merge duplicate wiki categories using the expanded KNOWN_ALIASES table.
+/// For each alias group, picks the canonical category (lowest id) and reassigns all topics.
+fn migrate_merge_duplicate_categories(conn: &Connection) -> Result<(), sqlite::Error> {
+    if get_schema_version(conn) >= 5 {
+        return Ok(());
+    }
+
+    // Collect all categories
+    let mut stmt =
+        conn.prepare("SELECT category_id, name FROM wiki_categories ORDER BY category_id")?;
+    let mut categories: Vec<(i64, String)> = Vec::new();
+    while let sqlite::State::Row = stmt.next()? {
+        categories.push((stmt.read::<i64, _>(0)?, stmt.read::<String, _>(1)?));
+    }
+    drop(stmt);
+
+    if categories.is_empty() {
+        conn.execute(
+            "INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '5')",
+        )?;
+        return Ok(());
+    }
+
+    // Build merge map: for each category, find its canonical target
+    // Two categories merge if they share a KNOWN_ALIASES group OR have same lowercased name
+    let mut merge_to: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    // canonical_name -> (lowest_category_id)
+    let mut canonical_map: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+
+    for &(cat_id, ref name) in &categories {
+        let normalized = name.trim().to_lowercase();
+
+        // Check known aliases for a canonical name
+        let canonical = crate::store::wiki_category::find_canonical_name_pub(&normalized)
+            .map(|s| s.to_lowercase())
+            .unwrap_or_else(|| normalized.clone());
+
+        if let Some(&existing_id) = canonical_map.get(&canonical) {
+            if existing_id != cat_id {
+                merge_to.insert(cat_id, existing_id);
+            }
+        } else {
+            canonical_map.insert(canonical, cat_id);
+        }
+    }
+
+    // Also merge exact case-insensitive duplicates that aren't in KNOWN_ALIASES
+    let mut name_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for &(cat_id, ref name) in &categories {
+        if merge_to.contains_key(&cat_id) {
+            continue;
+        }
+        let key = name.trim().to_lowercase();
+        if let Some(&existing_id) = name_map.get(&key) {
+            if existing_id != cat_id {
+                merge_to.insert(cat_id, existing_id);
+            }
+        } else {
+            name_map.insert(key, cat_id);
+        }
+    }
+
+    let merge_count = merge_to.len();
+    if merge_count > 0 {
+        log::info!(
+            "Wiki migration v5: merging {} duplicate categories",
+            merge_count
+        );
+
+        for (&from_id, &to_id) in &merge_to {
+            // Reassign topics
+            conn.execute(format!(
+                "UPDATE wiki_topics SET category_id = {} WHERE category_id = {}",
+                to_id, from_id
+            ))?;
+            // Delete the duplicate category
+            conn.execute(format!(
+                "DELETE FROM wiki_categories WHERE category_id = {}",
+                from_id
+            ))?;
+        }
+    }
+
+    // Also delete orphaned categories with zero topics
+    conn.execute(
+        "DELETE FROM wiki_categories WHERE category_id NOT IN (
+            SELECT DISTINCT category_id FROM wiki_topics WHERE category_id IS NOT NULL
+        )",
+    )?;
+
+    conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '5')")?;
 
     Ok(())
 }

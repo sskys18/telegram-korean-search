@@ -10,7 +10,7 @@ export function WikiPage() {
 
   return (
     <div className="wiki-page">
-      <WikiSettings worker={worker} />
+      <WikiSettings worker={worker} onDataChanged={wiki.refreshAll} />
 
       {wiki.error && <div className="wiki-banner-error">{wiki.error}</div>}
 

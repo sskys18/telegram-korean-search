@@ -13,8 +13,12 @@ pub struct WikiCategory {
 /// Common aliases that should merge into the same category.
 /// Maps normalized form → canonical name.
 const KNOWN_ALIASES: &[(&[&str], &str)] = &[
+    // --- Crypto core ---
     (&["defi", "decentralized finance", "디파이"], "DeFi"),
-    (&["nft", "nfts", "non-fungible"], "NFT"),
+    (
+        &["nft", "nfts", "non-fungible", "collectibles", "수집품"],
+        "NFT",
+    ),
     (
         &[
             "l1",
@@ -28,41 +32,460 @@ const KNOWN_ALIASES: &[(&[&str], &str)] = &[
         ],
         "L1/L2",
     ),
-    (&["airdrop", "airdrops", "에어드롭"], "Airdrop"),
+    (
+        &["airdrop", "airdrops", "에어드롭", "campaign", "rewards"],
+        "Airdrop",
+    ),
     (&["trading", "트레이딩", "매매"], "Trading"),
-    (&["regulation", "규제", "legal", "compliance"], "Regulation"),
+    (
+        &[
+            "regulation",
+            "규제",
+            "legal",
+            "compliance",
+            "legislation",
+            "입법",
+            "enforcement",
+        ],
+        "Regulation",
+    ),
     (
         &["macro", "매크로", "macro economy", "macroeconomy"],
         "Macro",
     ),
     (
-        &["scam", "scam alert", "스캠", "rug pull", "rugpull", "fraud"],
+        &[
+            "scam",
+            "scam alert",
+            "scams",
+            "스캠",
+            "rug pull",
+            "rugpull",
+            "fraud",
+            "사기",
+            "사기주의",
+        ],
         "Scam Alert",
     ),
-    (&["meme", "memecoin", "meme coin", "밈코인"], "Memecoin"),
-    (&["bitcoin", "btc", "비트코인"], "Bitcoin"),
+    (
+        &["meme", "memecoin", "meme coin", "밈코인", "밈"],
+        "Memecoin",
+    ),
+    (&["bitcoin", "btc", "비트코인", "btcfi"], "Bitcoin"),
     (&["ethereum", "eth", "이더리움"], "Ethereum"),
     (&["solana", "sol", "솔라나"], "Solana"),
     (
         &["stablecoin", "stablecoins", "스테이블코인", "usdt", "usdc"],
         "Stablecoin",
     ),
-    (&["gaming", "gamefi", "게임파이", "game"], "GameFi"),
     (
-        &["ai", "artificial intelligence", "인공지능", "ai crypto"],
+        &[
+            "gaming",
+            "gamefi",
+            "게임파이",
+            "game",
+            "game economy",
+            "gaming economy",
+            "게임 경제",
+        ],
+        "GameFi",
+    ),
+    (
+        &[
+            "ai",
+            "artificial intelligence",
+            "인공지능",
+            "ai crypto",
+            "agi",
+        ],
         "AI",
     ),
     (&["dex", "decentralized exchange", "탈중앙거래소"], "DEX"),
     (
-        &["cex", "centralized exchange", "거래소", "binance", "upbit"],
+        &[
+            "cex",
+            "centralized exchange",
+            "거래소",
+            "binance",
+            "upbit",
+            "바이낸스",
+        ],
         "CEX",
     ),
     (&["dao", "governance", "거버넌스"], "DAO"),
     (
-        &["privacy", "프라이버시", "zero knowledge", "zk"],
+        &[
+            "privacy",
+            "프라이버시",
+            "zero knowledge",
+            "zk",
+            "privacy/zk",
+            "privacy coin",
+            "프라이버시 코인",
+        ],
         "Privacy/ZK",
     ),
     (&["news", "뉴스", "announcement", "공지"], "News"),
+    (&["token", "토큰", "tokenomics"], "Token"),
+    (&["altcoin", "알트코인"], "Altcoin"),
+    (
+        &["prediction market", "prediction markets", "예측시장"],
+        "Prediction Market",
+    ),
+    (&["rwa", "real world assets", "실물자산토큰화"], "RWA"),
+    (
+        &["staking", "스테이킹", "yield farming", "예치작"],
+        "Staking",
+    ),
+    // --- Markets & finance ---
+    (
+        &[
+            "equities",
+            "equity",
+            "stocks",
+            "stock market",
+            "증시",
+            "주식",
+        ],
+        "Equities",
+    ),
+    (
+        &[
+            "market sentiment",
+            "market psychology",
+            "sentiment",
+            "시장 심리",
+            "investor sentiment",
+            "투자심리",
+        ],
+        "Market Sentiment",
+    ),
+    (
+        &[
+            "market analysis",
+            "market data",
+            "market overview",
+            "market commentary",
+            "market recap",
+            "시장분석",
+            "시장 해설",
+            "시장정리",
+            "시장 개요",
+        ],
+        "Market Analysis",
+    ),
+    (
+        &[
+            "market structure",
+            "market microstructure",
+            "시장 구조",
+            "시장 미시구조",
+        ],
+        "Market Structure",
+    ),
+    (
+        &[
+            "market moves",
+            "market activity",
+            "market snapshot",
+            "market movers",
+            "시장 변동",
+            "시장 동향",
+            "시장 등락",
+        ],
+        "Market Activity",
+    ),
+    (
+        &[
+            "market trend",
+            "market cycle",
+            "market narrative",
+            "cycle analysis",
+            "시장 트렌드",
+            "시장 사이클",
+            "시장 내러티브",
+            "사이클 분석",
+        ],
+        "Market Trend",
+    ),
+    (
+        &[
+            "market update",
+            "market alert",
+            "market calendar",
+            "market schedule",
+            "시황",
+            "시장 경고",
+            "증시일정",
+            "시장 일정",
+        ],
+        "Market Update",
+    ),
+    (&["commodities", "commodity", "원자재"], "Commodities"),
+    (
+        &[
+            "derivatives",
+            "perps",
+            "perpetuals",
+            "perp dex",
+            "perpdex",
+            "futures",
+            "파생상품",
+            "무기한선물",
+            "파생 dex",
+            "퍼프덱스",
+        ],
+        "Derivatives",
+    ),
+    (&["options", "옵션"], "Options"),
+    (&["fx", "forex", "환율", "외환", "currency", "통화"], "FX"),
+    (
+        &["etf", "etf/fund", "etf/펀드", "index", "지수"],
+        "ETF/Fund",
+    ),
+    (
+        &[
+            "technical analysis",
+            "tech analysis",
+            "기술적분석",
+            "기술 분석",
+            "price action",
+            "가격 흐름",
+        ],
+        "Technical Analysis",
+    ),
+    (
+        &[
+            "corporate finance",
+            "corporate",
+            "corporate action",
+            "기업금융",
+            "기업행동",
+        ],
+        "Corporate Finance",
+    ),
+    (&["investing", "investment", "투자"], "Investing"),
+    (
+        &[
+            "earnings",
+            "실적",
+            "revenue",
+            "수익",
+            "profitability",
+            "수익성",
+        ],
+        "Earnings",
+    ),
+    (
+        &["valuation", "밸류에이션", "fundamentals", "펀더멘털"],
+        "Valuation",
+    ),
+    // --- Tech ---
+    (
+        &[
+            "semiconductors",
+            "반도체",
+            "semiconductor equipment",
+            "반도체 장비",
+        ],
+        "Semiconductors",
+    ),
+    (
+        &["tech stocks", "기술주", "us tech", "미국 기술주"],
+        "Tech Stocks",
+    ),
+    (
+        &["developer tools", "dev tools", "devtools", "개발도구"],
+        "Developer Tools",
+    ),
+    (
+        &["data center", "데이터센터", "cloud", "클라우드"],
+        "Data Center",
+    ),
+    // --- Geopolitics ---
+    (
+        &[
+            "geopolitics",
+            "지정학",
+            "international relations",
+            "국제관계",
+        ],
+        "Geopolitics",
+    ),
+    (
+        &["war", "전쟁", "conflict", "분쟁", "military", "군사"],
+        "War",
+    ),
+    (
+        &["sanctions", "제재", "export controls", "수출 규제"],
+        "Sanctions",
+    ),
+    (&["diplomacy", "외교"], "Diplomacy"),
+    // --- Economy ---
+    (
+        &[
+            "energy",
+            "에너지",
+            "oil",
+            "원유",
+            "natural gas",
+            "천연가스",
+            "lng",
+        ],
+        "Energy",
+    ),
+    (&["infrastructure", "인프라"], "Infrastructure"),
+    (
+        &[
+            "jobs",
+            "hiring",
+            "recruiting",
+            "careers",
+            "채용",
+            "employment",
+            "고용",
+        ],
+        "Jobs",
+    ),
+    (
+        &[
+            "security",
+            "보안",
+            "cybercrime",
+            "사이버범죄",
+            "hack",
+            "exploit",
+            "익스플로잇",
+        ],
+        "Security",
+    ),
+    (&["payments", "결제", "fintech"], "Payments"),
+    (&["defense", "방산", "aerospace", "항공우주"], "Defense"),
+    (
+        &[
+            "automotive",
+            "autos",
+            "자동차",
+            "autonomous driving",
+            "자율주행",
+        ],
+        "Automotive",
+    ),
+    (&["battery", "batteries", "배터리"], "Battery"),
+    (&["film", "movie", "영화"], "Film"),
+    (
+        &["tv", "broadcast", "방송", "streaming", "스트리밍"],
+        "Broadcast",
+    ),
+    (&["humor", "유머", "satire", "풍자"], "Humor"),
+    (&["food", "음식", "diet", "다이어트"], "Food"),
+    (&["society", "사회", "public safety"], "Society"),
+    (
+        &[
+            "people",
+            "profile",
+            "personality",
+            "인물",
+            "biography",
+            "약력",
+            "celebrity",
+            "셀럽",
+        ],
+        "People",
+    ),
+    (&["due diligence", "duediligence", "실사"], "Due Diligence"),
+    (&["pnl", "p&l", "손익"], "PnL"),
+    (&["pre-market", "premarket", "프리마켓"], "Pre-Market"),
+    (&["resale", "flipping", "reselling", "리셀"], "Resale"),
+    (
+        &["fiscal", "public finance", "재정", "budget", "예산"],
+        "Fiscal",
+    ),
+    (&["controversy", "scandal", "논란"], "Controversy"),
+    (&["event", "giveaway", "이벤트"], "Event"),
+    (
+        &["elections", "선거", "election law", "선거법"],
+        "Elections",
+    ),
+    (
+        &["gambling", "casino", "betting", "도박", "카지노", "베팅"],
+        "Gambling",
+    ),
+    (&["venture", "vc", "벤처", "funding", "투자유치"], "Venture"),
+    (&["정치/사회", "sociopolitics", "사회정치"], "Society"),
+    (&["엔터테인먼트", "entertainment"], "Entertainment"),
+    (&["암호화폐", "crypto", "크립토"], "Crypto"),
+    (&["일상/감성", "lifestyle", "라이프스타일"], "Lifestyle"),
+    (
+        &["korean politics", "한국 정치", "local politics", "지방정치"],
+        "Korean Politics",
+    ),
+    (
+        &[
+            "us politics",
+            "미국 정치",
+            "us policy",
+            "미국 정책",
+            "us foreign policy",
+            "미국 대외정책",
+        ],
+        "US Politics",
+    ),
+    (
+        &[
+            "central bank",
+            "중앙은행",
+            "fed",
+            "연준",
+            "monetary policy",
+            "통화정책",
+            "rates",
+            "금리",
+        ],
+        "Central Bank",
+    ),
+    (&["gold", "금"], "Gold"),
+    (&["insurance", "보험"], "Insurance"),
+    (
+        &["real estate", "housing policy", "주거정책"],
+        "Real Estate",
+    ),
+    (
+        &[
+            "biotech",
+            "pharma",
+            "바이오",
+            "제약",
+            "healthcare",
+            "헬스케어",
+        ],
+        "Biotech",
+    ),
+    (
+        &[
+            "korea market",
+            "korean stocks",
+            "korea stocks",
+            "국내증시",
+            "한국 시장",
+            "kosdaq",
+            "코스닥",
+        ],
+        "Korean Stocks",
+    ),
+    (
+        &["us stocks", "미국증시", "blue chips", "대형주"],
+        "US Stocks",
+    ),
+    (&["inflation", "물가"], "Inflation"),
+    (
+        &["exchange", "listing", "exchange listing", "상장"],
+        "Exchange",
+    ),
+    (&["community", "커뮤니티", "social", "소셜"], "Community"),
+    (&["trump", "트럼프"], "Trump"),
+    (&["china", "중국"], "China"),
+    (&["tariffs", "관세", "trade", "무역"], "Trade"),
 ];
 
 impl Store {
@@ -187,6 +610,30 @@ impl Store {
     pub fn normalize_category(&self, raw: &str) -> Result<i64, sqlite::Error> {
         self.resolve_category(raw, None)
     }
+
+    pub fn clear_wiki_categories(&self) -> Result<(), sqlite::Error> {
+        self.conn().execute("DELETE FROM wiki_categories")?;
+        Ok(())
+    }
+
+    /// Resolve a category and return both the id and canonical name.
+    pub fn resolve_category_with_name(
+        &self,
+        raw: &str,
+        raw_ko: Option<&str>,
+    ) -> Result<(i64, String), sqlite::Error> {
+        let id = self.resolve_category(raw, raw_ko)?;
+        let name = self
+            .get_category_by_id(id)?
+            .map(|c| c.name)
+            .unwrap_or_else(|| raw.to_string());
+        Ok((id, name))
+    }
+}
+
+/// Public version for use by schema migrations.
+pub fn find_canonical_name_pub(normalized: &str) -> Option<&'static str> {
+    find_canonical_name(normalized)
 }
 
 /// Check if the normalized input matches any known alias.
@@ -263,9 +710,17 @@ mod tests {
     #[test]
     fn test_resolve_new_unknown_category() {
         let store = Store::open_in_memory().unwrap();
+        // "real world assets" is now a known alias for "RWA"
         let id = store.resolve_category("real world assets", None).unwrap();
         let cat = store.get_category_by_id(id).unwrap().unwrap();
-        assert_eq!(cat.name, "Real World Assets"); // titlecased
+        assert_eq!(cat.name, "RWA");
+
+        // Truly unknown category gets titlecased
+        let id2 = store
+            .resolve_category("quantum computing trends", None)
+            .unwrap();
+        let cat2 = store.get_category_by_id(id2).unwrap().unwrap();
+        assert_eq!(cat2.name, "Quantum Computing Trends");
     }
 
     #[test]

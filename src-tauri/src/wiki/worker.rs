@@ -116,8 +116,28 @@ async fn run_worker(app: AppHandle, shutdown: Arc<AtomicBool>) {
             batch_messages.len()
         );
 
+        // Fetch existing category + topic names so LLM prefers reusing them
+        let (existing_categories, existing_topics) = {
+            let store = state.store.lock().unwrap();
+            let cats: Vec<String> = store
+                .get_all_categories()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            let topics: Vec<String> = store
+                .get_trending_topics(80, 0, None)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.title)
+                .collect();
+            (cats, topics)
+        };
+
         // Call LLM batch classification
-        let batch_result = llm.classify_batch(&batch_messages).await;
+        let batch_result = llm
+            .classify_batch(&batch_messages, &existing_categories, &existing_topics)
+            .await;
 
         match batch_result {
             Ok(results) => {
@@ -226,6 +246,10 @@ fn process_classified_topic(
     message_id: i64,
     message_timestamp: i64,
 ) -> Result<(), sqlite::Error> {
+    // Always resolve the category to get both id and canonical name
+    let (category_id, canonical_category) = store
+        .resolve_category_with_name(&classified.category, classified.category_ko.as_deref())?;
+
     let topic_id = match store.find_topic_by_alias(&classified.topic)? {
         Some(id) => {
             if let Some(ref ko) = classified.topic_ko {
@@ -236,23 +260,37 @@ fn process_classified_topic(
             id
         }
         None => {
-            let category_id =
-                store.resolve_category(&classified.category, classified.category_ko.as_deref())?;
-            let new_topic = NewTopic {
-                title: classified.topic.clone(),
-                title_ko: classified.topic_ko.clone(),
-                category_id,
-            };
-            store.create_topic(&new_topic)?
+            // Try fuzzy matching before creating a new topic
+            if let Some(fuzzy_id) = store.find_topic_fuzzy(&classified.topic)? {
+                log::debug!(
+                    "Wiki worker: fuzzy-matched '{}' to existing topic {}",
+                    classified.topic,
+                    fuzzy_id
+                );
+                if let Some(ref ko) = classified.topic_ko {
+                    store.set_title_ko_if_absent(fuzzy_id, ko)?;
+                }
+                let alias = normalize_topic_title(&classified.topic);
+                store.add_topic_alias(fuzzy_id, &alias)?;
+                fuzzy_id
+            } else {
+                let new_topic = NewTopic {
+                    title: classified.topic.clone(),
+                    title_ko: classified.topic_ko.clone(),
+                    category_id,
+                };
+                store.create_topic(&new_topic)?
+            }
         }
     };
 
+    // Store the canonical category name, not the raw LLM output
     let link = TopicMessageLink {
         topic_id,
         chat_id,
         message_id,
         relevance: classified.relevance,
-        assigned_category: classified.category.clone(),
+        assigned_category: canonical_category,
     };
     store.link_message_to_topic(&link)?;
     store.record_topic_stat(topic_id, message_timestamp, chat_id)?;

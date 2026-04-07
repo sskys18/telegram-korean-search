@@ -17,20 +17,23 @@ interface WikiSettingsProps {
     reprocessWiki: () => Promise<void>;
     clearWikiData: () => Promise<void>;
   };
+  onDataChanged?: () => Promise<void>;
 }
 
-export function WikiSettings({ worker }: WikiSettingsProps) {
+export function WikiSettings({ worker, onDataChanged }: WikiSettingsProps) {
   const [openPanel, setOpenPanel] = useState(false);
 
   const handleReprocess = async () => {
     if (window.confirm("Rebuild the wiki queue and summaries from collected messages?")) {
       await worker.reprocessWiki();
+      await onDataChanged?.();
     }
   };
 
   const handleClear = async () => {
     if (window.confirm("Clear all wiki topics, pages, and queue data?")) {
       await worker.clearWikiData();
+      await onDataChanged?.();
     }
   };
 

@@ -470,23 +470,56 @@ pub async fn get_wiki_status(state: State<'_, AppState>) -> Result<WikiStatus, S
     })
 }
 
+/// Stop the wiki worker and wait for it to finish.
+async fn ensure_worker_stopped(state: &AppState) {
+    // Signal shutdown
+    {
+        let mut guard = state.wiki_worker_shutdown.lock().await;
+        if let Some(shutdown) = guard.as_ref() {
+            shutdown.store(true, Ordering::Relaxed);
+        }
+        *guard = None;
+    }
+    // Wait briefly for the worker thread to finish
+    let handle = {
+        let mut guard = state
+            .wiki_worker_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.take()
+    };
+    if let Some(h) = handle {
+        // Give the worker a moment to exit its loop
+        for _ in 0..20 {
+            if h.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
 #[tauri::command]
-pub fn reprocess_wiki(state: State<AppState>) -> Result<(), String> {
+pub async fn reprocess_wiki(state: State<'_, AppState>) -> Result<(), String> {
+    ensure_worker_stopped(&state).await;
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store.clear_classify_queue().map_err(|e| e.to_string())?;
     store.clear_wiki_pages().map_err(|e| e.to_string())?;
     store.clear_wiki_topics().map_err(|e| e.to_string())?;
+    store.clear_wiki_categories().map_err(|e| e.to_string())?;
     store.clear_wiki_stats().map_err(|e| e.to_string())?;
     store.enqueue_all_messages().map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
-pub fn clear_wiki_data(state: State<AppState>) -> Result<(), String> {
+pub async fn clear_wiki_data(state: State<'_, AppState>) -> Result<(), String> {
+    ensure_worker_stopped(&state).await;
     let store = state.store.lock().map_err(|e| e.to_string())?;
     store.clear_classify_queue().map_err(|e| e.to_string())?;
     store.clear_wiki_pages().map_err(|e| e.to_string())?;
     store.clear_wiki_topics().map_err(|e| e.to_string())?;
+    store.clear_wiki_categories().map_err(|e| e.to_string())?;
     store.clear_wiki_stats().map_err(|e| e.to_string())?;
     Ok(())
 }
