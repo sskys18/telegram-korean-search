@@ -470,38 +470,19 @@ pub async fn get_wiki_status(state: State<'_, AppState>) -> Result<WikiStatus, S
     })
 }
 
-/// Stop the wiki worker and wait for it to finish.
-async fn ensure_worker_stopped(state: &AppState) {
-    // Signal shutdown
-    {
-        let mut guard = state.wiki_worker_shutdown.lock().await;
-        if let Some(shutdown) = guard.as_ref() {
-            shutdown.store(true, Ordering::Relaxed);
-        }
-        *guard = None;
-    }
-    // Wait briefly for the worker thread to finish
-    let handle = {
-        let mut guard = state
-            .wiki_worker_handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.take()
-    };
-    if let Some(h) = handle {
-        // Give the worker a moment to exit its loop
-        for _ in 0..20 {
-            if h.is_finished() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    }
-}
-
 #[tauri::command]
-pub async fn reprocess_wiki(state: State<'_, AppState>) -> Result<(), String> {
-    ensure_worker_stopped(&state).await;
+pub fn reprocess_wiki(state: State<AppState>) -> Result<(), String> {
+    // Signal worker to stop (non-blocking — worker will exit on next loop check)
+    if let Some(shutdown) = state
+        .wiki_worker_shutdown
+        .try_lock()
+        .ok()
+        .as_deref()
+        .and_then(|g| g.as_ref())
+    {
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
     let store = state.lock_store();
     store.clear_classify_queue().map_err(|e| e.to_string())?;
     store.clear_wiki_pages().map_err(|e| e.to_string())?;
@@ -509,18 +490,29 @@ pub async fn reprocess_wiki(state: State<'_, AppState>) -> Result<(), String> {
     store.clear_wiki_categories().map_err(|e| e.to_string())?;
     store.clear_wiki_stats().map_err(|e| e.to_string())?;
     store.enqueue_all_messages().map_err(|e| e.to_string())?;
+    log::info!("Wiki reprocess: cleared all data and re-enqueued messages");
     Ok(())
 }
 
 #[tauri::command]
-pub async fn clear_wiki_data(state: State<'_, AppState>) -> Result<(), String> {
-    ensure_worker_stopped(&state).await;
+pub fn clear_wiki_data(state: State<AppState>) -> Result<(), String> {
+    if let Some(shutdown) = state
+        .wiki_worker_shutdown
+        .try_lock()
+        .ok()
+        .as_deref()
+        .and_then(|g| g.as_ref())
+    {
+        shutdown.store(true, Ordering::Relaxed);
+    }
+
     let store = state.lock_store();
     store.clear_classify_queue().map_err(|e| e.to_string())?;
     store.clear_wiki_pages().map_err(|e| e.to_string())?;
     store.clear_wiki_topics().map_err(|e| e.to_string())?;
     store.clear_wiki_categories().map_err(|e| e.to_string())?;
     store.clear_wiki_stats().map_err(|e| e.to_string())?;
+    log::info!("Wiki clear: all wiki data deleted");
     Ok(())
 }
 
