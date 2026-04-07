@@ -259,10 +259,10 @@ pub async fn incremental_sync(
                     }
                 }
                 total += count;
-                log::info!("Synced {} messages for chat {}", count, chat.title);
+                log::debug!("Synced {} messages for chat {}", count, chat.title);
             }
             Err(e) => {
-                log::warn!("Failed to sync chat {}: {}", chat.title, e);
+                log::debug!("Failed to sync chat {}: {}", chat.title, e);
             }
         }
     }

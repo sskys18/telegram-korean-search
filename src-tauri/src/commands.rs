@@ -689,7 +689,7 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
             let store = state.lock_store();
             for row in &chat_rows {
                 if let Err(e) = store.upsert_chat(row) {
-                    log::warn!("Failed to save chat {}: {}", row.title, e);
+                    log::debug!("Failed to save chat {}: {}", row.title, e);
                 }
             }
             let active = store.get_active_chats().unwrap_or_default();
@@ -793,7 +793,7 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
                         let newest_id = rows.iter().map(|r| r.message_id).max().unwrap();
                         let store = state.lock_store();
                         if let Err(e) = store.insert_messages_batch(&rows) {
-                            log::warn!("Failed to save messages for {}: {}", chat.title, e);
+                            log::debug!("Failed to save messages for {}: {}", chat.title, e);
                         } else {
                             let items: Vec<(i64, i64)> =
                                 rows.iter().map(|r| (r.chat_id, r.message_id)).collect();
@@ -829,7 +829,7 @@ fn run_collection(app: AppHandle, client: grammers_client::Client) {
                             }
                         }
                     }
-                    log::info!("Fetched {} messages for {}", count, chat.title);
+                    log::debug!("Fetched {} messages for {}", count, chat.title);
                 }
                 Err(e) => log::warn!("Failed to fetch messages for {}: {}", chat.title, e),
             }

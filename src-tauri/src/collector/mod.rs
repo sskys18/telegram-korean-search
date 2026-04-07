@@ -57,7 +57,7 @@ fn install_grammers_panic_hook() {
                 loc.file().contains("grammers-session") || loc.file().contains("grammers_session")
             });
             if from_grammers {
-                log::warn!("Telegram session error (recovering automatically)");
+                log::debug!("Telegram session error (recovering automatically)");
             } else {
                 default_hook(info);
             }
