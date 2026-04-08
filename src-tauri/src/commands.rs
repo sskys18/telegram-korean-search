@@ -172,6 +172,10 @@ pub fn save_api_credentials(
 /// If the session is stale (AUTH_KEY_UNREGISTERED), deletes it and reconnects fresh.
 #[tauri::command]
 pub async fn connect_telegram(state: State<'_, AppState>) -> Result<ConnectResult, String> {
+    // Serialize connect calls — React StrictMode fires useEffect twice in dev,
+    // causing two concurrent SqliteSession opens which deadlock grammers.
+    let _connect_guard = state.connect_lock.lock().await;
+
     // Read api_id and auth flag from DB
     let (api_id, was_authenticated) = {
         let store = state.lock_store();

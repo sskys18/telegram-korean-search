@@ -25,6 +25,8 @@ pub struct AppState {
     pub runner_handle: TokioMutex<Option<tokio::task::JoinHandle<()>>>,
     pub wiki_worker_shutdown: TokioMutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
     pub wiki_worker_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Prevents concurrent connect_telegram calls (React StrictMode fires useEffect twice)
+    pub connect_lock: TokioMutex<()>,
 }
 
 impl AppState {
@@ -116,6 +118,7 @@ pub fn run() {
             runner_handle: TokioMutex::new(None),
             wiki_worker_shutdown: TokioMutex::new(None),
             wiki_worker_handle: Mutex::new(None),
+            connect_lock: TokioMutex::new(()),
         })
         .setup(|app| {
             #[cfg(desktop)]

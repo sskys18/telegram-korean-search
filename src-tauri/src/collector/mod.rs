@@ -34,7 +34,6 @@ pub async fn connect(api_id: i32) -> Result<(Client, tokio::task::JoinHandle<()>
                     "Session file corrupted ({}), deleting and creating fresh",
                     err_str
                 );
-                // Delete session and WAL/SHM files
                 let _ = std::fs::remove_file(&path);
                 let _ = std::fs::remove_file(path.with_extension("session-wal"));
                 let _ = std::fs::remove_file(path.with_extension("session-shm"));
@@ -51,10 +50,6 @@ pub async fn connect(api_id: i32) -> Result<(Client, tokio::task::JoinHandle<()>
     let pool = SenderPool::new(Arc::clone(&session), api_id);
     let client = Client::new(&pool);
 
-    // Destructure to take ownership of the runner.
-    // Install a panic hook that suppresses grammers-session panics (e.g. stale session
-    // causing AUTH_KEY_UNREGISTERED → session SQLite write failure). These panics are
-    // expected and handled by the stale session recovery in connect_telegram.
     let SenderPool { runner, .. } = pool;
     install_grammers_panic_hook();
     let runner_handle = tokio::spawn(async move {
