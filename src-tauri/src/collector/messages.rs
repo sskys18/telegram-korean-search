@@ -69,10 +69,22 @@ fn peer_ref_from_chat(chat: &ChatRow) -> PeerRef {
             id: PeerId::user(chat.chat_id),
             auth: PeerAuth::from_hash(hash),
         },
-        "group" => PeerRef {
-            id: PeerId::chat(-chat.chat_id),
-            auth: PeerAuth::default(),
-        },
+        "group" => {
+            let bare = -chat.chat_id;
+            if bare > 999_999_999_999 {
+                // Megagroup stored as "group" but has a channel-format ID
+                let channel_bare = bare - 1_000_000_000_000;
+                PeerRef {
+                    id: PeerId::channel(channel_bare),
+                    auth: PeerAuth::from_hash(hash),
+                }
+            } else {
+                PeerRef {
+                    id: PeerId::chat(bare),
+                    auth: PeerAuth::default(),
+                }
+            }
+        }
         _ => {
             // supergroup / channel: bot_api_dialog_id = -(1000000000000 + bare_id)
             let bare_id = (-chat.chat_id) - 1_000_000_000_000;
