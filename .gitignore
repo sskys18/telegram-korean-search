@@ -25,13 +25,6 @@ dist/
 session.bin
 *.key
 *.session
-telegram.session
-tg_fetch_session.session
-
-# Local data dumps (never commit scraped chat data)
-pp_bwl_data/
-fetch_channel.py
-wiki_worker_cli.py
 
 # Logs
 *.log
