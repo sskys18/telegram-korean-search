@@ -12,9 +12,11 @@ use std::sync::Mutex;
 use crate::ipc::protocol::{
     IndexBatchParams, IndexBatchResult, IndexMessageInput, Method, Notification, NotifyIn, Outcome,
     PongResult, Request, Response, ResponsePayload, RpcError, SearchParams, SearchScopeInput,
+    WikiSearchParams, WikiTopicDetail, WikiTopicDetailParams, WikiTopicSummary, WikiTrendingParams,
 };
 use crate::search::{engine, SearchResult};
 use crate::store::message::{strip_whitespace, MessageRow};
+use crate::store::wiki_topic::WikiTopic;
 use crate::store::Store;
 
 /// Shared state for every handler. Cheap to clone.
@@ -73,14 +75,36 @@ pub fn dispatch_request(state: &SidecarState, req: Request) -> Dispatch {
                 error: RpcError::internal(e.to_string()),
             },
         },
-        Method::WikiTrending(_) | Method::WikiTopicDetail(_) | Method::WikiSearch(_) => {
-            Outcome::Err {
+        Method::WikiTrending(params) => match wiki_trending(state, params) {
+            Ok(list) => Outcome::Ok {
+                result: ResponsePayload::WikiTrending(list),
+            },
+            Err(e) => Outcome::Err {
+                error: RpcError::internal(e.to_string()),
+            },
+        },
+        Method::WikiTopicDetail(params) => match wiki_topic_detail(state, params) {
+            Ok(Some(detail)) => Outcome::Ok {
+                result: ResponsePayload::WikiTopicDetail(detail),
+            },
+            Ok(None) => Outcome::Err {
                 error: RpcError {
-                    code: RpcError::METHOD_NOT_FOUND,
-                    message: "wiki methods not yet wired up".into(),
+                    code: RpcError::INVALID_PARAMS,
+                    message: "topic not found".into(),
                 },
-            }
-        }
+            },
+            Err(e) => Outcome::Err {
+                error: RpcError::internal(e.to_string()),
+            },
+        },
+        Method::WikiSearch(params) => match wiki_search(state, params) {
+            Ok(list) => Outcome::Ok {
+                result: ResponsePayload::WikiSearch(list),
+            },
+            Err(e) => Outcome::Err {
+                error: RpcError::internal(e.to_string()),
+            },
+        },
     };
     Dispatch::Reply(Response { id, outcome })
 }
@@ -117,6 +141,75 @@ fn to_message_row(msg: IndexMessageInput) -> MessageRow {
         text_stripped: stripped,
         link: None,
     }
+}
+
+fn topic_to_summary(t: &WikiTopic) -> WikiTopicSummary {
+    WikiTopicSummary {
+        id: t.topic_id,
+        title: t.title.clone(),
+        title_ko: t.title_ko.clone(),
+        category: t
+            .category_name
+            .clone()
+            .unwrap_or_else(|| "Uncategorized".into()),
+        message_count: t.message_count,
+        trending_score: t.trending_score,
+    }
+}
+
+fn wiki_trending(
+    state: &SidecarState,
+    params: WikiTrendingParams,
+) -> Result<Vec<WikiTopicSummary>, sqlite::Error> {
+    let store = state.lock_store();
+    // Category filter is passed as a name by the shell; resolve to id
+    // before hitting the store. Missing categories just return no
+    // topics.
+    let category_id = match params.category.as_deref() {
+        Some(name) => {
+            let all = store.get_all_categories()?;
+            match all.iter().find(|c| c.name.eq_ignore_ascii_case(name)) {
+                Some(c) => Some(c.category_id),
+                None => return Ok(Vec::new()),
+            }
+        }
+        None => None,
+    };
+    let topics = store.get_trending_topics(params.limit, params.offset, category_id)?;
+    Ok(topics.iter().map(topic_to_summary).collect())
+}
+
+fn wiki_topic_detail(
+    state: &SidecarState,
+    params: WikiTopicDetailParams,
+) -> Result<Option<WikiTopicDetail>, sqlite::Error> {
+    let store = state.lock_store();
+    let topic = match store.get_topic(params.topic_id)? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let summary = topic_to_summary(&topic);
+    let page = store.get_latest_page(params.topic_id)?;
+    Ok(Some(WikiTopicDetail {
+        summary,
+        article_md: page.as_ref().map(|p| p.content_en.clone()),
+        article_md_ko: page.as_ref().map(|p| p.content_ko.clone()),
+    }))
+}
+
+fn wiki_search(
+    state: &SidecarState,
+    params: WikiSearchParams,
+) -> Result<Vec<WikiTopicSummary>, sqlite::Error> {
+    let store = state.lock_store();
+    let hits = store.search_wiki_pages(&params.query, params.limit)?;
+    let mut out = Vec::with_capacity(hits.len());
+    for hit in hits {
+        if let Some(topic) = store.get_topic(hit.topic_id)? {
+            out.push(topic_to_summary(&topic));
+        }
+    }
+    Ok(out)
 }
 
 fn run_search(state: &SidecarState, params: SearchParams) -> Result<SearchResult, sqlite::Error> {
