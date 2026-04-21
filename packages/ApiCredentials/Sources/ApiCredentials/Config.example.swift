@@ -1,15 +1,31 @@
+// Template for developers.
+//
+// Copy this file to `Config.swift` (which is gitignored) and replace
+// `apiId` and `apiHash` with credentials you obtained from
+// https://my.telegram.org (API development tools).
+//
+// Do NOT check your real credentials into git — Telegram treats
+// publicly-posted api_id/api_hash pairs as compromised and revokes
+// them. The real Config.swift is added to .gitignore exactly so that
+// running Xcode does not ask you to manage that manually.
+//
+// The `teamId` field below is upstream's Apple Developer team id.
+// For a local-only build, Xcode's automatic signing will override it
+// with whatever team is attached to your Apple ID; you do not need to
+// edit it unless you plan to ship a signed build.
+
 import Cocoa
 
 public final class ApiEnvironment {
     public static var apiId:Int32 {
-        return 9
+        return 0  // replace with your api_id from my.telegram.org
     }
     public static var apiHash:String {
-        return "3975f648bb682ee889f35483bc618d1c"
+        return ""  // replace with your api_hash from my.telegram.org
     }
     
     public static var bundleId: String {
-        return "ru.keepcoder.Telegram"
+        return "com.seoyu.telegram-seoyu"
     }
     public static var intentsBundleId: String {
         return teamId + "." + bundleId + ".FocusIntents"

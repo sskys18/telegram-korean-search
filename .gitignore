@@ -27,6 +27,9 @@ session.bin
 *.key
 *.session
 
+# Private API credentials — use Config.example.swift as a template
+packages/ApiCredentials/Sources/ApiCredentials/Config.swift
+
 # Logs
 *.log
 
