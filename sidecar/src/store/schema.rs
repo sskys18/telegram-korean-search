@@ -58,7 +58,112 @@ pub fn run_migrations(conn: &Connection) -> Result<(), sqlite::Error> {
     // Phase 5: Merge duplicate wiki categories
     migrate_merge_duplicate_categories(conn)?;
 
+    // Phase 6: Korean-aware auxiliary indexes (jamo, chosung, nospace)
+    migrate_korean_indexes(conn)?;
+
     Ok(())
+}
+
+fn migrate_korean_indexes(conn: &Connection) -> Result<(), sqlite::Error> {
+    if get_schema_version(conn) >= 6 {
+        return Ok(());
+    }
+
+    // Add two computed-at-insert columns. text_stripped already
+    // existed; we just start indexing it now. NOT NULL + DEFAULT ''
+    // keeps old INSERTs that do not mention these columns working.
+    if !column_exists(conn, "messages", "text_jamo")? {
+        conn.execute("ALTER TABLE messages ADD COLUMN text_jamo TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !column_exists(conn, "messages", "text_chosung")? {
+        conn.execute("ALTER TABLE messages ADD COLUMN text_chosung TEXT NOT NULL DEFAULT ''")?;
+    }
+
+    // Backfill the new columns from the existing text_plain in
+    // batches of 500 so we never hold a huge prepared statement in
+    // memory. Skip rows that already have a value (migration replay
+    // after a crash).
+    backfill_korean_columns(conn)?;
+
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_jamo USING fts5(
+            text_jamo,
+            content='messages',
+            tokenize='trigram case_sensitive 0'
+        )",
+    )?;
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_chosung USING fts5(
+            text_chosung,
+            content='messages',
+            tokenize='trigram case_sensitive 0'
+        )",
+    )?;
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_nospace USING fts5(
+            text_stripped,
+            content='messages',
+            tokenize='trigram case_sensitive 0'
+        )",
+    )?;
+
+    // External-content FTS5 reads the column from `messages` on
+    // rebuild, so the backfilled values are what gets indexed.
+    conn.execute("INSERT INTO messages_fts_jamo(messages_fts_jamo) VALUES('rebuild')")?;
+    conn.execute("INSERT INTO messages_fts_chosung(messages_fts_chosung) VALUES('rebuild')")?;
+    conn.execute("INSERT INTO messages_fts_nospace(messages_fts_nospace) VALUES('rebuild')")?;
+
+    conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '6')")?;
+
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, sqlite::Error> {
+    let mut stmt = conn.prepare(format!("PRAGMA table_info({table})"))?;
+    while let sqlite::State::Row = stmt.next()? {
+        if stmt.read::<String, _>("name")? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn backfill_korean_columns(conn: &Connection) -> Result<(), sqlite::Error> {
+    const BATCH: usize = 500;
+    loop {
+        let mut rows: Vec<(i64, String)> = Vec::with_capacity(BATCH);
+        {
+            let mut stmt = conn.prepare(
+                "SELECT rowid, text_plain FROM messages
+                 WHERE text_jamo = '' AND text_chosung = ''
+                 LIMIT ?",
+            )?;
+            stmt.bind((1, BATCH as i64))?;
+            while let sqlite::State::Row = stmt.next()? {
+                rows.push((stmt.read::<i64, _>(0)?, stmt.read::<String, _>(1)?));
+            }
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        conn.execute("BEGIN")?;
+        for (rowid, text) in &rows {
+            let jamo = crate::search::hangul::decompose_jamo(text);
+            let chosung = crate::search::hangul::chosung_only(text);
+            let mut stmt = conn
+                .prepare("UPDATE messages SET text_jamo = ?, text_chosung = ? WHERE rowid = ?")?;
+            stmt.bind((1, jamo.as_str()))?;
+            stmt.bind((2, chosung.as_str()))?;
+            stmt.bind((3, *rowid))?;
+            stmt.next()?;
+        }
+        conn.execute("COMMIT")?;
+
+        if rows.len() < BATCH {
+            return Ok(());
+        }
+    }
 }
 
 fn get_schema_version(conn: &Connection) -> i64 {

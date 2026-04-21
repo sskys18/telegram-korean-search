@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod hangul;
 pub mod highlight;
 
 use serde::{Deserialize, Serialize};

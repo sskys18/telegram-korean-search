@@ -2,6 +2,22 @@ use serde::{Deserialize, Serialize};
 
 use super::Store;
 
+fn fts_insert(
+    conn: &sqlite::Connection,
+    table: &str,
+    column: &str,
+    rowid: i64,
+    value: &str,
+) -> Result<(), sqlite::Error> {
+    let mut stmt = conn.prepare(format!(
+        "INSERT INTO {table}(rowid, {column}) VALUES (?, ?)"
+    ))?;
+    stmt.bind((1, rowid))?;
+    stmt.bind((2, value))?;
+    stmt.next()?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageRow {
     pub message_id: i64,
@@ -37,9 +53,14 @@ impl Store {
     pub fn insert_messages_batch(&self, messages: &[MessageRow]) -> Result<(), sqlite::Error> {
         self.conn.execute("BEGIN")?;
         for msg in messages {
+            let jamo = crate::search::hangul::decompose_jamo(&msg.text_plain);
+            let chosung = crate::search::hangul::chosung_only(&msg.text_plain);
+
             let mut stmt = self.conn.prepare(
-                "INSERT OR IGNORE INTO messages (message_id, chat_id, timestamp, text_plain, text_stripped, link)
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO messages
+                    (message_id, chat_id, timestamp, text_plain, text_stripped, link,
+                     text_jamo, text_chosung)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )?;
             stmt.bind((1, msg.message_id))?;
             stmt.bind((2, msg.chat_id))?;
@@ -50,6 +71,8 @@ impl Store {
                 Some(l) => stmt.bind((6, l.as_str()))?,
                 None => stmt.bind((6, sqlite::Value::Null))?,
             };
+            stmt.bind((7, jamo.as_str()))?;
+            stmt.bind((8, chosung.as_str()))?;
             stmt.next()?;
 
             // Check if the row was actually inserted (not a duplicate)
@@ -58,17 +81,41 @@ impl Store {
             let changes: i64 = changes_stmt.read(0)?;
 
             if changes > 0 {
-                // New message — index in FTS5
                 let mut rowid_stmt = self.conn.prepare("SELECT last_insert_rowid()")?;
                 rowid_stmt.next()?;
                 let msg_rowid: i64 = rowid_stmt.read(0)?;
 
-                let mut fts_stmt = self
-                    .conn
-                    .prepare("INSERT INTO messages_fts(rowid, text_plain) VALUES (?, ?)")?;
-                fts_stmt.bind((1, msg_rowid))?;
-                fts_stmt.bind((2, msg.text_plain.as_str()))?;
-                fts_stmt.next()?;
+                // Keep every external-content FTS5 table in sync. Each
+                // one was rebuilt during the v6 migration; these
+                // inserts cover the hot path for new messages.
+                fts_insert(
+                    &self.conn,
+                    "messages_fts",
+                    "text_plain",
+                    msg_rowid,
+                    &msg.text_plain,
+                )?;
+                fts_insert(
+                    &self.conn,
+                    "messages_fts_nospace",
+                    "text_stripped",
+                    msg_rowid,
+                    &msg.text_stripped,
+                )?;
+                fts_insert(
+                    &self.conn,
+                    "messages_fts_jamo",
+                    "text_jamo",
+                    msg_rowid,
+                    &jamo,
+                )?;
+                fts_insert(
+                    &self.conn,
+                    "messages_fts_chosung",
+                    "text_chosung",
+                    msg_rowid,
+                    &chosung,
+                )?;
             }
         }
         self.conn.execute("COMMIT")?;
@@ -98,6 +145,102 @@ impl Store {
         } else {
             Ok(None)
         }
+    }
+
+    /// Union-of-indexes search. Each `(fts_table, fts_query, priority)`
+    /// entry is turned into one FTS5 `MATCH` branch. Results that
+    /// appear in multiple branches are kept once, ranked by the
+    /// lowest (best) priority they appeared under. Within a priority
+    /// bucket, rows are ordered by `timestamp DESC` like every other
+    /// search path.
+    pub fn search_messages_multi_fts(
+        &self,
+        branches: &[(&str, &str, i64)],
+        scope_chat: Option<i64>,
+        cursor: Option<&Cursor>,
+        limit: usize,
+    ) -> Result<Vec<MessageWithChat>, sqlite::Error> {
+        if branches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut hits_sql = String::new();
+        for (i, (table, _query, priority)) in branches.iter().enumerate() {
+            if i > 0 {
+                hits_sql.push_str(" UNION ALL ");
+            }
+            hits_sql.push_str(&format!(
+                "SELECT rowid, {priority} AS priority FROM {table} WHERE {table} MATCH ?"
+            ));
+        }
+
+        let cursor_clause = if cursor.is_some() {
+            "AND (m.timestamp < ?
+                  OR (m.timestamp = ? AND m.chat_id > ?)
+                  OR (m.timestamp = ? AND m.chat_id = ? AND m.message_id > ?))"
+        } else {
+            ""
+        };
+        let chat_clause = if scope_chat.is_some() {
+            "AND m.chat_id = ?"
+        } else {
+            ""
+        };
+
+        let sql = format!(
+            "WITH hits AS ({hits_sql}),
+                  ranked AS (
+                      SELECT rowid, MIN(priority) AS best FROM hits GROUP BY rowid
+                  )
+             SELECT m.message_id, m.chat_id, m.timestamp, m.text_plain, m.link, c.title
+             FROM messages m
+             JOIN chats c ON m.chat_id = c.chat_id
+             JOIN ranked r ON r.rowid = m.rowid
+             WHERE c.is_excluded = 0
+             {chat_clause}
+             {cursor_clause}
+             ORDER BY r.best ASC, m.timestamp DESC, m.chat_id ASC, m.message_id ASC
+             LIMIT ?"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind_idx = 1_i64;
+        for (_, query, _) in branches {
+            stmt.bind((bind_idx as usize, *query))?;
+            bind_idx += 1;
+        }
+        if let Some(chat_id) = scope_chat {
+            stmt.bind((bind_idx as usize, chat_id))?;
+            bind_idx += 1;
+        }
+        if let Some(c) = cursor {
+            stmt.bind((bind_idx as usize, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx as usize, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx as usize, c.chat_id))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx as usize, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx as usize, c.chat_id))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx as usize, c.message_id))?;
+            bind_idx += 1;
+        }
+        stmt.bind((bind_idx as usize, limit as i64))?;
+
+        let mut results = Vec::new();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            results.push(MessageWithChat {
+                message_id: stmt.read::<i64, _>(0)?,
+                chat_id: stmt.read::<i64, _>(1)?,
+                timestamp: stmt.read::<i64, _>(2)?,
+                text_plain: stmt.read::<String, _>(3)?,
+                link: stmt.read::<Option<String>, _>(4)?,
+                chat_title: stmt.read::<String, _>(5)?,
+            });
+        }
+        Ok(results)
     }
 
     pub fn search_messages_fts(
