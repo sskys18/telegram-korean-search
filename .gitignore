@@ -2,6 +2,10 @@
 target/
 sidecar/target/
 
+# Node (leftover from archive/tauri-v0; not used any more)
+node_modules/
+dist/
+
 # macOS
 .DS_Store
 .AppleDouble

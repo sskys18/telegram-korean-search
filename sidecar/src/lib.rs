@@ -2,9 +2,11 @@
 //!
 //! Owns the local message mirror, Korean-aware search index, and wiki
 //! pipeline. Consumed by the Swift shell via the IPC binary at
-//! `src/bin/main.rs`.
+//! `src/bin/main.rs`, which serves requests over a Unix-domain
+//! socket.
 
 pub mod error;
+pub mod ipc;
 pub mod logging;
 pub mod search;
 pub mod security;
