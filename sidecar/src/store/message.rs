@@ -431,7 +431,9 @@ mod tests {
         setup_chat(&store, 1);
 
         let msg = make_message(1, 100, 1000, "hello");
-        store.insert_messages_batch(&[msg.clone()]).unwrap();
+        store
+            .insert_messages_batch(std::slice::from_ref(&msg))
+            .unwrap();
         store.insert_messages_batch(&[msg]).unwrap();
         assert_eq!(store.message_count().unwrap(), 1);
     }
