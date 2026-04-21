@@ -1,0 +1,24 @@
+[submodule "submodules/libtgvoip"]
+	path = submodules/libtgvoip
+	url = https://github.com/telegramdesktop/libtgvoip.git
+[submodule "submodules/Sparkle"]
+	path = submodules/Sparkle
+	url = https://gitlab.com/overtake/Sparkle.git
+[submodule "submodules/telegram-ios"]
+	path = submodules/telegram-ios
+	url = https://github.com/overtake/Telegram-iOS.git
+[submodule "submodules/rlottie"]
+	path = submodules/rlottie
+	url = https://github.com/overtake/rlottie.git
+[submodule "submodules/tgcalls"]
+	path = submodules/tgcalls
+	url = https://github.com/overtake/tgcalls.git
+[submodule "submodules/tg_owt"]
+	path = submodules/tg_owt
+	url = https://github.com/desktop-app/tg_owt.git
+[submodule "submodules/libprisma"]
+	path = submodules/libprisma
+	url = https://github.com/desktop-app/libprisma.git
+[submodule "submodules/regex"]
+	path = submodules/regex
+	url = https://github.com/boostorg/regex.git

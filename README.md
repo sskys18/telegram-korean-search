@@ -2,11 +2,11 @@
 
 > macOS Telegram client with Korean substring search and a local LLM-powered wiki
 
-**Status: pre-alpha, under active restructuring.** The project is moving from a
-standalone Tauri companion app to a fork of
-[overtake/TelegramSwift](https://github.com/overtake/TelegramSwift) paired with
-a local Rust sidecar. The fork is not yet in tree (pending Phase 5); this
-README documents the target architecture.
+**Status: pre-alpha, under active restructuring.** The project is a fork of
+[overtake/TelegramSwift](https://github.com/overtake/TelegramSwift) paired
+with a local Rust sidecar for Korean search and wiki generation. Upstream
+Swift source has been merged in; the search-bar hook and wiki UI wiring are
+next.
 
 ## Why
 
@@ -60,9 +60,13 @@ Legacy docs for the old Tauri companion app live under `docs/legacy/`.
 ## Repository layout
 
 ```
-sidecar/            Rust crate (search, store, wiki). Published under MIT.
-telegram-swift/     TelegramSwift subtree (to be added). Inherits GPLv2.
-docs/legacy/        Design docs from the old Tauri app, kept for reference.
+Telegram-Mac/          TelegramSwift app target (upstream, GPLv2)
+Telegram-Mac.xcworkspace
+packages/, submodules/ TelegramSwift modules and their own submodules
+core-xprojects/, ...   upstream build infrastructure
+
+sidecar/               Rust crate, MIT (search, store, wiki, security)
+docs/legacy/           Tauri-era design docs (reference only)
 ```
 
 ## Build
@@ -77,13 +81,34 @@ cargo clippy -- -D warnings     # clean
 cargo fmt --check               # clean
 ```
 
-The Swift shell will be added at `telegram-swift/` in Phase 5. Build
-instructions will follow once it lands.
+The Swift app target, Xcode workspace, and submodules live at the repository
+root alongside `sidecar/`. Build instructions follow upstream TelegramSwift's
+[INSTALL.md](INSTALL.md) for the Swift side, plus `cd sidecar && cargo build`
+for the Rust side.
+
+## Attribution
+
+This project is a fork of
+[overtake/TelegramSwift](https://github.com/overtake/TelegramSwift). All Swift
+source files, the Xcode workspace, and `submodules/` are upstream's work,
+licensed under GPLv2. Our additions (`sidecar/`, `docs/legacy/`,
+search/wiki integration to come) build on top of it.
+
+Per upstream's fork requirements:
+
+1. This fork uses its own Telegram API ID (configured at first run).
+2. This fork is **not** called "Telegram". The app and repository are
+   `telegram-seoyu`.
+3. This fork does **not** use Telegram's standard logo. A distinct icon is
+   in progress.
+4. We aim to follow Telegram's
+   [MTProto security guidelines](https://core.telegram.org/mtproto/security_guidelines).
+5. Source is public per GPLv2.
 
 ## License
 
-- Root / Swift shell: GPLv2 (inherited from TelegramSwift)
-- `sidecar/`: MIT (see `sidecar/LICENSE` once added)
+- Swift shell + all upstream code: **GPLv2** (see [LICENSE](LICENSE))
+- `sidecar/` Rust crate: **MIT** (see `sidecar/Cargo.toml`)
 
 ## Scope
 

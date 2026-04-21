@@ -1,16 +1,13 @@
 # Rust
 target/
-src-tauri/target/
-src-tauri/gen/
-
-# Node
-node_modules/
-dist/
+sidecar/target/
 
 # macOS
 .DS_Store
 .AppleDouble
 .LSOverride
+xcuserdata
+xcuserstate
 
 # IDE
 .idea/
@@ -32,3 +29,20 @@ session.bin
 # Conductor workspace
 .context/
 .conductor/
+
+# TelegramSwift build output
+fastlane/README.md
+fastlane/report.xml
+core-xprojects/Mozjpeg/build
+core-xprojects/openssl/build
+core-xprojects/libwebp/build
+core-xprojects/libopus/build
+core-xprojects/ffmpeg/build
+core-xprojects/webrtc/build
+core-xprojects/libvpx/build
+core-xprojects/OpenH264/build
+core-xprojects/dav1d/build
+core-xprojects/tde2e/build
+submodules/libwebp/SharedHeaders
+submodules/Mozjpeg/SharedHeaders
+submodules/OpenSSLEncryptionProvider/SharedHeaders
