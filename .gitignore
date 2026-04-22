@@ -9,6 +9,17 @@ dist/
 # UniFFI Swift bindings (generated from the sidecar cdylib)
 sidecar/target/swift-bindings/
 
+# Xcode-generated build output in the package / submodule tree
+# (landing targets; not the upstream source)
+build/
+packages/*/build/
+submodules/telegram-ios/submodules/*/build/
+submodules/telegram-ios/third-party/*/build/
+
+# Xcode workspace SPM state (regenerated on every resolve)
+Telegram.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+Telegram-Mac.xcworkspace/xcshareddata/swiftpm/
+
 # macOS
 .DS_Store
 .AppleDouble
