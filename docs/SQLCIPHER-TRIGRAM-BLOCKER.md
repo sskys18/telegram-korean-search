@@ -1,4 +1,4 @@
-# sqlcipher FTS5 trigram blocker
+# sqlcipher FTS5 trigram blocker — RESOLVED 2026-04-22
 
 ## Symptom
 
@@ -50,12 +50,20 @@ $ nm …/Telegram.debug.dylib | grep 'T _sqlite3_libversion'
    clash (static rusqlite with a C-level prefix rewrite). Complex and
    nobody does this.
 
-## Status as of 2026-04-22
+## Fix
 
-The Seoyu bridge, ingest observer, and search-merge hook are wired and
-compile. The integration is end-to-end inert until this is resolved
-because every indexed message trips the tokenizer error. The sidecar
-side is already robust to partial failures: `insert_messages_batch`
-now rolls back its own transaction on error and auto-inserts a stub
-chat row so the FK check passes, but neither of those helps when the
-FTS5 insert itself cannot run.
+Option 1 was taken. We vendor the sqlcipher 4.6.1 amalgamation (SQLite
+3.46.1, trigram included) at `vendor/sqlcipher-4.6.1/` and
+`scripts/patch-submodules.sh` overwrites the submodule's `sqlite3.c`,
+`sqlite3.h`, `sqlite3ext.h`, `sqlite3session.h` with it whenever the
+submodule is back on upstream 3.33.0. The patch is idempotent and keyed
+on the `#define SQLITE_VERSION` line so repeated runs are no-ops.
+
+## Verification
+
+After rebuild on the new amalgamation, launching the fork and letting
+Postbox sync caused `tg-korean-search.db` to grow from 190,330 rows to
+191,969 rows in roughly a minute, with the max timestamp moving from
+2026-04-17 (Tauri-era indexing cutoff) to the current instant. No
+`no such tokenizer: trigram` errors in the log. The ingest observer
+is now the authoritative source for new rows.

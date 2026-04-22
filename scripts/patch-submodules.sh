@@ -136,4 +136,24 @@ else
   echo "$POSTBOX already patched"
 fi
 
+
+# ---- (3) sqlcipher amalgamation upgrade ----
+# Upstream telegram-ios vendors sqlcipher 3.33.0 which predates the FTS5
+# trigram tokenizer (added in SQLite 3.34). Seoyu's Korean-aware FTS5
+# tables require trigram. Overwrite the submodule's amalgamation with
+# the 4.6.1 build we vendor under vendor/sqlcipher-4.6.1/.
+SQLCIPHER_SRC_DIR=submodules/telegram-ios/submodules/sqlcipher/Sources
+SQLCIPHER_HDR_DIR=submodules/telegram-ios/submodules/sqlcipher/PublicHeaders/sqlcipher
+VENDORED=vendor/sqlcipher-4.6.1
+CURRENT_SQLITE_VER=$(grep -m1 '^#define SQLITE_VERSION ' "$SQLCIPHER_SRC_DIR/sqlite3.c" | awk -F'"' '{print $2}')
+if [[ "$CURRENT_SQLITE_VER" != "3.46.1" ]]; then
+  echo "Upgrading sqlcipher amalgamation (was SQLite $CURRENT_SQLITE_VER -> 3.46.1)"
+  cp "$VENDORED/sqlite3.c"        "$SQLCIPHER_SRC_DIR/sqlite3.c"
+  cp "$VENDORED/sqlite3.h"        "$SQLCIPHER_HDR_DIR/sqlite3.h"
+  cp "$VENDORED/sqlite3ext.h"     "$SQLCIPHER_HDR_DIR/sqlite3ext.h"
+  cp "$VENDORED/sqlite3session.h" "$SQLCIPHER_HDR_DIR/sqlite3session.h"
+else
+  echo "sqlcipher amalgamation already at SQLite 3.46.1"
+fi
+
 echo "done"
