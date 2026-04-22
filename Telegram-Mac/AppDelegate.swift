@@ -460,6 +460,8 @@ class AppDelegate: NSResponder, NSApplicationDelegate, NSUserNotificationCenterD
         mw = window
         
         
+        SeoyuBridge.shared.bootstrap()
+
         #if BETA || DEBUG
         FirebaseApp.configure()
         Crashlytics.crashlytics().setCrashlyticsCollectionEnabled(true)
