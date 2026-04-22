@@ -1255,8 +1255,19 @@ class SearchController: GenericViewController<TableView>,TableViewDelegate {
                     if hits.isEmpty {
                         return .single(remote)
                     }
-                    let seoyuIds: [MessageId] = hits.map { hit in
-                        MessageId(peerId: PeerId(hit.chatId), namespace: Namespaces.Message.Cloud, id: Int32(clamping: hit.messageId))
+                    let seoyuIds: [MessageId] = hits.compactMap { hit in
+                        // The sidecar stores raw chat ids; pre-fork rows did not
+                        // use PeerId.toInt64 encoding, and PeerId(Int64) traps on
+                        // bit patterns it cannot round-trip. Skip anything that
+                        // is not obviously a PeerId.toInt64 output so the fork
+                        // does not crash on stale rows.
+                        let bits = UInt64(bitPattern: hit.chatId)
+                        let idHighBits = (bits >> 35) & 0xffffffff
+                        let legacyHigh = (bits >> 32) & 0xffffffff
+                        let lowBits = bits & 0xffffffff
+                        let isLegacyMax = legacyHigh == 0x7fffffff && lowBits == 0
+                        guard isLegacyMax || idHighBits <= 0x00ffffff else { return nil }
+                        return MessageId(peerId: PeerId(hit.chatId), namespace: Namespaces.Message.Cloud, id: Int32(clamping: hit.messageId))
                     }
                     return context.account.postbox.transaction { transaction -> [Message] in
                         return seoyuIds.compactMap { transaction.getMessage($0) }
