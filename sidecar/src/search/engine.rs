@@ -105,20 +105,13 @@ fn plan_branches(raw_query: &str) -> Vec<Branch> {
         }
     }
 
-    // 5. Chosung as a last-ditch match for users who typed a mix of
-    //    syllables and consonants. `chosung_only` on syllables is a
-    //    lossy projection; keep this lowest priority.
-    let chosung = chosung_only(trimmed);
-    if chosung != trimmed && !chosung.trim().is_empty() {
-        let chosung_q = build_fts_query(chosung.trim());
-        if trigram_ready(&chosung_q) {
-            plan.push(Branch {
-                table: "messages_fts_chosung",
-                query: chosung_q,
-                priority: 50,
-            });
-        }
-    }
+    // Chosung fallback for syllable queries is intentionally omitted.
+    // `chosung_only` on a full-syllable query collapses rich Korean into
+    // four-to-six common consonants (e.g. "오스트레" -> "ㅇㅅㅌㄹ") which
+    // matches hundreds of unrelated messages (월스트리트, 이스라엘, ...).
+    // The pure-chosung path above already handles users who explicitly
+    // type initials; anything mixed routes through plain / jamo / nospace
+    // where substring semantics stay intact.
 
     plan
 }
