@@ -1,100 +1,99 @@
-# Xcode 26 build blocker
+# Xcode 26 build blocker — RESOLVED 2026-04-22
 
-## Symptom
+Previously thought to be a wait-on-Apple blocker. Unblocked by a three-part
+local workaround that preserves the full TelegramSwift fork and requires no
+OS/Xcode downgrade.
 
-Any Swift-linking target (TelegramShare, Telegram, FocusIntents) fails at the
-`Ld` step with:
+## Symptom (original)
+
+Any Swift-linking target failed at the `Ld` step with:
 
 ```
 clang: error: no such file or directory:
   '/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-v17.5.188.0.60LGSr/Metal.xctoolchain/usr/lib/swift-5.0/macosx/libswiftAppKit.dylib'
 ```
 
-## Root cause
+## Actual root cause (revised)
 
-Xcode 26.4.1 ships on macOS 26 (Tahoe) with the Metal toolchain bundled as a
-read-only APFS cryptex mount at
-`/var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-…/Metal.xctoolchain`.
+The Swift driver on Xcode 26.4.1 injects an explicit back-deploy path to
+Swift 5.0 standard library dylibs for AppKit, Foundation etc. The path it
+picks routes through the Metal toolchain cryptex mount, which ships with no
+`usr/lib/` at all (only `usr/bin/`, `usr/metal/`, `usr/share/`). On arm64
+macOS 13+, that back-deploy path is not actually required — the relevant
+dylibs live in the system. But the driver emits the reference anyway, and
+the linker fails because the file does not exist on disk.
 
-The Swift driver's back-compat stdlib lookup routes to
-`<active-toolchain>/usr/lib/swift-5.0/macosx/` whenever a target deploys below
-macOS 10.14.4. In Xcode 26.4.1 the Metal toolchain is selected as the
-"active toolchain" for this lookup, but that bundle ships no
-`usr/lib/` directory at all (only `usr/bin/`, `usr/metal/`, `usr/share/`). The
-linker is invoked with an absolute filename that physically does not exist
-on disk.
+This is an Apple-side Swift driver bug. A local fix is to remove the bad
+argument before invoking the linker.
 
-Verified:
+## The fix (three parts)
+
+### 1. Linker shim — `scripts/ld-cryptex-shim.sh`
+
+Wrapper invoked in place of `clang` as the linker. Strips any argument
+matching `…/Metal.xctoolchain/usr/lib/swift-5.0/macosx/*` from the
+command line and execs the real clang. Wired in via xcodebuild:
 
 ```
-$ ls /var/run/com.apple.security.cryptexd/mnt/com.apple.MobileAsset.MetalToolchain-*/Metal.xctoolchain/usr/lib
-ls: .../Metal.xctoolchain/usr/lib: No such file or directory
+LD=$(pwd)/scripts/ld-cryptex-shim.sh
+LDPLUSPLUS=$(pwd)/scripts/ld-cryptex-shim.sh
 ```
 
-The cryptex is mounted read-only with an APFS seal (SSV), so a symlink
-patch inside the cryptex is impossible even with root.
+### 2. Shallow-framework fixup — `scripts/fix-shallow-frameworks.sh`
 
-## Things that do NOT fix it
+macOS 26 enforces versioned framework bundles. The `macos-*` slices of
+`FirebaseAnalytics.xcframework`, `GoogleAppMeasurement.xcframework`, and
+`GoogleAppMeasurementIdentitySupport.xcframework` ship as iOS-style
+shallow bundles. The script converts them to versioned layout in place,
+targeting the DerivedData `SourcePackages/artifacts/…` copies that SPM
+materializes. Must run before each build.
 
-Every combination of the following was tried on this project and produced
-the same error:
+### 3. Package.swift deploy-target bump
 
-- `MACOSX_DEPLOYMENT_TARGET = 13.0` in the .xcodeproj
-- `.macOS(.v12)` / `.v13` in every Package.swift in tree
-- `ARCHS=arm64 ONLY_ACTIVE_ARCH=YES` (skip x86_64 slice)
-- `-configuration Release` (debug vs release does not matter)
-- `EAGER_LINKING=NO EAGER_LINKING_REQUIRES_EMIT_TBD=NO`
-- `-toolchain com.apple.dt.toolchain.XcodeDefault` (breaks Metal shader
-  compilation, same root cause)
-- `SWIFT_USE_INTEGRATED_DRIVER=NO`
-- `SWIFT_ENABLE_EXPLICIT_MODULES=NO`
-- `sudo xcodebuild -runFirstLaunch`
-- `xcodebuild -downloadComponent MetalToolchain` (already run)
-- Fresh DerivedData + fresh SPM cache
-- Building only the `Telegram` target via `-project` (still pulls the
-  extension targets as embed deps)
+24 `submodules/telegram-ios/submodules/*/Package.swift` manifests were
+still at `.macOS(.v10_13)`. Bumped all to `.macOS(.v12)` to match the
+rest of the tree. Swift-tools-version 5.5 remains unchanged.
 
-## Paths forward
+### 4. OpenH264 staging
 
-1. **Wait for Apple**. File at https://feedbackassistant.apple.com referencing
-   the exact path + the Metal toolchain asset id
-   `com.apple.MobileAsset.MetalToolchain-v17.5.188.0.60LGSr`. Check each Xcode
-   point release.
+`core-xprojects/OpenH264/build/arm64/libopenh264.a` is produced by the
+framework build but the `Telegram.xcodeproj` references it at
+`core-xprojects/OpenH264/build/output/lib/libopenh264.a`. Copy the
+static library into the expected location once.
 
-2. **Install Xcode 16.x** *only possible on macOS ≤ 15*. Tahoe will refuse
-   to launch older Xcode. Requires downgrading the OS or dual-booting a
-   Sequoia partition.
+## Build command
 
-3. **Pivot to an overlay client** built with `swift build` + Command Line
-   Tools only. Bypasses the whole .xcodeproj / cryptex pipeline. Keeps the
-   Rust sidecar. Ships a menu-bar app with a Cmd+Shift+F Korean-search
-   overlay that deep-links into the official Telegram Desktop.
+```
+./scripts/fix-shallow-frameworks.sh
+xcodebuild build -workspace Telegram-Mac.xcworkspace -scheme Telegram \
+  -configuration Debug -destination 'generic/platform=macOS' \
+  ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+  LD=$(pwd)/scripts/ld-cryptex-shim.sh \
+  LDPLUSPLUS=$(pwd)/scripts/ld-cryptex-shim.sh
+```
 
-4. **Write a TDLib-based SwiftUI client from scratch** with `swift build`.
-   Works (no .xcodeproj = no cryptex bug) but is a ~3-month solo project
-   for even a text-only MVP.
+Result on this box (Mac arm64, macOS 26.4.1, Xcode 26.4.1): `BUILD
+SUCCEEDED`. Telegram.app launches.
 
-See the conversation handoff for which of these the project is currently
-pursuing.
+## Things that did NOT work
 
-## What upstream edits did land
+- `MACOSX_DEPLOYMENT_TARGET = 13.0` in the .xcodeproj, `.macOS(.v12)` in
+  every Package.swift, strict arch `ARCHS=arm64` — none of these changed
+  the driver's injection behaviour.
+- `TOOLCHAINS=com.apple.dt.toolchain.XcodeDefault` — skirts the cryptex
+  path but then breaks the Metal shader compile step because `metal` itself
+  lives inside the Metal.xctoolchain.
+- `VALIDATE_WORKSPACE=NO VALIDATE_PRODUCT=NO VALIDATE_DEPLOYMENT_PLATFORM=NO`
+  — does not suppress the shallow-framework check.
+- Replacing the cryptex path with the XcodeDefault back-deploy path — that
+  dylib is x86_64-only; the linker rejects it on arm64. Dropping the
+  argument is the correct move.
 
-Several upstream-level fixes are already committed because they are correct
-regardless of which path forward we take:
+## When Apple fixes this upstream
 
-- `core-xprojects/ffmpeg/ffmpeg/build.sh` — pin `FF_VERSION=7.1.1`
-- `core-xprojects/webrtc/webrtc/build.sh` — add `-Wno-error` to cmake flags
-- `configurations/*.xcconfig` — strip `APPCENTER_SECRET` and `SFEED_URL`
-- `Telegram.xcodeproj/project.pbxproj` — bump deployment target to 13.0,
-  rename bundle ids to `com.seoyu.telegram-seoyu`
-- `packages/*/Package.swift` and `submodules/telegram-ios/submodules/*/Package.swift`
-  — bump `.macOS(.v10_*)` to `.macOS(.v12)`
-- `packages/ApiCredentials/Sources/ApiCredentials/Config.swift.example` —
-  template; real `Config.swift` is gitignored and contains developer credentials
-- 981 Bazel `BUILD` files deleted from `submodules/telegram-ios/` (APFS
-  case-insensitive clash with Xcode's `build/` intermediates dir; not
-  checked in since they live inside a submodule and would be restored on
-  the next `git submodule update`)
+Once the Swift driver stops emitting the Metal cryptex path, the `LD=`
+override can be dropped. The shallow-framework fixup remains Firebase's
+responsibility — keep the script until they ship a versioned macOS slice.
 
 The `archive/tauri-v0` tag still points at the pre-fork state of the
-project if you want to roll back to the Tauri companion app.
+project if you ever need to roll back to the Tauri companion app.
