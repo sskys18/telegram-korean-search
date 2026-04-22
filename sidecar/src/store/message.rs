@@ -74,13 +74,12 @@ impl Store {
         }
         for msg in messages {
             let jamo = crate::search::hangul::decompose_jamo(&msg.text_plain);
-            let chosung = crate::search::hangul::chosung_only(&msg.text_plain);
 
             let mut stmt = self.conn.prepare(
                 "INSERT OR IGNORE INTO messages
                     (message_id, chat_id, timestamp, text_plain, text_stripped, link,
-                     text_jamo, text_chosung)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     text_jamo)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
             )?;
             stmt.bind((1, msg.message_id))?;
             stmt.bind((2, msg.chat_id))?;
@@ -92,7 +91,6 @@ impl Store {
                 None => stmt.bind((6, sqlite::Value::Null))?,
             };
             stmt.bind((7, jamo.as_str()))?;
-            stmt.bind((8, chosung.as_str()))?;
             stmt.next()?;
 
             // Check if the row was actually inserted (not a duplicate)
@@ -128,13 +126,6 @@ impl Store {
                     "text_jamo",
                     msg_rowid,
                     &jamo,
-                )?;
-                fts_insert(
-                    &self.conn,
-                    "messages_fts_chosung",
-                    "text_chosung",
-                    msg_rowid,
-                    &chosung,
                 )?;
             }
         }

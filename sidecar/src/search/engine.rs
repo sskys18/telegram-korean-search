@@ -1,7 +1,7 @@
 use crate::store::message::{strip_whitespace, Cursor, MessageWithChat};
 use crate::store::Store;
 
-use super::hangul::{chosung_only, contains_bare_jamo, decompose_jamo, looks_like_chosung_query};
+use super::hangul::{contains_bare_jamo, decompose_jamo};
 use super::highlight::find_highlights;
 use super::{SearchItem, SearchResult};
 
@@ -27,7 +27,7 @@ fn build_fts_query(query: &str) -> String {
 
 /// One planned hit against a specific FTS5 index. `priority` is used
 /// by the SQL side to rank results: lower is better, so exact
-/// `text_plain` matches rank above jamo or chosung fallbacks.
+/// `text_plain` matches rank above jamo or nospace fallbacks.
 struct Branch {
     table: &'static str,
     query: String,
@@ -41,20 +41,6 @@ struct Branch {
 fn plan_branches(raw_query: &str) -> Vec<Branch> {
     let trimmed = raw_query.trim();
     if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    // 1. Chosung-only query (ㅅㅅㅈㅈ) — only the chosung index will
-    //    ever match, so skip the other branches.
-    if looks_like_chosung_query(trimmed) {
-        let q = build_fts_query(trimmed);
-        if trigram_ready(&q) {
-            return vec![Branch {
-                table: "messages_fts_chosung",
-                query: q,
-                priority: 40,
-            }];
-        }
         return Vec::new();
     }
 
@@ -104,14 +90,6 @@ fn plan_branches(raw_query: &str) -> Vec<Branch> {
             });
         }
     }
-
-    // Chosung fallback for syllable queries is intentionally omitted.
-    // `chosung_only` on a full-syllable query collapses rich Korean into
-    // four-to-six common consonants (e.g. "오스트레" -> "ㅇㅅㅌㄹ") which
-    // matches hundreds of unrelated messages (월스트리트, 이스라엘, ...).
-    // The pure-chosung path above already handles users who explicitly
-    // type initials; anything mixed routes through plain / jamo / nospace
-    // where substring semantics stay intact.
 
     plan
 }
@@ -415,17 +393,6 @@ mod tests {
     }
 
     #[test]
-    fn korean_chosung_only_query() {
-        let store = korean_store();
-        let result = search(&store, "ㅅㅅㅈㅈ", &SearchScope::All, None, None).unwrap();
-        let ids: Vec<i64> = result.items.iter().map(|i| i.message_id).collect();
-        assert!(
-            ids.contains(&1),
-            "expected 삼성전자 via chosung, got {ids:?}"
-        );
-    }
-
-    #[test]
     fn korean_bare_jamo_query() {
         // `ㅅㅏㅁ` should match `삼` via the jamo index.
         let store = korean_store();
@@ -435,13 +402,6 @@ mod tests {
             ids.contains(&1) || ids.contains(&2),
             "expected 삼-prefixed row via jamo, got {ids:?}"
         );
-    }
-
-    #[test]
-    fn plan_branches_routes_chosung_only() {
-        let plan = plan_branches("ㅅㅅㅈㅈ");
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].table, "messages_fts_chosung");
     }
 
     #[test]

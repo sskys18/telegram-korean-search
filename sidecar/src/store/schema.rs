@@ -61,6 +61,29 @@ pub fn run_migrations(conn: &Connection) -> Result<(), sqlite::Error> {
     // Phase 6: Korean-aware auxiliary indexes (jamo, chosung, nospace)
     migrate_korean_indexes(conn)?;
 
+    // Phase 7: Drop the chosung-only index and column. In practice the
+    // chosung fallback produced far more noise than signal on short
+    // full-syllable queries, and we removed the query planner branch;
+    // keep the database tidy to match.
+    migrate_drop_chosung(conn)?;
+
+    Ok(())
+}
+
+fn migrate_drop_chosung(conn: &Connection) -> Result<(), sqlite::Error> {
+    if get_schema_version(conn) >= 7 {
+        return Ok(());
+    }
+
+    conn.execute("DROP TABLE IF EXISTS messages_fts_chosung")?;
+
+    if column_exists(conn, "messages", "text_chosung")? {
+        // DROP COLUMN requires SQLite 3.35+. sqlcipher ships 3.46.1.
+        conn.execute("ALTER TABLE messages DROP COLUMN text_chosung")?;
+    }
+
+    conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '7')")?;
+
     Ok(())
 }
 
