@@ -1273,17 +1273,26 @@ class SearchController: GenericViewController<TableView>,TableViewDelegate {
                         return seoyuIds.compactMap { transaction.getMessage($0) }
                     }
                     |> map { seoyuMessages -> ([ChatListSearchEntry], Bool, SearchMessagesState?, SearchMessagesResult?) in
-                        var entries = remote.0
+                        var messageEntries: [(Message, CombinedPeerReadState?, MessageHistoryThreadData?)] = []
+                        var otherEntries: [ChatListSearchEntry] = []
                         var seen = Set<MessageId>()
-                        for entry in entries {
-                            if case let .message(message, _, _, _, _) = entry {
-                                seen.insert(message.id)
+                        for entry in remote.0 {
+                            if case let .message(message, _, readState, threadInfo, _) = entry {
+                                if seen.insert(message.id).inserted {
+                                    messageEntries.append((message, readState, threadInfo))
+                                }
+                            } else {
+                                otherEntries.append(entry)
                             }
                         }
-                        var index = 30001
-                        for message in seoyuMessages where !seen.contains(message.id) {
-                            entries.append(.message(message, query, nil, nil, index))
-                            seen.insert(message.id)
+                        for message in seoyuMessages where seen.insert(message.id).inserted {
+                            messageEntries.append((message, nil, nil))
+                        }
+                        messageEntries.sort { $0.0.timestamp > $1.0.timestamp }
+                        var entries = otherEntries
+                        var index = 20001
+                        for (message, readState, threadInfo) in messageEntries {
+                            entries.append(.message(message, query, readState, threadInfo, index))
                             index += 1
                         }
                         return (entries, remote.1, remote.2, remote.3)
