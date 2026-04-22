@@ -30,7 +30,6 @@ public final class SeoyuBridge {
             ).appendingPathComponent("telegram-korean-search", isDirectory: true)
             try fm.createDirectory(at: base, withIntermediateDirectories: true)
             let dbPath = base.appendingPathComponent("tg-korean-search.db").path
-
             let instance = try Seoyu(dbPath: dbPath)
             let version = instance.version()
             NSLog("[seoyu] opened store at %@, sidecar version %@", dbPath, version)

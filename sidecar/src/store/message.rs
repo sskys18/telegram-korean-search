@@ -51,7 +51,27 @@ pub fn strip_whitespace(text: &str) -> String {
 
 impl Store {
     pub fn insert_messages_batch(&self, messages: &[MessageRow]) -> Result<(), sqlite::Error> {
+        // Clean up any transaction leftover from a previous failed call so
+        // this one does not hit "cannot start a transaction within a
+        // transaction". Ignore the error if no txn is active.
+        let _ = self.conn.execute("ROLLBACK");
         self.conn.execute("BEGIN")?;
+        let result = (|| -> Result<(), sqlite::Error> {
+        // Satisfy the FK from messages.chat_id -> chats.chat_id without
+        // requiring callers to call upsert_chat first. The shell (Swift)
+        // mirror may upsert a richer ChatInfo later; this stub keeps
+        // ingestion unblocked when it does not.
+        let mut seen_chats: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for msg in messages {
+            if seen_chats.insert(msg.chat_id) {
+                let mut stmt = self.conn.prepare(
+                    "INSERT OR IGNORE INTO chats (chat_id, title, chat_type, username, access_hash, is_excluded)
+                     VALUES (?, '', 'dm', NULL, NULL, 0)",
+                )?;
+                stmt.bind((1, msg.chat_id))?;
+                stmt.next()?;
+            }
+        }
         for msg in messages {
             let jamo = crate::search::hangul::decompose_jamo(&msg.text_plain);
             let chosung = crate::search::hangul::chosung_only(&msg.text_plain);
@@ -118,8 +138,18 @@ impl Store {
                 )?;
             }
         }
-        self.conn.execute("COMMIT")?;
-        Ok(())
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     pub fn get_message(
