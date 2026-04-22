@@ -2,15 +2,27 @@
 name = "telegram-seoyu-sidecar"
 version = "0.0.1"
 edition = "2021"
-description = "Korean search + wiki sidecar for telegram-seoyu"
+description = "Korean search + wiki core for telegram-seoyu"
 license = "MIT"
+build = "build.rs"
 
 [[bin]]
 name = "tg-seoyu-sidecar"
 path = "src/bin/main.rs"
 
+[[bin]]
+# CLI wrapper around `uniffi_bindgen::bindgen_main` so the Xcode
+# build phase can run `cargo run --bin uniffi-bindgen generate ...`
+# to emit Swift bindings next to the Xcode project. Not shipped.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+required-features = []
+
 [lib]
 name = "seoyu"
+# `cdylib` + `staticlib` are what the Swift side links against;
+# `rlib` keeps the crate usable from our own binaries and tests.
+crate-type = ["cdylib", "staticlib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]
@@ -27,3 +39,8 @@ rand = "0.8"
 zeroize = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+uniffi = { version = "0.31", features = ["cli"] }
+thiserror = "2"
+
+[build-dependencies]
+uniffi = { version = "0.31", features = ["build"] }

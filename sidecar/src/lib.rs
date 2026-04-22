@@ -11,4 +11,9 @@ pub mod logging;
 pub mod search;
 pub mod security;
 pub mod store;
+pub mod uniffi_api;
 pub mod wiki;
+
+// Emit the UniFFI scaffolding. Must come after the `uniffi_api` module
+// is declared so the proc-macro sees the exported types.
+uniffi::setup_scaffolding!("seoyu");

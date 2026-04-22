@@ -6,6 +6,9 @@ sidecar/target/
 node_modules/
 dist/
 
+# UniFFI Swift bindings (generated from the sidecar cdylib)
+sidecar/target/swift-bindings/
+
 # macOS
 .DS_Store
 .AppleDouble
