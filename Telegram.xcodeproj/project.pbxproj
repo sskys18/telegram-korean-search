@@ -1003,6 +1003,7 @@
 		27FE779C26F4AE4400E1C90B /* SmartThemePreviewRowItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27FE779B26F4AE4400E1C90B /* SmartThemePreviewRowItem.swift */; };
 		27FFCEC52694BA58006CA024 /* WidgetAppearance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27FFCEC42694BA58006CA024 /* WidgetAppearance.swift */; };
 		27FFCEC72694BC95006CA024 /* WidgetController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27FFCEC62694BC95006CA024 /* WidgetController.swift */; };
+		959B19D8EAA529E4134A05F7 /* SeoyuIngestObserver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AA70EE27AEF60CFE8EEF1F1 /* SeoyuIngestObserver.swift */; };
 		9F0367F0227208E000456348 /* QRCode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0367EF227208E000456348 /* QRCode.swift */; };
 		9F0367F22272108800456348 /* ProxyQRCodeRowItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0367F12272108800456348 /* ProxyQRCodeRowItem.swift */; };
 		9F0368012277091800456348 /* LAnimationButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0368002277091800456348 /* LAnimationButton.swift */; };
@@ -1738,6 +1739,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		1AA70EE27AEF60CFE8EEF1F1 /* SeoyuIngestObserver.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SeoyuIngestObserver.swift; sourceTree = "<group>"; };
 		2700B21F273ADC08003E4018 /* HotKey */ = {isa = PBXFileReference; lastKnownFileType = folder; name = HotKey; path = packages/HotKey; sourceTree = "<group>"; };
 		270202BE261A1BF500CFCE6D /* PaymentsTipsRowItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PaymentsTipsRowItem.swift; sourceTree = "<group>"; };
 		270202C2261B3D3100CFCE6D /* CurrencyUITextFieldDelegate.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = CurrencyUITextFieldDelegate.swift; sourceTree = "<group>"; };
@@ -6914,6 +6916,7 @@
 			isa = PBXGroup;
 			children = (
 				6D7CA564C2448EAC50105F96 /* SeoyuBridge.swift */,
+				1AA70EE27AEF60CFE8EEF1F1 /* SeoyuIngestObserver.swift */,
 			);
 			name = Seoyu;
 			path = Seoyu;
@@ -8740,6 +8743,7 @@
 				C253E2311DE34FBB0022A29F /* AudioPlayerController.swift in Sources */,
 				276154852C12EF620090BFFC /* Star_TransactionRowItem.swift in Sources */,
 				CE55300AA5883F0787100DDD /* SeoyuBridge.swift in Sources */,
+				959B19D8EAA529E4134A05F7 /* SeoyuIngestObserver.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

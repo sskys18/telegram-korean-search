@@ -1,4 +1,6 @@
 import Foundation
+import Postbox
+import SwiftSignalKit
 import Seoyu
 
 /// Process-wide handle to the Rust sidecar. Opened once on app launch.
@@ -9,6 +11,7 @@ public final class SeoyuBridge {
 
     public private(set) var seoyu: Seoyu?
     public private(set) var initializationError: Error?
+    private var ingestDisposable: Disposable?
 
     private init() {}
 
@@ -36,6 +39,17 @@ public final class SeoyuBridge {
             NSLog("[seoyu] bootstrap failed: %@", String(describing: error))
             self.initializationError = error
         }
+    }
+
+    /// Install the global Postbox observer that mirrors every stored or
+    /// updated message into Seoyu. Safe to call multiple times per
+    /// postbox; subsequent calls replace the previous observer so the
+    /// sidecar only ever sees a single ingest stream.
+    public func attach(postbox: Postbox) {
+        guard let seoyu else { return }
+        self.ingestDisposable?.dispose()
+        let observer = SeoyuIngestObserver(seoyu: seoyu)
+        self.ingestDisposable = postbox.installGlobalStoreOrUpdateMessageAction(action: observer)
     }
 
     /// Run a global Korean-aware search. Returns an empty list if the

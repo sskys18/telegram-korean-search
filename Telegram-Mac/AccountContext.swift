@@ -697,6 +697,9 @@ final class AccountContext {
         self.engine = TelegramEngine(account: account)
         self.isSupport = isSupport
         #if !SHARE
+        SeoyuBridge.shared.attach(postbox: account.postbox)
+        #endif
+        #if !SHARE
         self.inAppPurchaseManager = .init(engine: engine)
         
         
