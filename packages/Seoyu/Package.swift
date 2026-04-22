@@ -51,7 +51,7 @@ if hasXcframework {
 
 let package = Package(
     name: "Seoyu",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v12)],
     products: [
         .library(name: "Seoyu", targets: ["Seoyu"])
     ],

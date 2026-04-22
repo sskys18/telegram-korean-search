@@ -6,7 +6,7 @@ import PackageDescription
 let package = Package(
     name: "Spotlight",
     platforms: [
-        .macOS(.v10_11)
+        .macOS(.v12)
     ],
     products: [
         .library(
