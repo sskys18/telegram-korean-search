@@ -22,18 +22,25 @@ Build `telegram-seoyu`: macOS Telegram client with Korean substring search and a
   - `core-xprojects/OpenH264/build/arm64/libopenh264.a` copied to `…/build/output/lib/` as the xcodeproj expects
 - All 10 C/C++ frameworks compiled (`core-xprojects/{OpenH264,openssl,libopus,libvpx,Mozjpeg,libwebp,dav1d,ffmpeg,webrtc,tde2e}/build/`)
 
+### Swift ↔ sidecar integration (live)
+- `packages/Seoyu` is a local SPM dep of the Telegram target; UniFFI symbols link into Telegram.app (commit `e1dbb4469`).
+- `Telegram-Mac/Seoyu/SeoyuBridge.swift` — singleton, opens the sqlite store under Application Support on app launch via `AppDelegate` (commit `6276657c2`).
+- `SearchController.prepareEntries()` wraps `remoteSearch` with a mapToSignal that asks `SeoyuBridge.search(...)`, materializes `Message`s via `postbox.transaction.getMessage`, de-dupes by `MessageId`, and appends as extra `ChatListSearchEntry.message` rows (commit `02cee2a53`).
+- `SeoyuIngestObserver` is attached via `installGlobalStoreOrUpdateMessageAction` from `AccountContext.init`, so every stored or updated Postbox message is mirrored into Seoyu's FTS5 index (commit `f23e5aaad`). The DB file grows in real time on app launch.
+
 ### Not yet wired
-- **Swift shell ↔ sidecar integration** — the Telegram fork builds and launches, but it does not yet call into the Seoyu xcframework. Next concrete step: hook `Dialogs::Widget::searchMessages` equivalent (`SearchController.prepareEntries()` in this codebase) to call `seoyu.search(...)` via UniFFI and merge hits.
-- **Message ingest** — Postbox sync needs to fan out into `seoyu.index(...)` for each new message. Likely hook: `addMessages` in `Postbox`.
-- **Xcode project integration of Seoyu** — add `packages/Seoyu` as an SPM local dep of Telegram target. Currently untouched.
 - **Wiki panel UI** — no Swift code yet.
+- **Chat-scoped search** — the merge is global; per-chat search still falls back to native only.
+- **Historical backfill** — the observer only sees messages that flow through `addMessages` after the observer is installed. Older messages are only indexed if they pass through Postbox again (edit, repair sync, etc.). A one-shot crawler over existing peers would be valuable.
 
 ## Resume Here
 
-1. Run `./scripts/fix-shallow-frameworks.sh` once (needed after every fresh DerivedData or SPM resolve).
-2. `./scripts/build-seoyu-xcframework.sh` to (re)build the Rust side as an xcframework.
-3. `xcodebuild build -workspace Telegram-Mac.xcworkspace -scheme Telegram -configuration Debug -destination 'generic/platform=macOS' ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO LD=$(pwd)/scripts/ld-cryptex-shim.sh LDPLUSPLUS=$(pwd)/scripts/ld-cryptex-shim.sh` to rebuild Telegram.app.
-4. Add `packages/Seoyu` as a local package dep of the `Telegram` target in `Telegram.xcodeproj`. Plan to wire the search-merge call from the search controller.
+1. `./scripts/patch-submodules.sh` once per fresh `git submodule update` (bumps deploy targets + reinstalls the Postbox global-observer patch).
+2. `./scripts/fix-shallow-frameworks.sh` once per fresh DerivedData or SPM resolve (Firebase/Google xcframework macos slices are shallow on disk).
+3. `./scripts/build-seoyu-xcframework.sh` to (re)build the Rust side.
+4. `xcodebuild build -workspace Telegram-Mac.xcworkspace -scheme Telegram -configuration Debug -destination 'generic/platform=macOS' ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO LD=$(pwd)/scripts/ld-cryptex-shim.sh LDPLUSPLUS=$(pwd)/scripts/ld-cryptex-shim.sh`.
+
+Next substantive work is the wiki panel and a historical backfill over existing peers so Seoyu sees messages that predate the observer install.
 
 ## Decisions
 - **UniFFI over IPC as primary bridge**: picked in commit `48d215712`. IPC stays in tree for debugging but Swift shell calls UniFFI direct.
