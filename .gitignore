@@ -1,16 +1,31 @@
 # Rust
 target/
-src-tauri/target/
-src-tauri/gen/
+sidecar/target/
 
-# Node
+# Node (leftover from archive/tauri-v0; not used any more)
 node_modules/
 dist/
+
+# UniFFI Swift bindings (generated from the sidecar cdylib)
+sidecar/target/swift-bindings/
+
+# Xcode-generated build output in the package / submodule tree
+# (landing targets; not the upstream source)
+build/
+packages/*/build/
+submodules/telegram-ios/submodules/*/build/
+submodules/telegram-ios/third-party/*/build/
+
+# Xcode workspace SPM state (regenerated on every resolve)
+Telegram.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+Telegram-Mac.xcworkspace/xcshareddata/swiftpm/
 
 # macOS
 .DS_Store
 .AppleDouble
 .LSOverride
+xcuserdata
+xcuserstate
 
 # IDE
 .idea/
@@ -24,6 +39,10 @@ dist/
 .env.*
 session.bin
 *.key
+*.session
+
+# Private API credentials — use Config.example.swift as a template
+packages/ApiCredentials/Sources/ApiCredentials/Config.swift
 
 # Logs
 *.log
@@ -31,3 +50,20 @@ session.bin
 # Conductor workspace
 .context/
 .conductor/
+
+# TelegramSwift build output
+fastlane/README.md
+fastlane/report.xml
+core-xprojects/Mozjpeg/build
+core-xprojects/openssl/build
+core-xprojects/libwebp/build
+core-xprojects/libopus/build
+core-xprojects/ffmpeg/build
+core-xprojects/webrtc/build
+core-xprojects/libvpx/build
+core-xprojects/OpenH264/build
+core-xprojects/dav1d/build
+core-xprojects/tde2e/build
+submodules/libwebp/SharedHeaders
+submodules/Mozjpeg/SharedHeaders
+submodules/OpenSSLEncryptionProvider/SharedHeaders
