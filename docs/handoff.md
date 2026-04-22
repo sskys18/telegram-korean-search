@@ -1,6 +1,6 @@
 # Session Handoff
-> Generated: 2026-04-22 (after sqlcipher 4.6.1 drop-in, chosung removal,
-> Korean search shipping live on the TelegramSwift fork).
+> Generated: 2026-04-22 (after sqlcipher 4.6.1 drop-in, Korean search
+> shipping live on the TelegramSwift fork).
 
 ## Task
 Build `telegram-seoyu`: macOS Telegram client with Korean substring search and
@@ -22,11 +22,9 @@ an LLM-generated wiki. Fork of `overtake/TelegramSwift` + Rust sidecar
 
 ### Sidecar
 - 100 lib + 4 integration tests, clippy clean.
-- Schema at **v7** (chosung column and its FTS5 table dropped — the
-  fallback produced more noise than signal on short full-syllable
-  queries).
+- Schema at **v7**.
 - Search planner branches: plain → nospace → jamo. Explicit jamo and
-  nospace routes still exist; chosung is gone.
+  nospace routes.
 - FTS5 trigram runs on sqlcipher 4.6.1 (SQLite 3.46.1) — enabled via
   the vendored amalgamation at `vendor/sqlcipher-4.6.1/`.
 - `insert_messages_batch` now rolls back on mid-batch error and
@@ -128,10 +126,6 @@ xcodebuild build -workspace Telegram-Mac.xcworkspace -scheme Telegram \
   paid Apple Dev account yet).
 - **Work around the Xcode 26 cryptex bug locally** via `ld-cryptex-shim`.
   See `docs/XCODE26-BLOCKER.md`.
-- **Drop chosung entirely** — the false-positive rate on short
-  syllable queries (`오스트레` → `ㅇㅅㅌㄹ`) matched too many
-  unrelated messages to be useful. Schema v7 removes the column and
-  the FTS5 table. Pure chosung shortcuts are no longer supported.
 - **Timestamp-descending sort** for merged search: Telegram server
   orders by relevance, which interleaved year-old hits with today's
   results. The merged output sorts message entries newest-first.

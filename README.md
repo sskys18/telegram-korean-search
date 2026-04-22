@@ -12,15 +12,14 @@ next.
 
 Telegram's search ignores Korean substrings. `삼성` does not match `삼성전자`.
 Inserted or missing whitespace (`삼성 전자` vs `삼성전자`) misses further.
-초성 (`ㅅㅅㅈㅈ`) and jamo (`ㅅㅏㅁ`) searches do not work at all. This project
-replaces the search bar behavior with a Korean-aware local index and adds a
-side-panel wiki that summarizes chatter across your channels.
+Jamo (`ㅅㅏㅁ`) searches do not work at all. This project replaces the search
+bar behavior with a Korean-aware local index and adds a side-panel wiki that
+summarizes chatter across your channels.
 
 ## Features
 
 - Korean substring search — `삼성` finds `삼성전자`
 - Whitespace-insensitive matching — `삼성 전자` finds `삼성전자`
-- 초성 search — `ㅅㅅㅈㅈ` finds `삼성전자`
 - 자모 decomposition search — `ㅅㅏㅁ` finds `삼성`
 - English substring search
 - Local FTS5 index over every message stored in Postbox
@@ -42,7 +41,7 @@ side-panel wiki that summarizes chatter across your channels.
 │  telegram-seoyu sidecar (Rust, MIT)      │
 │   ├── SQLite mirror (messages + FTS5)    │
 │   ├── Korean normalizer (trigram / jamo  │
-│   │   / chosung / nospace)               │
+│   │   / nospace)                         │
 │   ├── search engine                      │
 │   └── wiki pipeline (codex exec)         │
 └──────────────────────────────────────────┘

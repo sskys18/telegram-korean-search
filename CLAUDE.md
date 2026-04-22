@@ -41,7 +41,7 @@ Results merge inside `SearchController.prepareEntries()`.
 - **IPC**: Unix socket, JSON-RPC (not yet implemented)
 - **Storage (sidecar)**: SQLite with WAL mode
 - **Search (sidecar)**: SQLite FTS5 trigram tokenizer + Korean-specific
-  auxiliary columns (jamo, 초성, nospace)
+  auxiliary columns (jamo, nospace)
 - **LLM**: `codex exec` CLI subprocess (o4-mini for classification, gpt-5.4
   for summaries) — default. Other backends pluggable later.
 - **Session security**: AES-256-GCM, macOS Keychain (retained from the
@@ -121,10 +121,10 @@ exits. The IPC server is the next piece to land.
 ## Korean search plan
 
 The existing FTS5 trigram tokenizer handles English substring and basic
-Korean substring, but not jamo decomposition, 초성, or whitespace-insensitive
+Korean substring, but not jamo decomposition or whitespace-insensitive
 matching. The extension, landing in a dedicated phase, adds:
 
-1. `messages_fts` auxiliary columns: `jamo`, `chosung`, `nospace`.
+1. `messages_fts` auxiliary columns: `jamo`, `nospace`.
 2. Rust normalizer (no external lib; Hangul codepoint math).
 3. Multi-query search: issue `MATCH` against each column, UNION, rank.
 4. Backfill existing rows in a schema migration (v5).

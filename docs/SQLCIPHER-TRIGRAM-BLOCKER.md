@@ -43,7 +43,7 @@ $ nm …/Telegram.debug.dylib | grep 'T _sqlite3_libversion'
    design intact.
 2. **Drop trigram from the sidecar schema** and switch to a tokenizer
    sqlcipher 3.33 already ships (`unicode61` with `remove_diacritics 2`).
-   Substring / 초성 / nospace queries would need to fall back to `LIKE`
+   Substring / nospace queries would need to fall back to `LIKE`
    for short inputs (crate already has `search_messages_like_*`).
    Cheaper than (1) but regresses the plan documented in CLAUDE.md.
 3. **Namespace rename the sidecar's SQLite** so the two copies do not
