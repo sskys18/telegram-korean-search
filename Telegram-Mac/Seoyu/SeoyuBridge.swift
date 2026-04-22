@@ -37,4 +37,23 @@ public final class SeoyuBridge {
             self.initializationError = error
         }
     }
+
+    /// Run a global Korean-aware search. Returns an empty list if the
+    /// sidecar is not initialized or the call fails so callers can
+    /// treat this as a best-effort augmentation of native search.
+    public func search(query: String, limit: UInt32 = 50) -> [SearchHit] {
+        guard let seoyu, !query.isEmpty else { return [] }
+        do {
+            let page = try seoyu.search(
+                query: query,
+                scope: .all,
+                limit: limit,
+                cursor: nil
+            )
+            return page.items
+        } catch {
+            NSLog("[seoyu] search failed for %@: %@", query, String(describing: error))
+            return []
+        }
+    }
 }

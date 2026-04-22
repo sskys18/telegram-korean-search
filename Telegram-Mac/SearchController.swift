@@ -12,6 +12,7 @@ import SwiftSignalKit
 import Postbox
 import TelegramCore
 import InAppSettings
+import Seoyu
 
 extension SearchMessagesLocation {
     func withUpdatedSouce(_ source: SearchController.MessaagesSourceValue) -> SearchMessagesLocation {
@@ -1248,9 +1249,39 @@ class SearchController: GenericViewController<TableView>,TableViewDelegate {
                     }
                 }
                 
+                let seoyuAugmented: Signal<([ChatListSearchEntry], Bool, SearchMessagesState?, SearchMessagesResult?), NoError>
+                seoyuAugmented = remoteSearch |> mapToSignal { remote -> Signal<([ChatListSearchEntry], Bool, SearchMessagesState?, SearchMessagesResult?), NoError> in
+                    let hits = SeoyuBridge.shared.search(query: query)
+                    if hits.isEmpty {
+                        return .single(remote)
+                    }
+                    let seoyuIds: [MessageId] = hits.map { hit in
+                        MessageId(peerId: PeerId(hit.chatId), namespace: Namespaces.Message.Cloud, id: Int32(clamping: hit.messageId))
+                    }
+                    return context.account.postbox.transaction { transaction -> [Message] in
+                        return seoyuIds.compactMap { transaction.getMessage($0) }
+                    }
+                    |> map { seoyuMessages -> ([ChatListSearchEntry], Bool, SearchMessagesState?, SearchMessagesResult?) in
+                        var entries = remote.0
+                        var seen = Set<MessageId>()
+                        for entry in entries {
+                            if case let .message(message, _, _, _, _) = entry {
+                                seen.insert(message.id)
+                            }
+                        }
+                        var index = 30001
+                        for message in seoyuMessages where !seen.contains(message.id) {
+                            entries.append(.message(message, query, nil, nil, index))
+                            seen.insert(message.id)
+                            index += 1
+                        }
+                        return (entries, remote.1, remote.2, remote.3)
+                    }
+                }
+
                 let foundRemoteMessages: Signal<([ChatListSearchEntry], Bool, SearchMessagesState?, SearchMessagesResult?), NoError>
-                
-                foundRemoteMessages = !options.contains(.messages) ? .single(([], false, nil, nil)) : .single(([], true, nil, nil)) |> then(remoteSearch)
+
+                foundRemoteMessages = !options.contains(.messages) ? .single(([], false, nil, nil)) : .single(([], true, nil, nil)) |> then(seoyuAugmented)
 
                 
                 
