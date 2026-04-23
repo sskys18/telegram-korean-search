@@ -1004,6 +1004,7 @@
 		27FFCEC52694BA58006CA024 /* WidgetAppearance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27FFCEC42694BA58006CA024 /* WidgetAppearance.swift */; };
 		27FFCEC72694BC95006CA024 /* WidgetController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27FFCEC62694BC95006CA024 /* WidgetController.swift */; };
 		2AEFBE2FEB9729E2DF44EF49 /* WikiLocale.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6BD979333AC71E797E0BA24 /* WikiLocale.swift */; };
+		447AA92904D655C313551BB9 /* WikiTabController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B674F485C92DD789394BA4AA /* WikiTabController.swift */; };
 		959B19D8EAA529E4134A05F7 /* SeoyuIngestObserver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AA70EE27AEF60CFE8EEF1F1 /* SeoyuIngestObserver.swift */; };
 		9F0367F0227208E000456348 /* QRCode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0367EF227208E000456348 /* QRCode.swift */; };
 		9F0367F22272108800456348 /* ProxyQRCodeRowItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0367F12272108800456348 /* ProxyQRCodeRowItem.swift */; };
@@ -2860,6 +2861,7 @@
 		A7F2831A239A496400742C20 /* ContextShowPeersHolder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContextShowPeersHolder.swift; sourceTree = "<group>"; };
 		A7F28336239A808500742C20 /* TemplateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TemplateController.swift; sourceTree = "<group>"; };
 		A843DC01B098D9A9CEB63574 /* WikiObserverBridge.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WikiObserverBridge.swift; sourceTree = "<group>"; };
+		B674F485C92DD789394BA4AA /* WikiTabController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WikiTabController.swift; sourceTree = "<group>"; };
 		C2016F3A1EAA4538003AF981 /* RecentPeerRowItem.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = RecentPeerRowItem.swift; sourceTree = "<group>"; };
 		C2016F431EAA4967003AF981 /* pt-BR */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "pt-BR"; path = "pt-BR.lproj/ShareViewController.strings"; sourceTree = "<group>"; };
 		C2016F451EAA4967003AF981 /* pt-BR */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "pt-BR"; path = "pt-BR.lproj/Localizable.strings"; sourceTree = "<group>"; };
@@ -6932,6 +6934,7 @@
 			children = (
 				D6BD979333AC71E797E0BA24 /* WikiLocale.swift */,
 				A843DC01B098D9A9CEB63574 /* WikiObserverBridge.swift */,
+				B674F485C92DD789394BA4AA /* WikiTabController.swift */,
 			);
 			name = Wiki;
 			path = "Telegram-Mac/Seoyu/Wiki";
@@ -8761,6 +8764,7 @@
 				959B19D8EAA529E4134A05F7 /* SeoyuIngestObserver.swift in Sources */,
 				2AEFBE2FEB9729E2DF44EF49 /* WikiLocale.swift in Sources */,
 				F1BF513EC5DEF718ED3E90E4 /* WikiObserverBridge.swift in Sources */,
+				447AA92904D655C313551BB9 /* WikiTabController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
