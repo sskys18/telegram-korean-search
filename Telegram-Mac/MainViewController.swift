@@ -282,6 +282,8 @@ final class UpdateTabController: GenericViewController<UpdateTabView> {
 }
 
 
+private final class WikiTitlebarAccessory: NSTitlebarAccessoryViewController {}
+
 class MainViewController: TelegramViewController {
 
     let chatList: ChatListController
@@ -403,17 +405,18 @@ class MainViewController: TelegramViewController {
         wikiPanelView.addSubview(panelChild)
 
         wikiToggleButton.title = ""
-        wikiToggleButton.bezelStyle = .circular
-        wikiToggleButton.isBordered = true
-        wikiToggleButton.setButtonType(.momentaryPushIn)
+        wikiToggleButton.bezelStyle = .texturedRounded
+        wikiToggleButton.isBordered = false
+        wikiToggleButton.setButtonType(.momentaryChange)
         wikiToggleButton.target = self
         wikiToggleButton.action = #selector(toggleWikiPanel)
-        let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+        let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
         wikiToggleButton.image = NSImage(systemSymbolName: "book.closed", accessibilityDescription: "Wiki")?
             .withSymbolConfiguration(cfg)
         wikiToggleButton.imagePosition = .imageOnly
-        wikiToggleButton.toolTip = "Wiki (Cmd+Shift+W)"
-        addSubview(wikiToggleButton)
+        wikiToggleButton.toolTip = "Wiki"
+
+        installWikiTitlebarAccessory()
 
         layoutWikiPanel(animated: false)
         if FastSettings.wikiPanelShown {
@@ -421,16 +424,23 @@ class MainViewController: TelegramViewController {
         }
     }
 
-    private func layoutWikiPanel(animated: Bool) {
-        let buttonSize: CGFloat = 28
-        let inset: CGFloat = 12
-        wikiToggleButton.frame = NSRect(
-            x: bounds.width - buttonSize - inset,
-            y: bounds.height - buttonSize - inset,
-            width: buttonSize,
-            height: buttonSize
-        )
+    private func installWikiTitlebarAccessory() {
+        let window = context.window
+        // Avoid double-install.
+        if window.titlebarAccessoryViewControllers.contains(where: { ($0 as? WikiTitlebarAccessory) != nil }) {
+            return
+        }
 
+        let accessory = WikiTitlebarAccessory()
+        accessory.layoutAttribute = .trailing
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 40, height: 28))
+        wikiToggleButton.frame = NSRect(x: 6, y: 2, width: 28, height: 24)
+        host.addSubview(wikiToggleButton)
+        accessory.view = host
+        window.addTitlebarAccessoryViewController(accessory)
+    }
+
+    private func layoutWikiPanel(animated: Bool) {
         let shown = FastSettings.wikiPanelShown
         let targetX = shown ? bounds.width - Self.wikiPanelWidth : bounds.width
         let targetFrame = NSRect(x: targetX, y: 0, width: Self.wikiPanelWidth, height: bounds.height)
