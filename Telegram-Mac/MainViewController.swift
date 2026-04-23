@@ -773,7 +773,16 @@ class MainViewController: TelegramViewController {
         self.chatList = ChatListController(context, mode: .plain)
         self.contacts = NavigationViewController(ContactsController(context), context.window)
         if let seoyu = SeoyuBridge.shared.seoyu {
-            let wiki = NavigationViewController(WikiTabController(seoyu: seoyu), context.window)
+            let openChat: (Int64, Int64) -> Void = { [weak context] chatId, messageId in
+                guard let context = context else { return }
+                let peerId = PeerId(chatId)
+                let mid = MessageId(peerId: peerId, namespace: Namespaces.Message.Cloud, id: Int32(messageId))
+                context.bindings.rootNavigation().push(
+                    ChatController(context: context, chatLocation: .peer(peerId), focusTarget: .init(messageId: mid)),
+                    true
+                )
+            }
+            let wiki = NavigationViewController(WikiTabController(seoyu: seoyu, openChat: openChat), context.window)
             wiki.applyAppearOnLoad = false
             wiki.hasBarRightBorder = true
             wiki.hasBarLeftBorder = true
