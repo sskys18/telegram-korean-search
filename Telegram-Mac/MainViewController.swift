@@ -284,6 +284,12 @@ final class UpdateTabController: GenericViewController<UpdateTabView> {
 
 private final class WikiTitlebarAccessory: NSTitlebarAccessoryViewController {}
 
+private final class WikiWindowDelegate: NSObject, NSWindowDelegate {
+    let onClose: () -> Void
+    init(onClose: @escaping () -> Void) { self.onClose = onClose }
+    func windowWillClose(_ notification: Notification) { onClose() }
+}
+
 class MainViewController: TelegramViewController {
 
     let chatList: ChatListController
@@ -294,10 +300,9 @@ class MainViewController: TelegramViewController {
     private let phoneCalls:RecentCallsViewController
 
     private var wikiTabController: WikiTabController?
-    private let wikiPanelView = NSView()
     private let wikiToggleButton = NSButton()
-    private var wikiEscMonitor: Any?
-    private static let wikiPanelWidth: CGFloat = 380
+    private var wikiWindow: NSWindow?
+    private var wikiWindowDelegate: WikiWindowDelegate?
     private let layoutDisposable:MetaDisposable = MetaDisposable()
     private let badgeCountDisposable: MetaDisposable = MetaDisposable()
     private let tooltipDisposable = MetaDisposable()
@@ -310,7 +315,6 @@ class MainViewController: TelegramViewController {
         self.navigation.frame = bounds
         self.contacts.frame = bounds
         updateController.updateLayout(context.layout, parentSize: size, isChatList: true)
-        layoutWikiPanel(animated: false)
     }
     
     override func loadView() {
@@ -390,21 +394,7 @@ class MainViewController: TelegramViewController {
     }
     
     private func setupWikiPanel() {
-        guard let wiki = self.wikiTabController else { return }
-        guard let host = context.window.contentView else { return }
-
-        wikiPanelView.wantsLayer = true
-        wikiPanelView.layer?.backgroundColor = theme.colors.background.cgColor
-        wikiPanelView.layer?.borderWidth = 1
-        wikiPanelView.layer?.borderColor = theme.colors.border.cgColor
-        wikiPanelView.isHidden = !FastSettings.wikiPanelShown
-        wikiPanelView.autoresizingMask = [.minXMargin, .height]
-        host.addSubview(wikiPanelView)
-
-        let panelChild = wiki.view
-        panelChild.frame = NSRect(x: 0, y: 0, width: Self.wikiPanelWidth, height: host.bounds.height)
-        panelChild.autoresizingMask = [.width, .height]
-        wikiPanelView.addSubview(panelChild)
+        guard self.wikiTabController != nil else { return }
 
         wikiToggleButton.title = ""
         wikiToggleButton.bezelStyle = .texturedRounded
@@ -420,19 +410,18 @@ class MainViewController: TelegramViewController {
 
         installWikiTitlebarAccessory()
 
-        layoutWikiPanel(animated: false)
         if FastSettings.wikiPanelShown {
-            installWikiEscMonitor()
+            DispatchQueue.main.async { [weak self] in
+                self?.openWikiWindow()
+            }
         }
     }
 
     private func installWikiTitlebarAccessory() {
         let window = context.window
-        // Avoid double-install.
         if window.titlebarAccessoryViewControllers.contains(where: { ($0 as? WikiTitlebarAccessory) != nil }) {
             return
         }
-
         let accessory = WikiTitlebarAccessory()
         accessory.layoutAttribute = .trailing
         let host = NSView(frame: NSRect(x: 0, y: 0, width: 40, height: 28))
@@ -442,59 +431,61 @@ class MainViewController: TelegramViewController {
         window.addTitlebarAccessoryViewController(accessory)
     }
 
-    private func layoutWikiPanel(animated: Bool) {
-        guard let host = context.window.contentView else { return }
-        let shown = FastSettings.wikiPanelShown
-        let hostBounds = host.bounds
-        let targetX = shown ? hostBounds.width - Self.wikiPanelWidth : hostBounds.width
-        let targetFrame = NSRect(x: targetX, y: 0, width: Self.wikiPanelWidth, height: hostBounds.height)
-
-        if shown {
-            wikiPanelView.isHidden = false
-        }
-
-        if animated {
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.18
-                wikiPanelView.animator().frame = targetFrame
-            }, completionHandler: { [weak self] in
-                if !FastSettings.wikiPanelShown {
-                    self?.wikiPanelView.isHidden = true
-                }
-            })
-        } else {
-            wikiPanelView.frame = targetFrame
-            if !shown { wikiPanelView.isHidden = true }
-        }
-    }
-
     @objc private func toggleWikiPanel() {
-        let next = !FastSettings.wikiPanelShown
-        FastSettings.wikiPanelShown = next
-        layoutWikiPanel(animated: true)
-        if next {
-            installWikiEscMonitor()
+        if let w = wikiWindow, w.isVisible {
+            closeWikiWindow()
         } else {
-            removeWikiEscMonitor()
+            openWikiWindow()
         }
     }
 
-    private func installWikiEscMonitor() {
-        guard wikiEscMonitor == nil else { return }
-        wikiEscMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == 53, FastSettings.wikiPanelShown {
-                self?.toggleWikiPanel()
-                return nil
+    private func openWikiWindow() {
+        guard let wiki = wikiTabController else { return }
+        if wikiWindow == nil {
+            let saved = NSRectFromString(UserDefaults.standard.string(forKey: "seoyu.wiki.window.frame") ?? "")
+            let initial: NSRect = saved.size.width > 0
+                ? saved
+                : NSRect(x: 0, y: 0, width: 420, height: 700)
+            let window = NSWindow(
+                contentRect: initial,
+                styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "Wiki"
+            window.isReleasedWhenClosed = false
+            window.minSize = NSSize(width: 320, height: 420)
+            let content = NSView(frame: window.contentLayoutRect)
+            content.autoresizingMask = [.width, .height]
+            let child = wiki.view
+            child.frame = content.bounds
+            child.autoresizingMask = [.width, .height]
+            content.addSubview(child)
+            window.contentView = content
+            if saved.size.width == 0 {
+                window.center()
             }
-            return event
+            let delegate = WikiWindowDelegate { [weak self] in
+                self?.handleWikiWindowClosed()
+            }
+            self.wikiWindowDelegate = delegate
+            window.delegate = delegate
+            self.wikiWindow = window
         }
+        wikiWindow?.makeKeyAndOrderFront(nil)
+        FastSettings.wikiPanelShown = true
     }
 
-    private func removeWikiEscMonitor() {
-        if let m = wikiEscMonitor {
-            NSEvent.removeMonitor(m)
-            wikiEscMonitor = nil
+    private func closeWikiWindow() {
+        wikiWindow?.orderOut(nil)
+        FastSettings.wikiPanelShown = false
+    }
+
+    private func handleWikiWindowClosed() {
+        if let frame = wikiWindow?.frame {
+            UserDefaults.standard.set(NSStringFromRect(frame), forKey: "seoyu.wiki.window.frame")
         }
+        FastSettings.wikiPanelShown = false
     }
 
     private func showCallsTab() {
@@ -912,6 +903,6 @@ class MainViewController: TelegramViewController {
         prefDisposable.dispose()
         settingsDisposable.dispose()
         filterMenuDisposable.dispose()
-        removeWikiEscMonitor()
+        wikiWindow?.close()
     }
 }
