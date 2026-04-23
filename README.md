@@ -10,6 +10,8 @@ result list alongside Telegram's native server search.
 **Status:** Dev build live. Unsigned, macOS 26 arm64 only.
 Latest release → **[v0.4.0-dev](https://github.com/sskys18/telegram-korean-search/releases/latest)**.
 
+[한국어 README](README.ko.md)
+
 ## What it fixes
 
 Telegram's native search is English-first. Korean queries suffer in three
