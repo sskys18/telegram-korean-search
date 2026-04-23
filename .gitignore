@@ -67,3 +67,4 @@ core-xprojects/tde2e/build
 submodules/libwebp/SharedHeaders
 submodules/Mozjpeg/SharedHeaders
 submodules/OpenSSLEncryptionProvider/SharedHeaders
+.worktrees/
