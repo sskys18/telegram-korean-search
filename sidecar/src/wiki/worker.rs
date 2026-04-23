@@ -40,6 +40,25 @@ impl EventEmitter for NoopEmitter {
     fn wiki_stopped(&self, _: &str) {}
 }
 
+/// Emitter that logs every event via `log::*`. This is the default
+/// used by the UniFFI-exposed worker before a real Swift-facing
+/// progress callback channel exists.
+pub struct LogEmitter;
+
+impl EventEmitter for LogEmitter {
+    fn wiki_progress(&self, processed: u64, pending: u64, total: u64) {
+        log::info!(
+            "wiki progress: processed={processed} pending={pending} total={total}"
+        );
+    }
+    fn wiki_error(&self, message: &str, recoverable: bool) {
+        log::warn!("wiki error (recoverable={recoverable}): {message}");
+    }
+    fn wiki_stopped(&self, reason: &str) {
+        log::info!("wiki stopped: {reason}");
+    }
+}
+
 /// Handle used to interact with a running worker.
 pub struct WorkerHandle {
     pub shutdown: Arc<AtomicBool>,
