@@ -391,16 +391,18 @@ class MainViewController: TelegramViewController {
     
     private func setupWikiPanel() {
         guard let wiki = self.wikiTabController else { return }
+        guard let host = context.window.contentView else { return }
 
         wikiPanelView.wantsLayer = true
         wikiPanelView.layer?.backgroundColor = theme.colors.background.cgColor
         wikiPanelView.layer?.borderWidth = 1
         wikiPanelView.layer?.borderColor = theme.colors.border.cgColor
         wikiPanelView.isHidden = !FastSettings.wikiPanelShown
-        addSubview(wikiPanelView)
+        wikiPanelView.autoresizingMask = [.minXMargin, .height]
+        host.addSubview(wikiPanelView)
 
         let panelChild = wiki.view
-        panelChild.frame = NSRect(x: 0, y: 0, width: Self.wikiPanelWidth, height: bounds.height)
+        panelChild.frame = NSRect(x: 0, y: 0, width: Self.wikiPanelWidth, height: host.bounds.height)
         panelChild.autoresizingMask = [.width, .height]
         wikiPanelView.addSubview(panelChild)
 
@@ -441,9 +443,11 @@ class MainViewController: TelegramViewController {
     }
 
     private func layoutWikiPanel(animated: Bool) {
+        guard let host = context.window.contentView else { return }
         let shown = FastSettings.wikiPanelShown
-        let targetX = shown ? bounds.width - Self.wikiPanelWidth : bounds.width
-        let targetFrame = NSRect(x: targetX, y: 0, width: Self.wikiPanelWidth, height: bounds.height)
+        let hostBounds = host.bounds
+        let targetX = shown ? hostBounds.width - Self.wikiPanelWidth : hostBounds.width
+        let targetFrame = NSRect(x: targetX, y: 0, width: Self.wikiPanelWidth, height: hostBounds.height)
 
         if shown {
             wikiPanelView.isHidden = false
