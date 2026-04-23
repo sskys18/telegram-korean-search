@@ -10,6 +10,14 @@ pub struct WikiCategory {
     pub sort_order: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CategoryWithCount {
+    pub id: i64,
+    pub name: String,
+    pub name_ko: Option<String>,
+    pub topic_count: i64,
+}
+
 /// Common aliases that should merge into the same category.
 /// Maps normalized form → canonical name.
 const KNOWN_ALIASES: &[(&[&str], &str)] = &[
@@ -614,6 +622,27 @@ impl Store {
     pub fn clear_wiki_categories(&self) -> Result<(), sqlite::Error> {
         self.conn().execute("DELETE FROM wiki_categories")?;
         Ok(())
+    }
+
+    /// All categories with their topic counts, ordered by topic count
+    /// descending. Used by the Swift wiki panel's category list.
+    pub fn get_categories_with_counts(&self) -> Result<Vec<CategoryWithCount>, sqlite::Error> {
+        let mut stmt = self.conn().prepare(
+            "SELECT c.category_id, c.name, c.name_ko,
+                    (SELECT COUNT(*) FROM wiki_topics t WHERE t.category_id = c.category_id)
+             FROM wiki_categories c
+             ORDER BY topic_count DESC",
+        )?;
+        let mut out = Vec::new();
+        while let sqlite::State::Row = stmt.next()? {
+            out.push(CategoryWithCount {
+                id: stmt.read::<i64, _>(0)?,
+                name: stmt.read::<String, _>(1)?,
+                name_ko: stmt.read::<Option<String>, _>(2)?,
+                topic_count: stmt.read::<i64, _>(3)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Resolve a category and return both the id and canonical name.

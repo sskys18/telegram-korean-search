@@ -84,6 +84,30 @@ impl Store {
             .execute("DELETE FROM topic_channel_membership")?;
         Ok(())
     }
+
+    /// Count of distinct topics and of total topic-message links whose
+    /// underlying message has `timestamp >= since_ts`. The
+    /// `wiki_topic_messages` table does not store a timestamp, so we
+    /// join to `messages` for the filter.
+    pub fn wiki_counts_since(&self, since_ts: i64) -> Result<(i64, i64), sqlite::Error> {
+        let mut stmt = self.conn().prepare(
+            "SELECT
+                (SELECT COUNT(DISTINCT wtm.topic_id)
+                 FROM wiki_topic_messages wtm
+                 JOIN messages m
+                   ON m.chat_id = wtm.chat_id AND m.message_id = wtm.message_id
+                 WHERE m.timestamp >= ?1),
+                (SELECT COUNT(*)
+                 FROM wiki_topic_messages wtm
+                 JOIN messages m
+                   ON m.chat_id = wtm.chat_id AND m.message_id = wtm.message_id
+                 WHERE m.timestamp >= ?1)
+            ",
+        )?;
+        stmt.bind((1, since_ts))?;
+        stmt.next()?;
+        Ok((stmt.read::<i64, _>(0)?, stmt.read::<i64, _>(1)?))
+    }
 }
 
 #[cfg(test)]

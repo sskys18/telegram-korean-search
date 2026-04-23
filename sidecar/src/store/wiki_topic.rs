@@ -374,6 +374,50 @@ impl Store {
         self.conn().execute("DELETE FROM wiki_topics")?;
         Ok(())
     }
+
+    /// Latest messages linked to a topic, newest first. Uses LEFT JOIN
+    /// on `chats` so a message whose chat row is missing still renders
+    /// (with an empty title) instead of vanishing.
+    pub fn get_topic_messages(
+        &self,
+        topic_id: i64,
+        limit: usize,
+    ) -> Result<Vec<TopicMessageRow>, sqlite::Error> {
+        let mut stmt = self.conn().prepare(format!(
+            "SELECT m.chat_id, m.message_id, m.timestamp, m.text_plain, m.link,
+                    COALESCE(c.title, '')
+             FROM wiki_topic_messages wtm
+             JOIN messages m ON m.chat_id = wtm.chat_id
+                             AND m.message_id = wtm.message_id
+             LEFT JOIN chats c ON c.chat_id = m.chat_id
+             WHERE wtm.topic_id = ?
+             ORDER BY m.timestamp DESC
+             LIMIT {limit}",
+        ))?;
+        stmt.bind((1, topic_id))?;
+        let mut out = Vec::new();
+        while let sqlite::State::Row = stmt.next()? {
+            out.push(TopicMessageRow {
+                chat_id: stmt.read::<i64, _>(0)?,
+                message_id: stmt.read::<i64, _>(1)?,
+                timestamp: stmt.read::<i64, _>(2)?,
+                text: stmt.read::<String, _>(3)?,
+                link: stmt.read::<Option<String>, _>(4)?,
+                chat_title: stmt.read::<String, _>(5)?,
+            });
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TopicMessageRow {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub timestamp: i64,
+    pub text: String,
+    pub link: Option<String>,
+    pub chat_title: String,
 }
 
 fn read_wiki_topic(stmt: &sqlite::Statement) -> Result<WikiTopic, sqlite::Error> {
