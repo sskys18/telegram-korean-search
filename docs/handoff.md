@@ -66,7 +66,9 @@ build verification to merge time on the main tree.
    into the Telegram target (or run a `xcodeproj` ruby script following
    the pattern from the prior `feat(wiki): WikiTabController scaffold`
    pbxproj diff).
-4. **Build the Telegram scheme** (not `All`). Verify mtime fresh:
+4. **Build via** `./scripts/build-dev.sh --run` (preferred — wires
+   `ld-cryptex-shim.sh` for Xcode 26 Metal cryptex bug). Or in Xcode,
+   build the **Telegram** scheme (not `All`). Verify mtime fresh:
    ```
    stat -f "%Sm" ~/Library/Developer/Xcode/DerivedData/Telegram-Mac-basjkgxsmvqzctcrxcuexrxbttgq/Build/Products/Debug/Telegram.app/Contents/MacOS/Telegram
    ```
