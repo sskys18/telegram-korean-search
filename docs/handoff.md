@@ -76,11 +76,9 @@ the sidecar side (see `sidecar/src/wiki/`):
 
 ### Concrete next steps
 
-1. **Worker loop**. The worker is class-only today — schedule it from
-   `SeoyuBridge.attach` on a background thread so newly indexed
-   messages are classified without user intervention. Drop any
-   result / progress onto a Seoyu-side `Signal` (or broadcast log) so
-   the Swift side can show "N messages processed" without polling.
+1. **Worker loop — done (2026-04-23)**. Worker autostarts from
+   `SeoyuBridge.attach` with a `LogEmitter`. Progress plumbing to Swift
+   is deferred to a follow-up plan; logs via `log::info!` only.
 2. **Wiki panel UI**. Add a sidebar / tab inside the fork that lists
    trending topics, opens a topic detail view with the bilingual
    article, and lets the user click through to the source messages
