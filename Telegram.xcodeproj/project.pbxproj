@@ -1671,6 +1671,7 @@
 		D0E82E002500F10E00E09A20 /* MergedAvatarsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0E82DFF2500F10E00E09A20 /* MergedAvatarsView.swift */; };
 		D0FCA7622434867400B72F18 /* PeerInfoHeadItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0FCA7612434867400B72F18 /* PeerInfoHeadItem.swift */; };
 		D0FFC4AC23E184BA0044D305 /* ChatListFilterController.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0FFC4AB23E184BA0044D305 /* ChatListFilterController.swift */; };
+		F1BF513EC5DEF718ED3E90E4 /* WikiObserverBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A843DC01B098D9A9CEB63574 /* WikiObserverBridge.swift */; };
 		F6F92CE307942704C1334B4F /* Seoyu in Frameworks */ = {isa = PBXBuildFile; productRef = 6DD898CE7577719A3978051F /* Seoyu */; };
 /* End PBXBuildFile section */
 
@@ -2858,6 +2859,7 @@
 		A7F283092395570400742C20 /* SearchSettingsController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchSettingsController.swift; sourceTree = "<group>"; };
 		A7F2831A239A496400742C20 /* ContextShowPeersHolder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContextShowPeersHolder.swift; sourceTree = "<group>"; };
 		A7F28336239A808500742C20 /* TemplateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TemplateController.swift; sourceTree = "<group>"; };
+		A843DC01B098D9A9CEB63574 /* WikiObserverBridge.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WikiObserverBridge.swift; sourceTree = "<group>"; };
 		C2016F3A1EAA4538003AF981 /* RecentPeerRowItem.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = RecentPeerRowItem.swift; sourceTree = "<group>"; };
 		C2016F431EAA4967003AF981 /* pt-BR */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "pt-BR"; path = "pt-BR.lproj/ShareViewController.strings"; sourceTree = "<group>"; };
 		C2016F451EAA4967003AF981 /* pt-BR */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "pt-BR"; path = "pt-BR.lproj/Localizable.strings"; sourceTree = "<group>"; };
@@ -6929,6 +6931,7 @@
 			isa = PBXGroup;
 			children = (
 				D6BD979333AC71E797E0BA24 /* WikiLocale.swift */,
+				A843DC01B098D9A9CEB63574 /* WikiObserverBridge.swift */,
 			);
 			name = Wiki;
 			path = "Telegram-Mac/Seoyu/Wiki";
@@ -8757,6 +8760,7 @@
 				CE55300AA5883F0787100DDD /* SeoyuBridge.swift in Sources */,
 				959B19D8EAA529E4134A05F7 /* SeoyuIngestObserver.swift in Sources */,
 				2AEFBE2FEB9729E2DF44EF49 /* WikiLocale.swift in Sources */,
+				F1BF513EC5DEF718ED3E90E4 /* WikiObserverBridge.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
