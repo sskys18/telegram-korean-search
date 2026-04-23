@@ -176,7 +176,6 @@ public final class WikiTabController: ViewController {
         if let current = pageStack.last {
             current.view.removeFromSuperview()
         }
-        addChild(child)
         child.view.translatesAutoresizingMaskIntoConstraints = false
         containerView.addSubview(child.view)
         NSLayoutConstraint.activate([
@@ -194,7 +193,6 @@ public final class WikiTabController: ViewController {
         while pageStack.count > 1 {
             let top = pageStack.removeLast()
             top.view.removeFromSuperview()
-            top.removeFromParent()
         }
         if let root = pageStack.last {
             root.view.translatesAutoresizingMaskIntoConstraints = false

@@ -3,19 +3,17 @@
 //! The FTS5 trigram tokenizer matches any three-codepoint substring.
 //! That handles `삼성` → `삼성전자` out of the box because both the
 //! indexed string and the query contain the same syllable code
-//! points. It does *not* handle three important Korean patterns:
+//! points. It does *not* handle two important Korean patterns:
 //!
 //! 1. **자모 (jamo) input** — a user types `ㅅㅏㅁ` expecting to match
 //!    `삼`. The syllable `삼` is one Unicode codepoint, not three.
-//! 2. **초성 (chosung / consonant-only) input** — `ㅅㅅㅈㅈ` should
-//!    match `삼성전자`. Again a single-codepoint syllable vs. many.
-//! 3. **Whitespace** — `삼성 전자` should match `삼성전자`. The
+//! 2. **Whitespace** — `삼성 전자` should match `삼성전자`. The
 //!    existing `text_stripped` column already has this; this module
 //!    only needs to normalize the query to match.
 //!
-//! The strategy here is to pre-compute *two extra searchable forms*
-//! of every message at index time — `text_jamo` and `text_chosung` —
-//! using the compatibility-jamo alphabet (U+3131–U+314E / U+314F–U+3163)
+//! The strategy here is to pre-compute one extra searchable form of
+//! every message at index time — `text_jamo` — using the
+//! compatibility-jamo alphabet (U+3131–U+314E / U+314F–U+3163)
 //! that typing a Korean keyboard produces. The query is run through
 //! the same normalizers before going to FTS5, so the query and the
 //! index always speak the same alphabet. No external Hangul library
@@ -94,42 +92,6 @@ pub fn decompose_jamo(text: &str) -> String {
     out
 }
 
-/// Return only the initial consonant of each Hangul syllable (as a
-/// compat-jamo character). Non-Hangul code points pass through
-/// unchanged so mixed Korean/English still works. `삼성전자` becomes
-/// `ㅅㅅㅈㅈ`.
-pub fn chosung_only(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if is_hangul_syllable(c) {
-            let (cho, _, _) = split_syllable(c);
-            out.push(cho);
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// True if the whole string is made of characters a user would type
-/// *only* to express an initial-consonant pattern (compat-jamo
-/// consonants, spaces, a couple of digits). Used by the query planner
-/// to decide whether to route a query to the chosung index.
-pub fn looks_like_chosung_query(query: &str) -> bool {
-    let mut saw_consonant = false;
-    for c in query.chars() {
-        if c.is_whitespace() {
-            continue;
-        }
-        if CHOSEONG_COMPAT.contains(&c) {
-            saw_consonant = true;
-            continue;
-        }
-        return false;
-    }
-    saw_consonant
-}
-
 /// True if the string contains any standalone compat-jamo. A mixed
 /// query like `ㅅ전자` still benefits from the jamo index because
 /// the bare jamo won't match the syllable form.
@@ -160,32 +122,6 @@ mod tests {
     #[test]
     fn decomposes_mixed_text() {
         assert_eq!(decompose_jamo("삼성 galaxy"), "ㅅㅏㅁㅅㅓㅇ galaxy");
-    }
-
-    #[test]
-    fn non_hangul_passes_through_chosung() {
-        assert_eq!(chosung_only("hello world"), "hello world");
-    }
-
-    #[test]
-    fn chosung_extracts_initials() {
-        assert_eq!(chosung_only("삼성전자"), "ㅅㅅㅈㅈ");
-        assert_eq!(chosung_only("대한민국"), "ㄷㅎㅁㄱ");
-    }
-
-    #[test]
-    fn chosung_mixed_content() {
-        assert_eq!(chosung_only("삼성 Galaxy S24"), "ㅅㅅ Galaxy S24");
-    }
-
-    #[test]
-    fn detects_chosung_query() {
-        assert!(looks_like_chosung_query("ㅅㅅㅈㅈ"));
-        assert!(looks_like_chosung_query("ㅅ ㅅ ㅈ ㅈ"));
-        assert!(!looks_like_chosung_query("삼성"));
-        assert!(!looks_like_chosung_query("ㅅ전자"));
-        assert!(!looks_like_chosung_query(""));
-        assert!(!looks_like_chosung_query("galaxy"));
     }
 
     #[test]

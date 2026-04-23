@@ -72,14 +72,5 @@ fn index_then_korean_search_round_trip() {
         "expected 삼성전자 row via partial match, got {ids:?}"
     );
 
-    let chosung_page = seoyu
-        .search("ㅅㅅㅈㅈ".into(), SearchScope::All, 30, None)
-        .expect("chosung search");
-    let chosung_ids: Vec<i64> = chosung_page.items.iter().map(|h| h.message_id).collect();
-    assert!(
-        chosung_ids.contains(&1),
-        "expected 삼성전자 via chosung, got {chosung_ids:?}"
-    );
-
     let _ = std::fs::remove_file(&path);
 }

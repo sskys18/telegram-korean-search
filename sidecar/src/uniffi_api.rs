@@ -202,7 +202,7 @@ impl Seoyu {
     }
 
     /// Mirror a batch of messages into the local store, populating
-    /// every FTS5 auxiliary index (plain, nospace, jamo, chosung).
+    /// every FTS5 auxiliary index (plain, nospace, jamo).
     /// Returns the number of inputs accepted (duplicates are
     /// silently skipped by `INSERT OR IGNORE`).
     pub fn index_messages(&self, messages: Vec<IndexedMessage>) -> Result<u64, SeoyuError> {

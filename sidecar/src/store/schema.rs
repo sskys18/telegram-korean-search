@@ -58,13 +58,12 @@ pub fn run_migrations(conn: &Connection) -> Result<(), sqlite::Error> {
     // Phase 5: Merge duplicate wiki categories
     migrate_merge_duplicate_categories(conn)?;
 
-    // Phase 6: Korean-aware auxiliary indexes (jamo, chosung, nospace)
+    // Phase 6: Korean-aware auxiliary indexes (jamo, nospace)
     migrate_korean_indexes(conn)?;
 
-    // Phase 7: Drop the chosung-only index and column. In practice the
-    // chosung fallback produced far more noise than signal on short
-    // full-syllable queries, and we removed the query planner branch;
-    // keep the database tidy to match.
+    // Phase 7: Clean up the chosung column/table for installs that
+    // already ran an earlier v6 (which created them). Fresh v6 in
+    // this codebase no longer creates chosung in the first place.
     migrate_drop_chosung(conn)?;
 
     Ok(())
@@ -98,26 +97,16 @@ fn migrate_korean_indexes(conn: &Connection) -> Result<(), sqlite::Error> {
     if !column_exists(conn, "messages", "text_jamo")? {
         conn.execute("ALTER TABLE messages ADD COLUMN text_jamo TEXT NOT NULL DEFAULT ''")?;
     }
-    if !column_exists(conn, "messages", "text_chosung")? {
-        conn.execute("ALTER TABLE messages ADD COLUMN text_chosung TEXT NOT NULL DEFAULT ''")?;
-    }
 
-    // Backfill the new columns from the existing text_plain in
-    // batches of 500 so we never hold a huge prepared statement in
-    // memory. Skip rows that already have a value (migration replay
-    // after a crash).
+    // Backfill the new column from the existing text_plain in batches
+    // of 500 so we never hold a huge prepared statement in memory.
+    // Skip rows that already have a value (migration replay after a
+    // crash).
     backfill_korean_columns(conn)?;
 
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_jamo USING fts5(
             text_jamo,
-            content='messages',
-            tokenize='trigram case_sensitive 0'
-        )",
-    )?;
-    conn.execute(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_chosung USING fts5(
-            text_chosung,
             content='messages',
             tokenize='trigram case_sensitive 0'
         )",
@@ -133,7 +122,6 @@ fn migrate_korean_indexes(conn: &Connection) -> Result<(), sqlite::Error> {
     // External-content FTS5 reads the column from `messages` on
     // rebuild, so the backfilled values are what gets indexed.
     conn.execute("INSERT INTO messages_fts_jamo(messages_fts_jamo) VALUES('rebuild')")?;
-    conn.execute("INSERT INTO messages_fts_chosung(messages_fts_chosung) VALUES('rebuild')")?;
     conn.execute("INSERT INTO messages_fts_nospace(messages_fts_nospace) VALUES('rebuild')")?;
 
     conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '6')")?;
@@ -158,7 +146,7 @@ fn backfill_korean_columns(conn: &Connection) -> Result<(), sqlite::Error> {
         {
             let mut stmt = conn.prepare(
                 "SELECT rowid, text_plain FROM messages
-                 WHERE text_jamo = '' AND text_chosung = ''
+                 WHERE text_jamo = ''
                  LIMIT ?",
             )?;
             stmt.bind((1, BATCH as i64))?;
@@ -173,12 +161,9 @@ fn backfill_korean_columns(conn: &Connection) -> Result<(), sqlite::Error> {
         conn.execute("BEGIN")?;
         for (rowid, text) in &rows {
             let jamo = crate::search::hangul::decompose_jamo(text);
-            let chosung = crate::search::hangul::chosung_only(text);
-            let mut stmt = conn
-                .prepare("UPDATE messages SET text_jamo = ?, text_chosung = ? WHERE rowid = ?")?;
+            let mut stmt = conn.prepare("UPDATE messages SET text_jamo = ? WHERE rowid = ?")?;
             stmt.bind((1, jamo.as_str()))?;
-            stmt.bind((2, chosung.as_str()))?;
-            stmt.bind((3, *rowid))?;
+            stmt.bind((2, *rowid))?;
             stmt.next()?;
         }
         conn.execute("COMMIT")?;
