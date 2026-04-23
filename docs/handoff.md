@@ -1,169 +1,126 @@
 # Session Handoff
-> Generated: 2026-04-22 (after sqlcipher 4.6.1 drop-in, Korean search
-> shipping live on the TelegramSwift fork).
+> Generated: 2026-04-23 (Phase 3-5 inline execution)
 
 ## Task
-Build `telegram-seoyu`: macOS Telegram client with Korean substring search and
-an LLM-generated wiki. Fork of `overtake/TelegramSwift` + Rust sidecar
-(`sidecar/`), bridged via UniFFI (`packages/Seoyu/`).
+Ship wiki panel UI Phase 3-5 on `wiki-feature` branch. User chose
+**option 2** from prior handoff: write Swift in worktree, defer Xcode
+build verification to merge time on the main tree.
 
 ## Status
 
-### Proven end-to-end
-- Fork builds on macOS 26 + Xcode 26.4.1, launches, authenticates,
-  syncs Postbox.
-- Seoyu bridge opens its sqlite store on app launch.
-- Postbox observer fires for every `addMessages`, sidecar rows grow in
-  real time. Observed during login: **0 → 14k+ rows in minutes**.
-- `SearchController.prepareEntries()` merges Seoyu hits with Telegram's
-  native search, de-dupes by `MessageId`, sorts the merged list by
-  message timestamp descending, and surfaces extra 한글 hits the server
-  alone does not produce.
+### Completed on branch `wiki-feature` (24 commits ahead of `main`)
 
-### Sidecar
-- 100 lib + 4 integration tests, clippy clean.
-- Schema at **v7**.
-- Search planner branches: plain → nospace → jamo. Explicit jamo and
-  nospace routes.
-- FTS5 trigram runs on sqlcipher 4.6.1 (SQLite 3.46.1) — enabled via
-  the vendored amalgamation at `vendor/sqlcipher-4.6.1/`.
-- `insert_messages_batch` now rolls back on mid-batch error and
-  auto-inserts a stub chat row so the FK check never stalls ingest.
+**Phase 3 — trending list** (commit `feat(wiki): trending list + digest + category chips`):
+- `Telegram-Mac/Seoyu/Wiki/WikiListViewController.swift` — table backed by
+  `seoyu.wikiTrending(...)`, throttled reload on `.seoyuWikiTopicsChanged`,
+  language-swap on `.seoyuWikiLanguageChanged`, optional `seed:` init for
+  search results, empty-state label, progress placeholder.
+- `Telegram-Mac/Seoyu/Wiki/WikiDigestCardView.swift` — "N topics · M msgs
+  today" + hot-topic strip; hides when digest empty.
+- `Telegram-Mac/Seoyu/Wiki/WikiCategoryChipsView.swift` — chip row with
+  "All" + first 6 + overflow expander, accent-tinted selection.
+- `Telegram-Mac/Seoyu/Wiki/WikiTabController.swift` — replaced placeholder
+  with push-based nav stack (`push(_:)`, `popToRoot()`).
 
-### Swift ↔ sidecar
-- `packages/Seoyu` is a local SPM dep of the Telegram target.
-- `Telegram-Mac/Seoyu/SeoyuBridge.swift` — singleton + lazy bootstrap
-  from `AppDelegate.applicationDidFinishLaunching`.
-- `Telegram-Mac/Seoyu/SeoyuIngestObserver.swift` — `StoreOrUpdateMessageAction`
-  conformer that mirrors every message into `seoyu.indexMessages`.
-- `SeoyuBridge.attach(postbox:)` installs the observer from
-  `AccountContext.init`, gated with `#if !SHARE`.
-- `SearchController.prepareEntries()` wraps the remote search signal
-  with a mapToSignal that asks `SeoyuBridge.search(...)` for extra
-  hits, materializes them through `postbox.transaction.getMessage`,
-  and merges into the entry list in timestamp-descending order.
-  It also filters out chat ids that are not valid `PeerId.toInt64`
-  outputs (stale Tauri-era rows would crash `PeerId(Int64)` in Debug).
+**Phase 4 — article view** (commit `feat(wiki): article view + source-message navigation`):
+- `Telegram-Mac/Seoyu/Wiki/MarkdownRenderer.swift` — in-tree md →
+  `NSAttributedString`. Supports `#`/`##`, `**bold**`, `*italic*`,
+  inline `` `code` ``, bullets (`-`/`*`), paragraphs. No deps.
+- `Telegram-Mac/Seoyu/Wiki/WikiSourceCellView.swift` — two-line source
+  cell using `RelativeDateTimeFormatter`.
+- `Telegram-Mac/Seoyu/Wiki/WikiArticleViewController.swift` — title +
+  scrollable rendered article + sources table. Click source → invokes
+  `openChat(chatId, messageId)` closure.
+- `Telegram-Mac/MainViewController.swift:776` — passes an `openChat`
+  closure that pushes `ChatController(... focusTarget: .init(messageId:))`
+  via `context.bindings.rootNavigation()`.
 
-### Build plumbing
-- `scripts/ld-cryptex-shim.sh` — strips the Swift driver's bogus
-  Metal-cryptex back-deploy dylib path (Xcode 26 bug).
-- `scripts/fix-shallow-frameworks.sh` — converts Firebase /
-  GoogleAppMeasurement xcframework `macos-*` slices from shallow to
-  versioned bundles (needed because macOS 26 enforces versioned
-  layout).
-- `scripts/patch-submodules.sh` — bumps submodule `Package.swift`
-  deploy targets, installs the Postbox global observer patch, and
-  replaces the vendored sqlcipher amalgamation with 4.6.1 (all
-  idempotent).
-- `scripts/build-seoyu-xcframework.sh` — builds the Rust sidecar and
-  bundles it as `packages/Seoyu/SeoyuFFI.xcframework`.
+**Phase 5 — polish** (commit `feat(wiki): toolbar + progress/error banners`):
+- WikiTabController toolbar: EN/KO toggle, Search (modal sheet → seeded
+  `WikiListViewController`), Run classify (`seoyu.wikiRunPendingNow()`,
+  enabled iff `pendingCount > 0`).
+- WikiListViewController: top dismissible error banner (recoverable=false),
+  bottom auto-dismissing 3s toast (recoverable=true).
 
-## Resume Here — the wiki panel is next
+### NOT done (deferred, requires real build env)
 
-Everything up to and including Korean search is live. The remaining
-product work is the wiki feature. Pipeline is already implemented on
-the sidecar side (see `sidecar/src/wiki/`):
+- **`Telegram.xcodeproj/project.pbxproj` updates** — six new files added
+  in this session are NOT in the pbxproj yet:
+  - `Telegram-Mac/Seoyu/Wiki/WikiListViewController.swift`
+  - `Telegram-Mac/Seoyu/Wiki/WikiDigestCardView.swift`
+  - `Telegram-Mac/Seoyu/Wiki/WikiCategoryChipsView.swift`
+  - `Telegram-Mac/Seoyu/Wiki/MarkdownRenderer.swift`
+  - `Telegram-Mac/Seoyu/Wiki/WikiSourceCellView.swift`
+  - `Telegram-Mac/Seoyu/Wiki/WikiArticleViewController.swift`
+- **Xcode build verification** — worktree env still missing libwebp /
+  ffmpeg / webrtc xcframeworks per prior handoff. Build moves to the
+  main tree post-merge.
+- **P5.T3 smoke test** — needs running app.
 
-- `wiki/llm.rs` wraps `codex exec` subprocess (o4-mini for topic
-  classification, gpt-5.4 for summary rendering).
-- `wiki/worker.rs` classifies queued messages into categories / topics;
-  the Tauri event-bus coupling is gone (`EventEmitter` trait instead).
-- `wiki/trending.rs` maintains daily topic stats.
-- UniFFI already exposes `seoyu.wikiTrending(limit:offset:category:)`
-  and `seoyu.wikiTopicDetail(topicId:)` — the Swift side just has to
-  call them.
+## Resume Here
 
-### Concrete next steps
-
-1. **Worker loop — done (2026-04-23)**. Worker autostarts from
-   `SeoyuBridge.attach` with a `LogEmitter`. Progress plumbing to Swift
-   is deferred to a follow-up plan; logs via `log::info!` only.
-2. **Wiki panel UI**. Add a sidebar / tab inside the fork that lists
-   trending topics, opens a topic detail view with the bilingual
-   article, and lets the user click through to the source messages
-   (already linked via `wiki_topic_messages` foreign keys).
-   - Suggested Swift path:
-     `Telegram-Mac/Seoyu/Wiki/WikiPanelController.swift` +
-     a SwiftUI / NSViewController split.
-   - `seoyu.wikiTrending` + `seoyu.wikiTopicDetail` are the only
-     UniFFI calls needed for the MVP.
-3. **Historical backfill**. The Postbox observer only sees messages
-   that are added or updated *after* the observer attaches. Older
-   messages that live in Postbox but never get touched again stay
-   invisible to Seoyu. Write a one-shot crawler that walks every
-   peer's history via Postbox and pushes batches through the same
-   `seoyu.indexMessages` path the observer uses.
-4. **Chat-scoped search**. `SearchController` currently only merges
-   for the global (chat-list) search. Per-chat search (inside a single
-   chat window) still falls back to native. Wiring is the same
-   pattern with `SeoyuBridge.search(..., scope: .chat(peerId.toInt64()))`.
-
-Run-before-code checklist once per fresh working tree:
-
-```
-./scripts/patch-submodules.sh
-./scripts/fix-shallow-frameworks.sh
-./scripts/build-seoyu-xcframework.sh
-xcodebuild build -workspace Telegram-Mac.xcworkspace -scheme Telegram \
-  -configuration Debug -destination 'generic/platform=macOS' \
-  ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
-  LD=$(pwd)/scripts/ld-cryptex-shim.sh \
-  LDPLUSPLUS=$(pwd)/scripts/ld-cryptex-shim.sh
-```
+1. **Switch to main tree** `/Users/sskys/Mine/telegram-korean-search`,
+   working Xcode env there.
+2. **Merge `wiki-feature` → `main`** (fast-forward expected, 24 commits).
+3. In Xcode, **drag the six new files** from `Telegram-Mac/Seoyu/Wiki/`
+   into the Telegram target (or run a `xcodeproj` ruby script following
+   the pattern from the prior `feat(wiki): WikiTabController scaffold`
+   pbxproj diff).
+4. **Build the Telegram scheme** (not `All`). Verify mtime fresh:
+   ```
+   stat -f "%Sm" ~/Library/Developer/Xcode/DerivedData/Telegram-Mac-basjkgxsmvqzctcrxcuexrxbttgq/Build/Products/Debug/Telegram.app/Contents/MacOS/Telegram
+   ```
+5. **Smoke test** (P5.T3): launch, log in, wait for ingest, watch logs:
+   ```
+   /usr/bin/log stream --predicate 'process == "Telegram" AND eventMessage CONTAINS "seoyu"'
+   ```
+   Expect `[seoyu] wiki worker started` + `[seoyu] wiki observer attached`.
+6. Open Wiki tab → digest + chips + trending visible. Click topic →
+   article + sources. Click source row → main window focuses the chat at
+   that message.
+7. Toggle EN/KO → titles + article body switch language.
+8. Search button → modal → enter "삼성" → seeded results list.
+9. Restart app → language preference persists.
 
 ## Decisions
-- **UniFFI over IPC as primary bridge**: picked in commit `48d215712`.
-  IPC stays in tree for debugging.
-- **`.macOS(.v12)` everywhere**: `.v13` would require
-  `swift-tools-version:5.7`; upstream manifests are on `:5.5`.
-- **981 Bazel `BUILD` files deleted from submodule working tree**:
-  APFS case-insensitive clash with Xcode's `build/` intermediate dir.
-- **Keep IPC server** in parallel with UniFFI.
-- **`CODE_SIGNING_ALLOWED=NO`** for every xcodebuild invocation (no
-  paid Apple Dev account yet).
-- **Work around the Xcode 26 cryptex bug locally** via `ld-cryptex-shim`.
-  See `docs/XCODE26-BLOCKER.md`.
-- **Timestamp-descending sort** for merged search: Telegram server
-  orders by relevance, which interleaved year-old hits with today's
-  results. The merged output sorts message entries newest-first.
-- **Ship sqlcipher 4.6.1**: upstream vendors 3.33.0, which predates
-  FTS5 trigram. The amalgamation under `vendor/sqlcipher-4.6.1/` is
-  the drop-in; `patch-submodules.sh` applies it.
+
+- **Inline execution** of Phase 3-5 in the worktree, no per-phase build
+  gate — accepted by user explicitly. All four sub-phase commits land on
+  `wiki-feature` already.
+- **Forward reference allowed**: WikiTabController in Phase 3 commit
+  references `WikiArticleViewController` (added in Phase 4 commit). Each
+  commit is internally consistent within the branch but `wiki-feature@P3`
+  alone won't compile — fine because we never check out that intermediate
+  state.
+- **PeerId/MessageId construction in MainViewController**: uses
+  `PeerId(chatId)` + `MessageId(peerId:, namespace: Namespaces.Message.Cloud, id: Int32(messageId))`,
+  matching the pattern at `AppDelegate.swift:1346`.
 
 ## Gotchas
-- `submodules/tg_owt/src/api/candidate.h` patch was undone during a
-  submodule reset. Webrtc builds clean without the patch thanks to
-  `-Wno-error` in `core-xprojects/webrtc/webrtc/build.sh`. If webrtc
-  breaks again on `lifetimebound`, the patch history is around commit
-  `e904583b6`.
-- `packages/ApiCredentials/Sources/ApiCredentials/Config.swift` is
-  gitignored and holds real credentials. Do not regenerate.
-- `Config.example.swift` was renamed to `Config.swift.example` on
-  purpose — two `.swift` files declared the same type.
-- `scripts/rebuild` file is left at `no`. The cleanup loop in
-  `configure_frameworks.sh` is gated on `yes`; the main build loop
-  runs regardless.
-- `scripts/fix-shallow-frameworks.sh` must be re-run after every
-  `rm -rf DerivedData` or SPM re-resolve.
-- `scripts/ld-cryptex-shim.sh` hardcodes `/Applications/Xcode.app`.
-- All submodule-working-tree patches (24 `Package.swift` bumps,
-  Postbox global observer, sqlcipher amalgamation) are reapplied
-  idempotently by `scripts/patch-submodules.sh` after any
-  `git submodule update`.
-- Pre-observer rows in the Seoyu DB use raw Tauri-era chat ids that
-  fail `PeerId.init(Int64)` round-trip. The search merge filters
-  them out by bit-pattern check. A clean reset is
-  `sqlite3 "$DB" "DELETE FROM messages WHERE chat_id NOT IN (SELECT DISTINCT chat_id FROM messages WHERE timestamp > <observer-install-ts>);"`.
+
+- **pbxproj is the manual step**. The six Swift files are on disk +
+  committed but Xcode won't see them until you add file refs. Without
+  this, the build fails with `cannot find type 'WikiListViewController'`
+  etc.
+- **NSTextField.action firing**: the search sheet wires
+  `field.action = #selector(submitSearch(_:))` so Enter submits. If you
+  don't see it fire, ensure the field is the window's
+  `initialFirstResponder` (already set).
+- **ForeignEmitter debounces topics-changed at 500ms** AND
+  WikiListViewController throttles `reload()` at 500ms — redundant but
+  cheap, leave it.
+- **Run-classify button disabled until first progress event with
+  `pending > 0`**. On a fresh empty queue it stays disabled — expected.
 
 ## Context
-- **Branch**: `main`.
-- **Tag**: `archive/tauri-v0` → pre-fork Tauri companion app state.
-- **Tests**: sidecar 100 lib + 4 integration passing, 1 ignored.
-  Telegram.app builds, launches, authenticates. Ingest + search merge
-  verified against a live account.
-- **Unpushed**: all commits on local `main` beyond `bd00180` are
-  unpushed to `origin`.
-- **Untracked**: `submodules/telegram-ios/third-party/td/TdBinding/SharedHeaders/`
-  generated headers (configure_frameworks.sh output inside submodule —
-  harmless).
+
+- **Branch**: `wiki-feature` in `/Users/sskys/Mine/telegram-korean-search/.worktrees/wiki-feature`.
+- **Main branch ref**: `c216dbb9d` (24 commits behind `wiki-feature`).
+- **Tests**: sidecar `cargo test --lib` last green at 107 passed (Phase 1
+  baseline). Not re-run this session — Phase 3-5 is Swift-only, sidecar
+  untouched.
+- **Plans**: `docs/plans/2026-04-23-wiki-panel-ui.md` — P1, P2, P3, P4,
+  P5.T1, P5.T2 shipped; P5.T3 (smoke test) and pbxproj manual step
+  remain.
+- **Spec**: `docs/specs/2026-04-23-wiki-panel-design.md` (approved).
+- **Unpushed**: entire `wiki-feature` branch.
