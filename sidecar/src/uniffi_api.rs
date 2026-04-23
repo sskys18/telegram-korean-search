@@ -22,14 +22,14 @@
 //! `try` / `catch`. Do not panic across the FFI boundary; convert to
 //! an error instead.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::search::{engine, SearchResult as CoreSearchResult};
 use crate::store::chat::ChatRow;
 use crate::store::message::{strip_whitespace, Cursor, MessageRow};
 use crate::store::Store;
-use crate::wiki::worker::{start_worker, LogEmitter, WorkerHandle};
+use crate::wiki::worker::WorkerHandle;
 
 /// Swift-facing errors. Anything that went wrong inside the crate is
 /// flattened into one of these three variants. The actual backtrace
@@ -316,14 +316,26 @@ impl Seoyu {
         if guard.is_some() {
             return Ok(());
         }
-        let handle = start_worker(
+        let emitter = Arc::new(crate::wiki::worker::ForeignEmitter::new(Arc::clone(
+            &self.wiki_observer,
+        )));
+        let handle = crate::wiki::worker::start_worker(
             Arc::clone(&self.store),
-            Arc::new(LogEmitter),
+            emitter,
             Arc::clone(&self.wiki_wake),
         )
         .map_err(|e| SeoyuError::Other(format!("spawn wiki worker: {e}")))?;
         *guard = Some(handle);
         Ok(())
+    }
+
+    pub fn set_wiki_observer(&self, observer: Option<Arc<dyn WikiObserver>>) {
+        let mut slot = self.wiki_observer.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = observer;
+    }
+
+    pub fn wiki_run_pending_now(&self) {
+        self.wiki_wake.store(true, Ordering::Relaxed);
     }
 
     pub fn stop_wiki_worker(&self) {
@@ -391,6 +403,7 @@ fn wiki_topic_to_summary(t: crate::store::wiki_topic::WikiTopic) -> WikiTopicSum
 
 impl Drop for Seoyu {
     fn drop(&mut self) {
+        self.set_wiki_observer(None);
         self.stop_wiki_worker();
     }
 }

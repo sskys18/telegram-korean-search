@@ -69,9 +69,7 @@ pub struct ForeignEmitter {
 }
 
 impl ForeignEmitter {
-    pub fn new(
-        observer: Arc<Mutex<Option<Arc<dyn crate::uniffi_api::WikiObserver>>>>,
-    ) -> Self {
+    pub fn new(observer: Arc<Mutex<Option<Arc<dyn crate::uniffi_api::WikiObserver>>>>) -> Self {
         Self {
             observer,
             last_topics_emit_ms: AtomicI64::new(0),
