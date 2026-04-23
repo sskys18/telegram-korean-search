@@ -288,9 +288,14 @@ class MainViewController: TelegramViewController {
     let navigation: NavigationViewController
     let tabController:TabBarController = TabBarController()
     let contacts:NavigationViewController
-    let wikiController: NavigationViewController?
     let settings:AccountViewController
     private let phoneCalls:RecentCallsViewController
+
+    private var wikiTabController: WikiTabController?
+    private let wikiPanelView = NSView()
+    private let wikiToggleButton = NSButton()
+    private var wikiEscMonitor: Any?
+    private static let wikiPanelWidth: CGFloat = 380
     private let layoutDisposable:MetaDisposable = MetaDisposable()
     private let badgeCountDisposable: MetaDisposable = MetaDisposable()
     private let tooltipDisposable = MetaDisposable()
@@ -303,6 +308,7 @@ class MainViewController: TelegramViewController {
         self.navigation.frame = bounds
         self.contacts.frame = bounds
         updateController.updateLayout(context.layout, parentSize: size, isChatList: true)
+        layoutWikiPanel(animated: false)
     }
     
     override func loadView() {
@@ -342,11 +348,6 @@ class MainViewController: TelegramViewController {
                 
         tabController.add(tab: TabItem(image: theme.icons.tab_contacts, selectedImage: theme.icons.tab_contacts_active, controller: contacts))
 
-        if let wiki = self.wikiController {
-            // NOTE: no dedicated wiki icon yet; reuse tab_contacts as placeholder.
-            tabController.add(tab: TabItem(image: theme.icons.tab_contacts, selectedImage: theme.icons.tab_contacts_active, controller: wiki))
-        }
-
         tabController.add(tab: TabItem(image: theme.icons.tab_calls, selectedImage: theme.icons.tab_calls_active, controller: phoneCalls))
         
         tabController.add(tab: TabBadgeItem(context, controller: navigation, image: theme.icons.tab_chats, selectedImage: theme.icons.tab_chats_active, longHoverHandler: { [weak self] control in
@@ -359,7 +360,9 @@ class MainViewController: TelegramViewController {
         
         
         tabController.updateLocalizationAndTheme(theme: theme)
-        
+
+        setupWikiPanel()
+
         self.ready.set(combineLatest(queue: prepareQueue, self.chatList.ready.get(), self.settings.ready.get()) |> map { $0 && $1 })
         
         
@@ -384,6 +387,102 @@ class MainViewController: TelegramViewController {
         settings.loadViewIfNeeded(bounds)
     }
     
+    private func setupWikiPanel() {
+        guard let wiki = self.wikiTabController else { return }
+
+        wikiPanelView.wantsLayer = true
+        wikiPanelView.layer?.backgroundColor = theme.colors.background.cgColor
+        wikiPanelView.layer?.borderWidth = 1
+        wikiPanelView.layer?.borderColor = theme.colors.border.cgColor
+        wikiPanelView.isHidden = !FastSettings.wikiPanelShown
+        addSubview(wikiPanelView)
+
+        let panelChild = wiki.view
+        panelChild.frame = NSRect(x: 0, y: 0, width: Self.wikiPanelWidth, height: bounds.height)
+        panelChild.autoresizingMask = [.width, .height]
+        wikiPanelView.addSubview(panelChild)
+
+        wikiToggleButton.title = ""
+        wikiToggleButton.bezelStyle = .circular
+        wikiToggleButton.isBordered = true
+        wikiToggleButton.setButtonType(.momentaryPushIn)
+        wikiToggleButton.target = self
+        wikiToggleButton.action = #selector(toggleWikiPanel)
+        let cfg = NSImage.SymbolConfiguration(pointSize: 14, weight: .semibold)
+        wikiToggleButton.image = NSImage(systemSymbolName: "book.closed", accessibilityDescription: "Wiki")?
+            .withSymbolConfiguration(cfg)
+        wikiToggleButton.imagePosition = .imageOnly
+        wikiToggleButton.toolTip = "Wiki (Cmd+Shift+W)"
+        addSubview(wikiToggleButton)
+
+        layoutWikiPanel(animated: false)
+        if FastSettings.wikiPanelShown {
+            installWikiEscMonitor()
+        }
+    }
+
+    private func layoutWikiPanel(animated: Bool) {
+        let buttonSize: CGFloat = 28
+        let inset: CGFloat = 12
+        wikiToggleButton.frame = NSRect(
+            x: bounds.width - buttonSize - inset,
+            y: bounds.height - buttonSize - inset,
+            width: buttonSize,
+            height: buttonSize
+        )
+
+        let shown = FastSettings.wikiPanelShown
+        let targetX = shown ? bounds.width - Self.wikiPanelWidth : bounds.width
+        let targetFrame = NSRect(x: targetX, y: 0, width: Self.wikiPanelWidth, height: bounds.height)
+
+        if shown {
+            wikiPanelView.isHidden = false
+        }
+
+        if animated {
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.18
+                wikiPanelView.animator().frame = targetFrame
+            }, completionHandler: { [weak self] in
+                if !FastSettings.wikiPanelShown {
+                    self?.wikiPanelView.isHidden = true
+                }
+            })
+        } else {
+            wikiPanelView.frame = targetFrame
+            if !shown { wikiPanelView.isHidden = true }
+        }
+    }
+
+    @objc private func toggleWikiPanel() {
+        let next = !FastSettings.wikiPanelShown
+        FastSettings.wikiPanelShown = next
+        layoutWikiPanel(animated: true)
+        if next {
+            installWikiEscMonitor()
+        } else {
+            removeWikiEscMonitor()
+        }
+    }
+
+    private func installWikiEscMonitor() {
+        guard wikiEscMonitor == nil else { return }
+        wikiEscMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if event.keyCode == 53, FastSettings.wikiPanelShown {
+                self?.toggleWikiPanel()
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func removeWikiEscMonitor() {
+        if let m = wikiEscMonitor {
+            NSEvent.removeMonitor(m)
+            wikiEscMonitor = nil
+        }
+    }
+
     private func showCallsTab() {
         tabController.insert(tab: TabItem(image: theme.icons.tab_calls, selectedImage: theme.icons.tab_calls_active, controller: phoneCalls), at: 1)
     }
@@ -782,13 +881,7 @@ class MainViewController: TelegramViewController {
                     true
                 )
             }
-            let wiki = NavigationViewController(WikiTabController(seoyu: seoyu, openChat: openChat), context.window)
-            wiki.applyAppearOnLoad = false
-            wiki.hasBarRightBorder = true
-            wiki.hasBarLeftBorder = true
-            self.wikiController = wiki
-        } else {
-            self.wikiController = nil
+            self.wikiTabController = WikiTabController(seoyu: seoyu, openChat: openChat)
         }
         self.settings = AccountViewController(context)
         self.phoneCalls = RecentCallsViewController(context)
@@ -805,5 +898,6 @@ class MainViewController: TelegramViewController {
         prefDisposable.dispose()
         settingsDisposable.dispose()
         filterMenuDisposable.dispose()
+        removeWikiEscMonitor()
     }
 }

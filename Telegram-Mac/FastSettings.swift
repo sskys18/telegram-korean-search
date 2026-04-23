@@ -486,6 +486,12 @@ class FastSettings {
     static var debugWebApp: Bool {
         return UserDefaults.standard.bool(forKey: kDebugWebApp)
     }
+
+    private static let kWikiPanelShown = "seoyu.wiki.panel.shown"
+    static var wikiPanelShown: Bool {
+        get { UserDefaults.standard.bool(forKey: kWikiPanelShown) }
+        set { UserDefaults.standard.set(newValue, forKey: kWikiPanelShown) }
+    }
     
     static func toggleDebugWebApp() {
         UserDefaults.standard.set(!debugWebApp, forKey: kDebugWebApp)
