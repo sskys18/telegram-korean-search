@@ -316,8 +316,12 @@ impl Seoyu {
         if guard.is_some() {
             return Ok(());
         }
-        let handle = start_worker(Arc::clone(&self.store), Arc::new(LogEmitter))
-            .map_err(|e| SeoyuError::Other(format!("spawn wiki worker: {e}")))?;
+        let handle = start_worker(
+            Arc::clone(&self.store),
+            Arc::new(LogEmitter),
+            Arc::clone(&self.wiki_wake),
+        )
+        .map_err(|e| SeoyuError::Other(format!("spawn wiki worker: {e}")))?;
         *guard = Some(handle);
         Ok(())
     }

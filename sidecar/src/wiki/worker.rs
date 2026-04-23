@@ -150,12 +150,17 @@ impl WorkerHandle {
 /// runtime. The worker owns an `Arc<Mutex<Store>>` handle so it can
 /// run alongside the IPC server without blocking incoming requests
 /// beyond individual short critical sections.
-pub fn start_worker<E>(store: Arc<Mutex<Store>>, emitter: Arc<E>) -> std::io::Result<WorkerHandle>
+pub fn start_worker<E>(
+    store: Arc<Mutex<Store>>,
+    emitter: Arc<E>,
+    wake: Arc<AtomicBool>,
+) -> std::io::Result<WorkerHandle>
 where
     E: EventEmitter,
 {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
+    let wake_clone = Arc::clone(&wake);
 
     let thread = std::thread::Builder::new()
         .name("seoyu-wiki-worker".into())
@@ -171,14 +176,18 @@ where
                     return;
                 }
             };
-            rt.block_on(run_worker(store, emitter, shutdown_clone));
+            rt.block_on(run_worker(store, emitter, shutdown_clone, wake_clone));
         })?;
 
     Ok(WorkerHandle { shutdown, thread })
 }
 
-async fn run_worker<E>(store: Arc<Mutex<Store>>, emitter: Arc<E>, shutdown: Arc<AtomicBool>)
-where
+async fn run_worker<E>(
+    store: Arc<Mutex<Store>>,
+    emitter: Arc<E>,
+    shutdown: Arc<AtomicBool>,
+    wake: Arc<AtomicBool>,
+) where
     E: EventEmitter,
 {
     let llm = LlmClient::new();
@@ -216,7 +225,13 @@ where
         };
 
         if items.is_empty() {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            for _ in 0..20 {
+                if shutdown.load(Ordering::Relaxed) || wake.load(Ordering::Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            wake.store(false, Ordering::Relaxed);
             emit_progress(&emitter, &store);
             continue;
         }
