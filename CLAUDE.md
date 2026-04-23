@@ -9,36 +9,39 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 pairing it with a Rust sidecar that owns a Korean-aware search index and an
 LLM-driven wiki.
 
-The project is in a transition period:
+Status: **dev build live** (v0.4.0-dev, unsigned, macOS 26 arm64). The
+TelegramSwift fork, sidecar, and UniFFI bridge are all in tree and ship a
+launchable `Telegram.app`. The wiki panel is next.
 
 - **archive/tauri-v0** (git tag `archive/tauri-v0`) — the previous Tauri-based
   companion app. Reference only.
-- **current branch** — the Rust sidecar has been extracted from the Tauri
-  shell, and the Tauri shell has been deleted. The TelegramSwift fork is not
-  yet in tree.
+- **main** — TelegramSwift fork + Rust sidecar + `packages/Seoyu` UniFFI
+  bridge. Korean search works end-to-end.
 
-## Target Architecture
+## Architecture
 
 ```
-TelegramSwift fork  ──(Unix socket JSON-RPC)──►  telegram-seoyu sidecar
- (AppKit, Swift)                                   (Rust)
-  · chat UI, login                                  · SQLite mirror
-  · search bar hook                                 · FTS5 + Korean index
-  · wiki panel                                      · wiki pipeline
+TelegramSwift fork  ──(in-process UniFFI FFI)──►  telegram-seoyu sidecar
+ (AppKit, Swift)                                   (Rust static lib)
+  · chat UI, login                                  · SQLite + FTS5 mirror
+  · SearchController hook                           · Korean normalizer
+  · SeoyuBridge singleton                           · wiki pipeline
                                                     · codex exec subprocess
 ```
 
-Messages enter Postbox via existing TelegramSwift sync. The Swift shell
-pushes each new message to the sidecar, which mirrors it into its own SQLite
-store and keeps the Korean index current. Search queries from the Swift
-search bar fan out: native `messages.search` in parallel with the sidecar.
-Results merge inside `SearchController.prepareEntries()`.
+Messages enter Postbox via existing TelegramSwift sync. `SeoyuBridge`
+installs a global Postbox observer that mirrors every stored-or-updated
+message into the sidecar's SQLite store and keeps the Korean index current.
+Search queries from the Swift search bar fan out: native `messages.search`
+in parallel with `SeoyuBridge.search(query:)`. Results merge inside
+`SearchController.prepareEntries()`.
 
 ## Tech Stack
 
 - **Shell**: Swift, AppKit (via TelegramSwift fork, GPLv2)
-- **Sidecar**: Rust, standalone crate under `sidecar/` (MIT)
-- **IPC**: Unix socket, JSON-RPC (not yet implemented)
+- **Sidecar**: Rust, standalone crate under `sidecar/` (MIT), linked into the
+  app as a static library via `packages/Seoyu` (Swift package, UniFFI-generated
+  bindings). No Unix socket, no separate process.
 - **Storage (sidecar)**: SQLite with WAL mode
 - **Search (sidecar)**: SQLite FTS5 trigram tokenizer + Korean-specific
   auxiliary columns (jamo, nospace)
@@ -50,54 +53,73 @@ Results merge inside `SearchController.prepareEntries()`.
 ## Repository layout
 
 ```
-sidecar/              # Rust crate (telegram-seoyu-sidecar)
+Telegram-Mac/          # Swift app target (upstream + Seoyu additions)
+  Seoyu/
+    SeoyuBridge.swift       # singleton that opens the store + exposes search
+    SeoyuIngestObserver.swift
+  AppDelegate.swift         # calls SeoyuBridge.bootstrap()
+  AccountContext.swift      # calls SeoyuBridge.attach(postbox:)
+  SearchController.swift    # augments remote search with Seoyu hits
+
+packages/Seoyu/        # Swift package: UniFFI bindings over the sidecar
+
+sidecar/               # Rust crate (telegram-seoyu-sidecar)
   Cargo.toml
   src/
-    lib.rs
-    bin/main.rs        # binary stub, gains IPC server later
-    error.rs
-    logging.rs
+    lib.rs              # UniFFI surface: Seoyu::new, search, ingest, …
+    bin/main.rs         # CLI stub (opens store, logs, exits)
     search/
-      engine.rs         # FTS5 search engine (Korean hooks pending)
+      engine.rs           # FTS5 multi-column search (content+jamo+nospace)
       highlight.rs
     store/
-      schema.rs         # DB schema & migrations (v4)
-      message.rs        # messages + FTS5 inserts
-      chat.rs
-      sync_state.rs
-      app_meta.rs
+      schema.rs           # DB schema & migrations (v5 with jamo/nospace)
+      message.rs          # messages + FTS5 inserts
+      chat.rs, sync_state.rs, app_meta.rs
       wiki_category.rs, wiki_page.rs, wiki_queue.rs,
       wiki_stats.rs, wiki_topic.rs
     security/
       crypto.rs, keychain.rs
     wiki/
-      llm.rs             # codex exec subprocess wrapper
-      worker.rs          # stub; full impl in archive/tauri-v0
+      llm.rs              # codex exec subprocess wrapper
+      worker.rs           # stub; full impl in archive/tauri-v0
       trending.rs
 
-telegram-swift/       # TelegramSwift subtree (pending Phase 5)
-
+scripts/
+  build-dev.sh        # one-shot unsigned arm64 Debug build
+  ld-cryptex-shim.sh  # Xcode 26 Metal-cryptex linker workaround
+  fix-shallow-frameworks.sh
 docs/
-  legacy/             # Tauri-era design docs, kept for reference
+  handoff.md          # current session snapshot
+  XCODE26-BLOCKER.md  # documented Xcode 26 build workaround
+  SQLCIPHER-TRIGRAM-BLOCKER.md
+  legacy/             # Tauri-era design docs, reference only
 
 .github/              # issue + PR templates (workflows rewritten later)
 ```
 
 ## Build & Run
 
-Sidecar only, for now:
+Full app, from a clean checkout:
+
+```bash
+./scripts/build-dev.sh --run     # builds + launches unsigned Debug app
+./scripts/build-dev.sh --dmg     # builds + packages dist/Telegram-seoyu.dmg
+```
+
+Sidecar standalone:
 
 ```bash
 cd sidecar
-cargo build                # debug
-cargo build --release      # produces tg-seoyu-sidecar
-cargo test                 # 85 tests, 1 ignored
-cargo fmt --check          # must be clean before commit
-cargo clippy -- -D warnings # must be clean before commit
+cargo build                       # debug
+cargo build --release             # produces tg-seoyu-sidecar
+cargo test                        # must be green before commit
+cargo fmt --check                 # must be clean before commit
+cargo clippy -- -D warnings       # must be clean before commit
 ```
 
-The binary does nothing useful yet — it opens the store, logs a line, and
-exits. The IPC server is the next piece to land.
+The sidecar binary is a CLI stub used for manual store inspection; the real
+consumer of the Rust library is the Swift app via the `packages/Seoyu`
+UniFFI bindings.
 
 ## Architecture Rules
 
@@ -105,9 +127,9 @@ exits. The IPC server is the next piece to land.
   `cargo clippy -D warnings`, and `cargo test` all green. Do not break the
   build even for intermediate states.
 - **Sidecar stays Tauri-free.** No `tauri::*` imports, no event bus coupling.
-  Progress reporting goes through IPC.
+  Progress reporting goes through the UniFFI surface.
 - **No grammers, no TDLib in the sidecar.** TelegramSwift owns MTProto. The
-  sidecar only receives already-parsed messages through IPC.
+  sidecar only receives already-parsed messages through the UniFFI bridge.
 - **FTS5 auto-indexing**: messages indexed into `messages_fts` on insert via
   `insert_messages_batch()`. No separate indexing step.
 - **Cursor pagination**: use `(timestamp, chat_id, message_id)` cursors.
@@ -118,26 +140,35 @@ exits. The IPC server is the next piece to land.
   state to fix a rendering or reentrancy issue, you are solving the wrong
   problem.
 
-## Korean search plan
+## Korean search (shipped)
 
-The existing FTS5 trigram tokenizer handles English substring and basic
-Korean substring, but not jamo decomposition or whitespace-insensitive
-matching. The extension, landing in a dedicated phase, adds:
-
-1. `messages_fts` auxiliary columns: `jamo`, `nospace`.
-2. Rust normalizer (no external lib; Hangul codepoint math).
-3. Multi-query search: issue `MATCH` against each column, UNION, rank.
-4. Backfill existing rows in a schema migration (v5).
+`messages_fts` has three columns: `content`, `jamo`, `nospace`. Ingest
+computes `jamo` (decomposed Hangul via in-crate codepoint math, no external
+lib) and `nospace` (whitespace-stripped) on every insert/update. Search
+issues `MATCH` against each column in a single query, UNIONs the row ids,
+and ranks by `bm25`. Migration v5 backfills existing rows.
 
 ## Wiki plan
 
 The wiki pipeline (categories, topics, pages, trending, queue) is preserved
 in the sidecar and is functionally intact. The worker is currently stubbed
-because it was coupled to the Tauri event bus; once the IPC contract lands
-the worker is rewritten to emit progress over IPC instead of Tauri events.
+because it was coupled to the Tauri event bus; once the Swift-side wiki
+panel lands the worker is rewritten to emit progress through the UniFFI
+bridge instead of Tauri events.
 
 ## Gotchas
 
+- **Xcode 26 Metal-cryptex linker bug.** Every Swift-linking target fails
+  at Ld with a missing `libswiftAppKit.dylib` under a Metal cryptex mount.
+  Fixed by `scripts/ld-cryptex-shim.sh`, wired in via `LD=` / `LDPLUSPLUS=`
+  in `scripts/build-dev.sh`. See `docs/XCODE26-BLOCKER.md` for the full
+  recipe. If you build via Xcode GUI, the shim is not applied — Xcode's
+  internal driver is mostly unaffected, but run the CLI build if you hit
+  this error from GUI after a system update.
+- **sqlcipher lacks the FTS5 trigram tokenizer** by default. We build
+  sqlcipher with `SQLITE_ENABLE_FTS5` + the trigram source patched in.
+  See `docs/SQLCIPHER-TRIGRAM-BLOCKER.md`. If ingest logs
+  `no such tokenizer: trigram`, the patched sqlcipher did not land.
 - Stale `telegram.session` files previously caused grammers panics. Under
   TelegramSwift this is no longer relevant — Postbox manages its own session.
 - `codex exec` subprocess is the only LLM path. Users without a ChatGPT
@@ -146,6 +177,10 @@ the worker is rewritten to emit progress over IPC instead of Tauri events.
   `sqlite3 tg-korean-search.db "DELETE FROM wiki_categories; DELETE FROM wiki_topics; DELETE FROM wiki_classify_queue;"`
 - Clippy enforces `format!()` not `&format!()`, `.is_multiple_of(N)` over
   `% N == 0`, and the 1.92-era `std::slice::from_ref` fixit.
+- Dev builds are unsigned (`CODE_SIGNING_ALLOWED=NO`); Keychain-backed
+  session encryption in `sidecar/src/security/keychain.rs` falls back to
+  plaintext without a real signing identity. Sign via Xcode GUI with a
+  Developer ID for full feature validation.
 
 ## Data Location
 
