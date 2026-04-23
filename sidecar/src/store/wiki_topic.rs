@@ -547,4 +547,95 @@ mod tests {
         assert_eq!(loaded.title, "DeFi Test");
         assert_eq!(loaded.category_name, Some("DeFi".to_string()));
     }
+
+    fn mk_chat(store: &Store, chat_id: i64, title: &str) {
+        store
+            .conn()
+            .execute(format!(
+                "INSERT INTO chats (chat_id, title, chat_type) VALUES ({}, '{}', 'channel')",
+                chat_id, title
+            ))
+            .unwrap();
+    }
+
+    fn mk_message(store: &Store, chat_id: i64, message_id: i64, ts: i64, text: &str) {
+        store
+            .conn()
+            .execute(format!(
+                "INSERT INTO messages (message_id, chat_id, timestamp, text_plain, text_stripped)
+                 VALUES ({}, {}, {}, '{}', '{}')",
+                message_id, chat_id, ts, text, text
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_get_topic_messages_order_and_limit() {
+        let store = Store::open_in_memory().unwrap();
+        let cat = store.resolve_category("Test", None).unwrap();
+        let topic_id = store
+            .create_topic(&NewTopic {
+                title: "T".into(),
+                title_ko: None,
+                category_id: cat,
+            })
+            .unwrap();
+        mk_chat(&store, 1, "room");
+        mk_message(&store, 1, 1, 100, "old");
+        mk_message(&store, 1, 2, 300, "newest");
+        mk_message(&store, 1, 3, 200, "middle");
+        store
+            .link_message_to_topic(&TopicMessageLink {
+                topic_id,
+                chat_id: 1,
+                message_id: 1,
+                relevance: 1.0,
+                assigned_category: "Test".into(),
+            })
+            .unwrap();
+        store
+            .link_message_to_topic(&TopicMessageLink {
+                topic_id,
+                chat_id: 1,
+                message_id: 2,
+                relevance: 1.0,
+                assigned_category: "Test".into(),
+            })
+            .unwrap();
+        store
+            .link_message_to_topic(&TopicMessageLink {
+                topic_id,
+                chat_id: 1,
+                message_id: 3,
+                relevance: 1.0,
+                assigned_category: "Test".into(),
+            })
+            .unwrap();
+
+        let rows = store.get_topic_messages(topic_id, 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].message_id, 2);
+        assert_eq!(rows[1].message_id, 3);
+        assert_eq!(rows[2].message_id, 1);
+        assert_eq!(rows[0].chat_title, "room");
+
+        let limited = store.get_topic_messages(topic_id, 2).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].message_id, 2);
+    }
+
+    #[test]
+    fn test_get_topic_messages_empty() {
+        let store = Store::open_in_memory().unwrap();
+        let cat = store.resolve_category("Test", None).unwrap();
+        let topic_id = store
+            .create_topic(&NewTopic {
+                title: "Empty".into(),
+                title_ko: None,
+                category_id: cat,
+            })
+            .unwrap();
+        let rows = store.get_topic_messages(topic_id, 10).unwrap();
+        assert!(rows.is_empty());
+    }
 }

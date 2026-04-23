@@ -158,4 +158,81 @@ mod tests {
         let count = store.get_total_active_channels().unwrap();
         assert_eq!(count, 1);
     }
+
+    fn seed_chat(store: &Store, chat_id: i64) {
+        store
+            .conn()
+            .execute(format!(
+                "INSERT INTO chats (chat_id, title, chat_type) VALUES ({}, 'c', 'channel')",
+                chat_id
+            ))
+            .unwrap();
+    }
+
+    fn seed_message(store: &Store, chat_id: i64, message_id: i64, ts: i64) {
+        store
+            .conn()
+            .execute(format!(
+                "INSERT INTO messages (message_id, chat_id, timestamp, text_plain, text_stripped)
+                 VALUES ({}, {}, {}, 'x', 'x')",
+                message_id, chat_id, ts
+            ))
+            .unwrap();
+    }
+
+    fn seed_topic(store: &Store, title: &str) -> i64 {
+        let cat = store.resolve_category("Test", None).unwrap();
+        store
+            .conn()
+            .execute(format!(
+                "INSERT INTO wiki_topics (title, category_id) VALUES ('{}', {})",
+                title, cat
+            ))
+            .unwrap();
+        let mut stmt = store.conn().prepare("SELECT last_insert_rowid()").unwrap();
+        stmt.next().unwrap();
+        stmt.read::<i64, _>(0).unwrap()
+    }
+
+    fn link(store: &Store, topic_id: i64, chat_id: i64, message_id: i64) {
+        store
+            .conn()
+            .execute(format!(
+                "INSERT INTO wiki_topic_messages (topic_id, chat_id, message_id) VALUES ({}, {}, {})",
+                topic_id, chat_id, message_id
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_wiki_counts_since_filters_and_distinct_topics() {
+        let store = Store::open_in_memory().unwrap();
+        seed_chat(&store, 1);
+        let t1 = seed_topic(&store, "Alpha");
+        let t2 = seed_topic(&store, "Beta");
+
+        // Two old messages (should be filtered out), three recent.
+        seed_message(&store, 1, 10, 100);
+        seed_message(&store, 1, 11, 200);
+        seed_message(&store, 1, 20, 1_000);
+        seed_message(&store, 1, 21, 1_100);
+        seed_message(&store, 1, 22, 1_200);
+
+        link(&store, t1, 1, 10); // old
+        link(&store, t1, 1, 20); // recent, t1
+        link(&store, t1, 1, 21); // recent, t1 again
+        link(&store, t2, 1, 22); // recent, t2
+
+        let (topics, msgs) = store.wiki_counts_since(1_000).unwrap();
+        assert_eq!(topics, 2);
+        assert_eq!(msgs, 3);
+    }
+
+    #[test]
+    fn test_wiki_counts_since_empty() {
+        let store = Store::open_in_memory().unwrap();
+        let (topics, msgs) = store.wiki_counts_since(0).unwrap();
+        assert_eq!(topics, 0);
+        assert_eq!(msgs, 0);
+    }
 }
