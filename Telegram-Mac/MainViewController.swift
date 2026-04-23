@@ -288,6 +288,7 @@ class MainViewController: TelegramViewController {
     let navigation: NavigationViewController
     let tabController:TabBarController = TabBarController()
     let contacts:NavigationViewController
+    let wikiController: NavigationViewController?
     let settings:AccountViewController
     private let phoneCalls:RecentCallsViewController
     private let layoutDisposable:MetaDisposable = MetaDisposable()
@@ -340,7 +341,12 @@ class MainViewController: TelegramViewController {
         }
                 
         tabController.add(tab: TabItem(image: theme.icons.tab_contacts, selectedImage: theme.icons.tab_contacts_active, controller: contacts))
-        
+
+        if let wiki = self.wikiController {
+            // NOTE: no dedicated wiki icon yet; reuse tab_contacts as placeholder.
+            tabController.add(tab: TabItem(image: theme.icons.tab_contacts, selectedImage: theme.icons.tab_contacts_active, controller: wiki))
+        }
+
         tabController.add(tab: TabItem(image: theme.icons.tab_calls, selectedImage: theme.icons.tab_calls_active, controller: phoneCalls))
         
         tabController.add(tab: TabBadgeItem(context, controller: navigation, image: theme.icons.tab_chats, selectedImage: theme.icons.tab_chats_active, longHoverHandler: { [weak self] control in
@@ -766,6 +772,15 @@ class MainViewController: TelegramViewController {
         
         self.chatList = ChatListController(context, mode: .plain)
         self.contacts = NavigationViewController(ContactsController(context), context.window)
+        if let seoyu = SeoyuBridge.shared.seoyu {
+            let wiki = NavigationViewController(WikiTabController(seoyu: seoyu), context.window)
+            wiki.applyAppearOnLoad = false
+            wiki.hasBarRightBorder = true
+            wiki.hasBarLeftBorder = true
+            self.wikiController = wiki
+        } else {
+            self.wikiController = nil
+        }
         self.settings = AccountViewController(context)
         self.phoneCalls = RecentCallsViewController(context)
         self.navigation = NavigationViewController(self.chatList, context.window)
