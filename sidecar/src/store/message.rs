@@ -679,4 +679,35 @@ mod tests {
         let store = test_store();
         assert_eq!(store.message_count().unwrap(), 0);
     }
+
+    #[test]
+    fn insert_messages_batch_enqueues_classify() {
+        let store = Store::open_in_memory().unwrap();
+        let msgs = vec![
+            MessageRow {
+                message_id: 10,
+                chat_id: 1,
+                timestamp: 1_700_000_000,
+                text_plain: "테스트 메시지".into(),
+                text_stripped: "테스트메시지".into(),
+                link: None,
+            },
+            MessageRow {
+                message_id: 11,
+                chat_id: 1,
+                timestamp: 1_700_000_001,
+                text_plain: "another".into(),
+                text_stripped: "another".into(),
+                link: None,
+            },
+        ];
+        store.insert_messages_batch(&msgs).unwrap();
+
+        let stats = store.get_queue_stats().unwrap();
+        assert_eq!(stats.pending, 2);
+
+        store.insert_messages_batch(&msgs).unwrap();
+        let stats = store.get_queue_stats().unwrap();
+        assert_eq!(stats.pending, 2);
+    }
 }
