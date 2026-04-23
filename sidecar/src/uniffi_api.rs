@@ -22,6 +22,7 @@
 //! `try` / `catch`. Do not panic across the FFI boundary; convert to
 //! an error instead.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use crate::search::{engine, SearchResult as CoreSearchResult};
@@ -156,6 +157,8 @@ pub trait WikiObserver: Send + Sync {
 pub struct Seoyu {
     store: Arc<Mutex<Store>>,
     wiki_worker: Mutex<Option<WorkerHandle>>,
+    wiki_observer: Arc<Mutex<Option<Arc<dyn WikiObserver>>>>,
+    wiki_wake: Arc<AtomicBool>,
 }
 
 #[uniffi::export]
@@ -171,6 +174,8 @@ impl Seoyu {
         Ok(Arc::new(Seoyu {
             store: Arc::new(Mutex::new(store)),
             wiki_worker: Mutex::new(None),
+            wiki_observer: Arc::new(Mutex::new(None)),
+            wiki_wake: Arc::new(AtomicBool::new(false)),
         }))
     }
 
