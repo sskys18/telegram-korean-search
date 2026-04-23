@@ -472,7 +472,7 @@ class MainViewController: TelegramViewController {
         // width so the chat area does not expand into the new space.
         var wf = window.frame
         wf.size.width += panelWidth
-        window.setFrame(wf, display: true, animate: true)
+        window.setFrame(wf, display: true, animate: false)
 
         // After the frame change we lay the panel out at the right edge.
         layoutWikiExpansion()
@@ -493,7 +493,7 @@ class MainViewController: TelegramViewController {
 
         var wf = window.frame
         wf.size.width = max(wf.size.width - Self.wikiPanelWidth, window.minSize.width)
-        window.setFrame(wf, display: true, animate: true)
+        window.setFrame(wf, display: true, animate: false)
         FastSettings.wikiPanelShown = false
     }
 
