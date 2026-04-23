@@ -62,7 +62,10 @@ impl WorkerHandle {
 /// runtime. The worker owns an `Arc<Mutex<Store>>` handle so it can
 /// run alongside the IPC server without blocking incoming requests
 /// beyond individual short critical sections.
-pub fn start_worker<E>(store: Arc<Mutex<Store>>, emitter: Arc<E>) -> WorkerHandle
+pub fn start_worker<E>(
+    store: Arc<Mutex<Store>>,
+    emitter: Arc<E>,
+) -> std::io::Result<WorkerHandle>
 where
     E: EventEmitter,
 {
@@ -84,10 +87,9 @@ where
                 }
             };
             rt.block_on(run_worker(store, emitter, shutdown_clone));
-        })
-        .expect("spawn wiki worker thread");
+        })?;
 
-    WorkerHandle { shutdown, thread }
+    Ok(WorkerHandle { shutdown, thread })
 }
 
 async fn run_worker<E>(store: Arc<Mutex<Store>>, emitter: Arc<E>, shutdown: Arc<AtomicBool>)
