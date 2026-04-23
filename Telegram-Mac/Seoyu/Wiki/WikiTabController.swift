@@ -185,6 +185,13 @@ public final class WikiTabController: ViewController {
             child.view.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
         ])
         pageStack.append(child)
+        // viewDidAppear is unreliable without proper VC parenting, so
+        // poke the new page to load its data immediately.
+        if let list = child as? WikiListViewController {
+            list.forceReload()
+        } else if let article = child as? WikiArticleViewController {
+            article.forceReload()
+        }
     }
 
     @discardableResult

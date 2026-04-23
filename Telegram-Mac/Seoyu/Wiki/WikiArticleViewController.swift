@@ -97,6 +97,10 @@ public final class WikiArticleViewController: NSViewController,
         reload()
     }
 
+    public func forceReload() {
+        reload()
+    }
+
     private func reload() {
         let seoyu = self.seoyu
         let topicId = self.topicId

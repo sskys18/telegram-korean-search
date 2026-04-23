@@ -165,6 +165,13 @@ public final class WikiListViewController: NSViewController,
         reload()
     }
 
+    /// Public so a host (e.g. WikiTabController) can force initial load
+    /// without relying on viewDidAppear (which only fires when the VC
+    /// is part of a window via NSViewController parenting).
+    public func forceReload() {
+        reload()
+    }
+
     private var lastReload: Date = .distantPast
 
     private func throttledReload() {
