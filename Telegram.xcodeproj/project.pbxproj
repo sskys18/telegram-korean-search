@@ -1004,7 +1004,9 @@
 		27FFCEC52694BA58006CA024 /* WidgetAppearance.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27FFCEC42694BA58006CA024 /* WidgetAppearance.swift */; };
 		27FFCEC72694BC95006CA024 /* WidgetController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27FFCEC62694BC95006CA024 /* WidgetController.swift */; };
 		2AEFBE2FEB9729E2DF44EF49 /* WikiLocale.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6BD979333AC71E797E0BA24 /* WikiLocale.swift */; };
+		37817F57621BDD62A5B13A6F /* WikiListViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3800C54E8CEA4F2EB8565388 /* WikiListViewController.swift */; };
 		447AA92904D655C313551BB9 /* WikiTabController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B674F485C92DD789394BA4AA /* WikiTabController.swift */; };
+		8B9D7CC79FDFCC9CEFF0A339 /* WikiCategoryChipsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE024FFAFD203C3CF1F9DC93 /* WikiCategoryChipsView.swift */; };
 		959B19D8EAA529E4134A05F7 /* SeoyuIngestObserver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AA70EE27AEF60CFE8EEF1F1 /* SeoyuIngestObserver.swift */; };
 		9F0367F0227208E000456348 /* QRCode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0367EF227208E000456348 /* QRCode.swift */; };
 		9F0367F22272108800456348 /* ProxyQRCodeRowItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0367F12272108800456348 /* ProxyQRCodeRowItem.swift */; };
@@ -1130,6 +1132,7 @@
 		9FF5A1CB2232A2FF00BC1359 /* UpgradedAccount.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FF5A1CA2232A2FF00BC1359 /* UpgradedAccount.swift */; };
 		9FFAE50F205AB4A3000C028E /* libiconv.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 9FFAE50E205AB4A3000C028E /* libiconv.tbd */; };
 		9FFAE514205AB50C000C028E /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 9FFAE513205AB50C000C028E /* libz.tbd */; };
+		A28B64D8FA5CAFB17F097DAE /* WikiDigestCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7C40A2E1988D8B0FC22D5FB0 /* WikiDigestCardView.swift */; };
 		A7029EF8240E3A5400A89ABD /* ChatListFiltersHeaderItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7029EF7240E3A5400A89ABD /* ChatListFiltersHeaderItem.swift */; };
 		A7029EFA240E3CDA00A89ABD /* folder.tgs in Resources */ = {isa = PBXBuildFile; fileRef = A7029EF9240E3CCF00A89ABD /* folder.tgs */; };
 		A71DC82B23858312000EEDE2 /* CoreSpotlight.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A71DC82A23858311000EEDE2 /* CoreSpotlight.framework */; settings = {ATTRIBUTES = (Weak, ); }; };
@@ -1191,6 +1194,8 @@
 		A7F2830A2395570400742C20 /* SearchSettingsController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7F283092395570400742C20 /* SearchSettingsController.swift */; };
 		A7F2831B239A496400742C20 /* ContextShowPeersHolder.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7F2831A239A496400742C20 /* ContextShowPeersHolder.swift */; };
 		A7F28337239A808500742C20 /* TemplateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7F28336239A808500742C20 /* TemplateController.swift */; };
+		A866FB23BA44067E05B10914 /* WikiArticleViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CE9737EEE4CD30375B97870 /* WikiArticleViewController.swift */; };
+		BEC167F58312FE9227637733 /* MarkdownRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7847C0AC9D2F5062B641F45 /* MarkdownRenderer.swift */; };
 		C2016F3B1EAA4538003AF981 /* RecentPeerRowItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2016F3A1EAA4538003AF981 /* RecentPeerRowItem.swift */; };
 		C201C2321E3B2D1C0026C21E /* FastSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = C201C2311E3B2D1C0026C21E /* FastSettings.swift */; };
 		C20232A81D81D189007C9ADE /* ChatController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20232A71D81D189007C9ADE /* ChatController.swift */; };
@@ -1552,6 +1557,7 @@
 		C2FD382E1DCA1FA3009DC28C /* PreviewSenderController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2FD382D1DCA1FA3009DC28C /* PreviewSenderController.swift */; };
 		C2FD38321DCA215F009DC28C /* GeneralInputRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2FD38311DCA215F009DC28C /* GeneralInputRow.swift */; };
 		C2FF14601E532C0A007B7B14 /* SearchEmptyRowItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2FF145F1E532C0A007B7B14 /* SearchEmptyRowItem.swift */; };
+		C93A2812C1F626F98107BED7 /* WikiSourceCellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E470758F2243277DF07BF97 /* WikiSourceCellView.swift */; };
 		CE55300AA5883F0787100DDD /* SeoyuBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D7CA564C2448EAC50105F96 /* SeoyuBridge.swift */; };
 		D001E974243B1A0A009025F9 /* LeftSidebarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = D001E973243B1A0A009025F9 /* LeftSidebarController.swift */; };
 		D001E976243B385E009025F9 /* FolderIcons.swift in Sources */ = {isa = PBXBuildFile; fileRef = D001E975243B385E009025F9 /* FolderIcons.swift */; };
@@ -1743,6 +1749,7 @@
 
 /* Begin PBXFileReference section */
 		1AA70EE27AEF60CFE8EEF1F1 /* SeoyuIngestObserver.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SeoyuIngestObserver.swift; sourceTree = "<group>"; };
+		1CE9737EEE4CD30375B97870 /* WikiArticleViewController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WikiArticleViewController.swift; sourceTree = "<group>"; };
 		2700B21F273ADC08003E4018 /* HotKey */ = {isa = PBXFileReference; lastKnownFileType = folder; name = HotKey; path = packages/HotKey; sourceTree = "<group>"; };
 		270202BE261A1BF500CFCE6D /* PaymentsTipsRowItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PaymentsTipsRowItem.swift; sourceTree = "<group>"; };
 		270202C2261B3D3100CFCE6D /* CurrencyUITextFieldDelegate.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = CurrencyUITextFieldDelegate.swift; sourceTree = "<group>"; };
@@ -2675,7 +2682,10 @@
 		27FE779B26F4AE4400E1C90B /* SmartThemePreviewRowItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmartThemePreviewRowItem.swift; sourceTree = "<group>"; };
 		27FFCEC42694BA58006CA024 /* WidgetAppearance.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetAppearance.swift; sourceTree = "<group>"; };
 		27FFCEC62694BC95006CA024 /* WidgetController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WidgetController.swift; sourceTree = "<group>"; };
+		2E470758F2243277DF07BF97 /* WikiSourceCellView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WikiSourceCellView.swift; sourceTree = "<group>"; };
+		3800C54E8CEA4F2EB8565388 /* WikiListViewController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WikiListViewController.swift; sourceTree = "<group>"; };
 		6D7CA564C2448EAC50105F96 /* SeoyuBridge.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SeoyuBridge.swift; sourceTree = "<group>"; };
+		7C40A2E1988D8B0FC22D5FB0 /* WikiDigestCardView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WikiDigestCardView.swift; sourceTree = "<group>"; };
 		9F0367EF227208E000456348 /* QRCode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRCode.swift; sourceTree = "<group>"; };
 		9F0367F12272108800456348 /* ProxyQRCodeRowItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProxyQRCodeRowItem.swift; sourceTree = "<group>"; };
 		9F0368002277091800456348 /* LAnimationButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LAnimationButton.swift; sourceTree = "<group>"; };
@@ -2861,6 +2871,7 @@
 		A7F2831A239A496400742C20 /* ContextShowPeersHolder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContextShowPeersHolder.swift; sourceTree = "<group>"; };
 		A7F28336239A808500742C20 /* TemplateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TemplateController.swift; sourceTree = "<group>"; };
 		A843DC01B098D9A9CEB63574 /* WikiObserverBridge.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WikiObserverBridge.swift; sourceTree = "<group>"; };
+		AE024FFAFD203C3CF1F9DC93 /* WikiCategoryChipsView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WikiCategoryChipsView.swift; sourceTree = "<group>"; };
 		B674F485C92DD789394BA4AA /* WikiTabController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WikiTabController.swift; sourceTree = "<group>"; };
 		C2016F3A1EAA4538003AF981 /* RecentPeerRowItem.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = RecentPeerRowItem.swift; sourceTree = "<group>"; };
 		C2016F431EAA4967003AF981 /* pt-BR */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "pt-BR"; path = "pt-BR.lproj/ShareViewController.strings"; sourceTree = "<group>"; };
@@ -3369,6 +3380,7 @@
 		D0FCA7612434867400B72F18 /* PeerInfoHeadItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerInfoHeadItem.swift; sourceTree = "<group>"; };
 		D0FFC4AB23E184BA0044D305 /* ChatListFilterController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatListFilterController.swift; sourceTree = "<group>"; };
 		D6BD979333AC71E797E0BA24 /* WikiLocale.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = WikiLocale.swift; sourceTree = "<group>"; };
+		D7847C0AC9D2F5062B641F45 /* MarkdownRenderer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MarkdownRenderer.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -6935,6 +6947,12 @@
 				D6BD979333AC71E797E0BA24 /* WikiLocale.swift */,
 				A843DC01B098D9A9CEB63574 /* WikiObserverBridge.swift */,
 				B674F485C92DD789394BA4AA /* WikiTabController.swift */,
+				3800C54E8CEA4F2EB8565388 /* WikiListViewController.swift */,
+				7C40A2E1988D8B0FC22D5FB0 /* WikiDigestCardView.swift */,
+				AE024FFAFD203C3CF1F9DC93 /* WikiCategoryChipsView.swift */,
+				D7847C0AC9D2F5062B641F45 /* MarkdownRenderer.swift */,
+				2E470758F2243277DF07BF97 /* WikiSourceCellView.swift */,
+				1CE9737EEE4CD30375B97870 /* WikiArticleViewController.swift */,
 			);
 			name = Wiki;
 			path = "Telegram-Mac/Seoyu/Wiki";
@@ -8765,6 +8783,12 @@
 				2AEFBE2FEB9729E2DF44EF49 /* WikiLocale.swift in Sources */,
 				F1BF513EC5DEF718ED3E90E4 /* WikiObserverBridge.swift in Sources */,
 				447AA92904D655C313551BB9 /* WikiTabController.swift in Sources */,
+				37817F57621BDD62A5B13A6F /* WikiListViewController.swift in Sources */,
+				A28B64D8FA5CAFB17F097DAE /* WikiDigestCardView.swift in Sources */,
+				8B9D7CC79FDFCC9CEFF0A339 /* WikiCategoryChipsView.swift in Sources */,
+				BEC167F58312FE9227637733 /* MarkdownRenderer.swift in Sources */,
+				C93A2812C1F626F98107BED7 /* WikiSourceCellView.swift in Sources */,
+				A866FB23BA44067E05B10914 /* WikiArticleViewController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
