@@ -9,6 +9,9 @@ public final class WikiListViewController: NSViewController,
     private let digestView = WikiDigestCardView()
     private let chipsView = WikiCategoryChipsView()
     private let emptyLabel = NSTextField(labelWithString: "")
+    private let errorBanner = NSView()
+    private let errorLabel = NSTextField(labelWithString: "")
+    private let toastLabel = NSTextField(labelWithString: "")
 
     private var topics: [WikiTopicSummary] = []
     private var seedTopics: [WikiTopicSummary]?
@@ -56,16 +59,55 @@ public final class WikiListViewController: NSViewController,
         emptyLabel.isHidden = true
         emptyLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        errorBanner.wantsLayer = true
+        errorBanner.layer?.backgroundColor = NSColor.systemRed.withAlphaComponent(0.15).cgColor
+        errorBanner.translatesAutoresizingMaskIntoConstraints = false
+        errorBanner.isHidden = true
+        errorLabel.translatesAutoresizingMaskIntoConstraints = false
+        errorLabel.textColor = .labelColor
+        errorLabel.lineBreakMode = .byTruncatingTail
+        let dismiss = NSButton(title: "Dismiss", target: self, action: #selector(dismissError))
+        dismiss.bezelStyle = .inline
+        dismiss.translatesAutoresizingMaskIntoConstraints = false
+        errorBanner.addSubview(errorLabel)
+        errorBanner.addSubview(dismiss)
+        NSLayoutConstraint.activate([
+            errorLabel.leadingAnchor.constraint(equalTo: errorBanner.leadingAnchor, constant: 12),
+            errorLabel.centerYAnchor.constraint(equalTo: errorBanner.centerYAnchor),
+            dismiss.trailingAnchor.constraint(equalTo: errorBanner.trailingAnchor, constant: -8),
+            dismiss.centerYAnchor.constraint(equalTo: errorBanner.centerYAnchor),
+            errorLabel.trailingAnchor.constraint(lessThanOrEqualTo: dismiss.leadingAnchor, constant: -8),
+            errorBanner.heightAnchor.constraint(equalToConstant: 32),
+        ])
+
+        toastLabel.wantsLayer = true
+        toastLabel.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        toastLabel.layer?.cornerRadius = 6
+        toastLabel.alignment = .center
+        toastLabel.textColor = .labelColor
+        toastLabel.translatesAutoresizingMaskIntoConstraints = false
+        toastLabel.isHidden = true
+        toastLabel.usesSingleLineMode = false
+        toastLabel.maximumNumberOfLines = 2
+
         let container = NSView()
+        container.addSubview(errorBanner)
         container.addSubview(root)
         container.addSubview(emptyLabel)
+        container.addSubview(toastLabel)
         NSLayoutConstraint.activate([
+            errorBanner.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            errorBanner.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            errorBanner.topAnchor.constraint(equalTo: container.topAnchor),
             root.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             root.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            root.topAnchor.constraint(equalTo: container.topAnchor),
+            root.topAnchor.constraint(equalTo: errorBanner.bottomAnchor),
             root.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             emptyLabel.centerXAnchor.constraint(equalTo: container.centerXAnchor),
             emptyLabel.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            toastLabel.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            toastLabel.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -16),
+            toastLabel.widthAnchor.constraint(lessThanOrEqualTo: container.widthAnchor, multiplier: 0.8),
         ])
         self.view = container
 
@@ -91,6 +133,31 @@ public final class WikiListViewController: NSViewController,
             object: nil,
             queue: .main
         ) { [weak self] note in self?.handleProgress(note) }
+
+        NotificationCenter.default.addObserver(
+            forName: .seoyuWikiError,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in self?.handleError(note) }
+    }
+
+    private func handleError(_ note: Notification) {
+        let message = (note.userInfo?["message"] as? String) ?? "wiki error"
+        let recoverable = (note.userInfo?["recoverable"] as? Bool) ?? true
+        if recoverable {
+            toastLabel.stringValue = "  \(message)  "
+            toastLabel.isHidden = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                self?.toastLabel.isHidden = true
+            }
+        } else {
+            errorLabel.stringValue = message
+            errorBanner.isHidden = false
+        }
+    }
+
+    @objc private func dismissError() {
+        errorBanner.isHidden = true
     }
 
     public override func viewDidAppear() {
