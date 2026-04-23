@@ -28,6 +28,7 @@ pub trait EventEmitter: Send + Sync + 'static {
     fn wiki_progress(&self, processed: u64, pending: u64, total: u64);
     fn wiki_error(&self, message: &str, recoverable: bool);
     fn wiki_stopped(&self, reason: &str);
+    fn wiki_topics_changed(&self) {}
 }
 
 /// Emitter that drops every event on the floor. Useful for tests
@@ -54,6 +55,76 @@ impl EventEmitter for LogEmitter {
     }
     fn wiki_stopped(&self, reason: &str) {
         log::info!("wiki stopped: {reason}");
+    }
+}
+
+use std::sync::atomic::AtomicI64;
+
+/// Emitter that forwards events to a foreign (Swift) observer. Falls
+/// back to log output when no observer is set. Debounces
+/// `on_topics_changed` to at most one call per 500 ms.
+pub struct ForeignEmitter {
+    pub observer: Arc<Mutex<Option<Arc<dyn crate::uniffi_api::WikiObserver>>>>,
+    last_topics_emit_ms: AtomicI64,
+}
+
+impl ForeignEmitter {
+    pub fn new(
+        observer: Arc<Mutex<Option<Arc<dyn crate::uniffi_api::WikiObserver>>>>,
+    ) -> Self {
+        Self {
+            observer,
+            last_topics_emit_ms: AtomicI64::new(0),
+        }
+    }
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    fn observer(&self) -> Option<Arc<dyn crate::uniffi_api::WikiObserver>> {
+        self.observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn topics_changed(&self) {
+        let now = Self::now_ms();
+        let last = self.last_topics_emit_ms.load(Ordering::Relaxed);
+        if now - last < 500 {
+            return;
+        }
+        self.last_topics_emit_ms.store(now, Ordering::Relaxed);
+        if let Some(o) = self.observer() {
+            o.on_topics_changed();
+        }
+    }
+}
+
+impl EventEmitter for ForeignEmitter {
+    fn wiki_progress(&self, processed: u64, pending: u64, total: u64) {
+        if let Some(o) = self.observer() {
+            o.on_progress(processed, pending, total);
+        } else {
+            log::info!("wiki progress: processed={processed} pending={pending} total={total}");
+        }
+    }
+    fn wiki_error(&self, message: &str, recoverable: bool) {
+        if let Some(o) = self.observer() {
+            o.on_error(message.to_string(), recoverable);
+        } else {
+            log::warn!("wiki error (recoverable={recoverable}): {message}");
+        }
+    }
+    fn wiki_stopped(&self, reason: &str) {
+        log::info!("wiki stopped: {reason}");
+    }
+    fn wiki_topics_changed(&self) {
+        self.topics_changed();
     }
 }
 
@@ -263,6 +334,7 @@ where
                 }
 
                 processed_count += results.len();
+                emitter.wiki_topics_changed();
             }
             Err(e) => {
                 log::warn!("wiki worker: batch classification failed: {e}");
