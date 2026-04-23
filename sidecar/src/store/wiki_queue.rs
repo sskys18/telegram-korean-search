@@ -253,6 +253,12 @@ mod tests {
             },
         ];
         store.insert_messages_batch(&msgs).unwrap();
+        // insert_messages_batch auto-enqueues for classification; clear
+        // the queue so each test starts with a known empty state.
+        store
+            .conn()
+            .execute("DELETE FROM wiki_classify_queue")
+            .unwrap();
         store
     }
 

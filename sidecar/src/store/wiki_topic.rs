@@ -374,6 +374,50 @@ impl Store {
         self.conn().execute("DELETE FROM wiki_topics")?;
         Ok(())
     }
+
+    /// Latest messages linked to a topic, newest first. Uses LEFT JOIN
+    /// on `chats` so a message whose chat row is missing still renders
+    /// (with an empty title) instead of vanishing.
+    pub fn get_topic_messages(
+        &self,
+        topic_id: i64,
+        limit: usize,
+    ) -> Result<Vec<TopicMessageRow>, sqlite::Error> {
+        let mut stmt = self.conn().prepare(format!(
+            "SELECT m.chat_id, m.message_id, m.timestamp, m.text_plain, m.link,
+                    COALESCE(c.title, '')
+             FROM wiki_topic_messages wtm
+             JOIN messages m ON m.chat_id = wtm.chat_id
+                             AND m.message_id = wtm.message_id
+             LEFT JOIN chats c ON c.chat_id = m.chat_id
+             WHERE wtm.topic_id = ?
+             ORDER BY m.timestamp DESC
+             LIMIT {limit}",
+        ))?;
+        stmt.bind((1, topic_id))?;
+        let mut out = Vec::new();
+        while let sqlite::State::Row = stmt.next()? {
+            out.push(TopicMessageRow {
+                chat_id: stmt.read::<i64, _>(0)?,
+                message_id: stmt.read::<i64, _>(1)?,
+                timestamp: stmt.read::<i64, _>(2)?,
+                text: stmt.read::<String, _>(3)?,
+                link: stmt.read::<Option<String>, _>(4)?,
+                chat_title: stmt.read::<String, _>(5)?,
+            });
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TopicMessageRow {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub timestamp: i64,
+    pub text: String,
+    pub link: Option<String>,
+    pub chat_title: String,
 }
 
 fn read_wiki_topic(stmt: &sqlite::Statement) -> Result<WikiTopic, sqlite::Error> {
@@ -502,5 +546,96 @@ mod tests {
         let loaded = store.get_topic(id).unwrap().unwrap();
         assert_eq!(loaded.title, "DeFi Test");
         assert_eq!(loaded.category_name, Some("DeFi".to_string()));
+    }
+
+    fn mk_chat(store: &Store, chat_id: i64, title: &str) {
+        store
+            .conn()
+            .execute(format!(
+                "INSERT INTO chats (chat_id, title, chat_type) VALUES ({}, '{}', 'channel')",
+                chat_id, title
+            ))
+            .unwrap();
+    }
+
+    fn mk_message(store: &Store, chat_id: i64, message_id: i64, ts: i64, text: &str) {
+        store
+            .conn()
+            .execute(format!(
+                "INSERT INTO messages (message_id, chat_id, timestamp, text_plain, text_stripped)
+                 VALUES ({}, {}, {}, '{}', '{}')",
+                message_id, chat_id, ts, text, text
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_get_topic_messages_order_and_limit() {
+        let store = Store::open_in_memory().unwrap();
+        let cat = store.resolve_category("Test", None).unwrap();
+        let topic_id = store
+            .create_topic(&NewTopic {
+                title: "T".into(),
+                title_ko: None,
+                category_id: cat,
+            })
+            .unwrap();
+        mk_chat(&store, 1, "room");
+        mk_message(&store, 1, 1, 100, "old");
+        mk_message(&store, 1, 2, 300, "newest");
+        mk_message(&store, 1, 3, 200, "middle");
+        store
+            .link_message_to_topic(&TopicMessageLink {
+                topic_id,
+                chat_id: 1,
+                message_id: 1,
+                relevance: 1.0,
+                assigned_category: "Test".into(),
+            })
+            .unwrap();
+        store
+            .link_message_to_topic(&TopicMessageLink {
+                topic_id,
+                chat_id: 1,
+                message_id: 2,
+                relevance: 1.0,
+                assigned_category: "Test".into(),
+            })
+            .unwrap();
+        store
+            .link_message_to_topic(&TopicMessageLink {
+                topic_id,
+                chat_id: 1,
+                message_id: 3,
+                relevance: 1.0,
+                assigned_category: "Test".into(),
+            })
+            .unwrap();
+
+        let rows = store.get_topic_messages(topic_id, 10).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].message_id, 2);
+        assert_eq!(rows[1].message_id, 3);
+        assert_eq!(rows[2].message_id, 1);
+        assert_eq!(rows[0].chat_title, "room");
+
+        let limited = store.get_topic_messages(topic_id, 2).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].message_id, 2);
+    }
+
+    #[test]
+    fn test_get_topic_messages_empty() {
+        let store = Store::open_in_memory().unwrap();
+        let cat = store.resolve_category("Test", None).unwrap();
+        let topic_id = store
+            .create_topic(&NewTopic {
+                title: "Empty".into(),
+                title_ko: None,
+                category_id: cat,
+            })
+            .unwrap();
+        let rows = store.get_topic_messages(topic_id, 10).unwrap();
+        assert!(rows.is_empty());
     }
 }

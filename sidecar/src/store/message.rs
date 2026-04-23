@@ -57,78 +57,86 @@ impl Store {
         let _ = self.conn.execute("ROLLBACK");
         self.conn.execute("BEGIN")?;
         let result = (|| -> Result<(), sqlite::Error> {
-        // Satisfy the FK from messages.chat_id -> chats.chat_id without
-        // requiring callers to call upsert_chat first. The shell (Swift)
-        // mirror may upsert a richer ChatInfo later; this stub keeps
-        // ingestion unblocked when it does not.
-        let mut seen_chats: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        for msg in messages {
-            if seen_chats.insert(msg.chat_id) {
-                let mut stmt = self.conn.prepare(
+            // Satisfy the FK from messages.chat_id -> chats.chat_id without
+            // requiring callers to call upsert_chat first. The shell (Swift)
+            // mirror may upsert a richer ChatInfo later; this stub keeps
+            // ingestion unblocked when it does not.
+            let mut seen_chats: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            for msg in messages {
+                if seen_chats.insert(msg.chat_id) {
+                    let mut stmt = self.conn.prepare(
                     "INSERT OR IGNORE INTO chats (chat_id, title, chat_type, username, access_hash, is_excluded)
                      VALUES (?, '', 'dm', NULL, NULL, 0)",
                 )?;
-                stmt.bind((1, msg.chat_id))?;
-                stmt.next()?;
+                    stmt.bind((1, msg.chat_id))?;
+                    stmt.next()?;
+                }
             }
-        }
-        for msg in messages {
-            let jamo = crate::search::hangul::decompose_jamo(&msg.text_plain);
+            for msg in messages {
+                let jamo = crate::search::hangul::decompose_jamo(&msg.text_plain);
 
-            let mut stmt = self.conn.prepare(
-                "INSERT OR IGNORE INTO messages
+                let mut stmt = self.conn.prepare(
+                    "INSERT OR IGNORE INTO messages
                     (message_id, chat_id, timestamp, text_plain, text_stripped, link,
                      text_jamo)
                  VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )?;
-            stmt.bind((1, msg.message_id))?;
-            stmt.bind((2, msg.chat_id))?;
-            stmt.bind((3, msg.timestamp))?;
-            stmt.bind((4, msg.text_plain.as_str()))?;
-            stmt.bind((5, msg.text_stripped.as_str()))?;
-            match &msg.link {
-                Some(l) => stmt.bind((6, l.as_str()))?,
-                None => stmt.bind((6, sqlite::Value::Null))?,
-            };
-            stmt.bind((7, jamo.as_str()))?;
-            stmt.next()?;
-
-            // Check if the row was actually inserted (not a duplicate)
-            let mut changes_stmt = self.conn.prepare("SELECT changes()")?;
-            changes_stmt.next()?;
-            let changes: i64 = changes_stmt.read(0)?;
-
-            if changes > 0 {
-                let mut rowid_stmt = self.conn.prepare("SELECT last_insert_rowid()")?;
-                rowid_stmt.next()?;
-                let msg_rowid: i64 = rowid_stmt.read(0)?;
-
-                // Keep every external-content FTS5 table in sync. Each
-                // one was rebuilt during the v6 migration; these
-                // inserts cover the hot path for new messages.
-                fts_insert(
-                    &self.conn,
-                    "messages_fts",
-                    "text_plain",
-                    msg_rowid,
-                    &msg.text_plain,
                 )?;
-                fts_insert(
-                    &self.conn,
-                    "messages_fts_nospace",
-                    "text_stripped",
-                    msg_rowid,
-                    &msg.text_stripped,
-                )?;
-                fts_insert(
-                    &self.conn,
-                    "messages_fts_jamo",
-                    "text_jamo",
-                    msg_rowid,
-                    &jamo,
-                )?;
+                stmt.bind((1, msg.message_id))?;
+                stmt.bind((2, msg.chat_id))?;
+                stmt.bind((3, msg.timestamp))?;
+                stmt.bind((4, msg.text_plain.as_str()))?;
+                stmt.bind((5, msg.text_stripped.as_str()))?;
+                match &msg.link {
+                    Some(l) => stmt.bind((6, l.as_str()))?,
+                    None => stmt.bind((6, sqlite::Value::Null))?,
+                };
+                stmt.bind((7, jamo.as_str()))?;
+                stmt.next()?;
+
+                // Check if the row was actually inserted (not a duplicate)
+                let mut changes_stmt = self.conn.prepare("SELECT changes()")?;
+                changes_stmt.next()?;
+                let changes: i64 = changes_stmt.read(0)?;
+
+                if changes > 0 {
+                    let mut rowid_stmt = self.conn.prepare("SELECT last_insert_rowid()")?;
+                    rowid_stmt.next()?;
+                    let msg_rowid: i64 = rowid_stmt.read(0)?;
+
+                    // Keep every external-content FTS5 table in sync. Each
+                    // one was rebuilt during the v6 migration; these
+                    // inserts cover the hot path for new messages.
+                    fts_insert(
+                        &self.conn,
+                        "messages_fts",
+                        "text_plain",
+                        msg_rowid,
+                        &msg.text_plain,
+                    )?;
+                    fts_insert(
+                        &self.conn,
+                        "messages_fts_nospace",
+                        "text_stripped",
+                        msg_rowid,
+                        &msg.text_stripped,
+                    )?;
+                    fts_insert(
+                        &self.conn,
+                        "messages_fts_jamo",
+                        "text_jamo",
+                        msg_rowid,
+                        &jamo,
+                    )?;
+
+                    let mut q = self.conn.prepare(
+                        "INSERT OR IGNORE INTO wiki_classify_queue (chat_id, message_id)
+                     VALUES (?, ?)",
+                    )?;
+                    q.bind((1, msg.chat_id))?;
+                    q.bind((2, msg.message_id))?;
+                    q.next()?;
+                }
             }
-        }
             Ok(())
         })();
         match result {
@@ -670,5 +678,36 @@ mod tests {
     fn test_message_count() {
         let store = test_store();
         assert_eq!(store.message_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn insert_messages_batch_enqueues_classify() {
+        let store = Store::open_in_memory().unwrap();
+        let msgs = vec![
+            MessageRow {
+                message_id: 10,
+                chat_id: 1,
+                timestamp: 1_700_000_000,
+                text_plain: "테스트 메시지".into(),
+                text_stripped: "테스트메시지".into(),
+                link: None,
+            },
+            MessageRow {
+                message_id: 11,
+                chat_id: 1,
+                timestamp: 1_700_000_001,
+                text_plain: "another".into(),
+                text_stripped: "another".into(),
+                link: None,
+            },
+        ];
+        store.insert_messages_batch(&msgs).unwrap();
+
+        let stats = store.get_queue_stats().unwrap();
+        assert_eq!(stats.pending, 2);
+
+        store.insert_messages_batch(&msgs).unwrap();
+        let stats = store.get_queue_stats().unwrap();
+        assert_eq!(stats.pending, 2);
     }
 }

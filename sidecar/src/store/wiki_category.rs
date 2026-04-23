@@ -10,6 +10,14 @@ pub struct WikiCategory {
     pub sort_order: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CategoryWithCount {
+    pub id: i64,
+    pub name: String,
+    pub name_ko: Option<String>,
+    pub topic_count: i64,
+}
+
 /// Common aliases that should merge into the same category.
 /// Maps normalized form → canonical name.
 const KNOWN_ALIASES: &[(&[&str], &str)] = &[
@@ -616,6 +624,28 @@ impl Store {
         Ok(())
     }
 
+    /// All categories with their topic counts, ordered by topic count
+    /// descending. Used by the Swift wiki panel's category list.
+    pub fn get_categories_with_counts(&self) -> Result<Vec<CategoryWithCount>, sqlite::Error> {
+        let mut stmt = self.conn().prepare(
+            "SELECT c.category_id, c.name, c.name_ko,
+                    (SELECT COUNT(*) FROM wiki_topics t WHERE t.category_id = c.category_id)
+                        AS topic_count
+             FROM wiki_categories c
+             ORDER BY topic_count DESC",
+        )?;
+        let mut out = Vec::new();
+        while let sqlite::State::Row = stmt.next()? {
+            out.push(CategoryWithCount {
+                id: stmt.read::<i64, _>(0)?,
+                name: stmt.read::<String, _>(1)?,
+                name_ko: stmt.read::<Option<String>, _>(2)?,
+                topic_count: stmt.read::<i64, _>(3)?,
+            });
+        }
+        Ok(out)
+    }
+
     /// Resolve a category and return both the id and canonical name.
     pub fn resolve_category_with_name(
         &self,
@@ -744,5 +774,47 @@ mod tests {
         assert_eq!(find_canonical_name("defi"), Some("DeFi"));
         assert_eq!(find_canonical_name("btc"), Some("Bitcoin"));
         assert_eq!(find_canonical_name("something random"), None);
+    }
+
+    #[test]
+    fn test_get_categories_with_counts_ordered() {
+        let store = Store::open_in_memory().unwrap();
+        let c_hot = store.resolve_category("Hot", None).unwrap();
+        let c_mid = store.resolve_category("Mid", None).unwrap();
+        let _c_cold = store.resolve_category("Cold", None).unwrap();
+
+        // Seed 3 topics under Hot, 1 under Mid, 0 under Cold.
+        for i in 0..3 {
+            store
+                .conn()
+                .execute(format!(
+                    "INSERT INTO wiki_topics (title, category_id) VALUES ('h{}', {})",
+                    i, c_hot
+                ))
+                .unwrap();
+        }
+        store
+            .conn()
+            .execute(format!(
+                "INSERT INTO wiki_topics (title, category_id) VALUES ('m0', {})",
+                c_mid
+            ))
+            .unwrap();
+
+        let cats = store.get_categories_with_counts().unwrap();
+        assert_eq!(cats.len(), 3);
+        assert_eq!(cats[0].name, "Hot");
+        assert_eq!(cats[0].topic_count, 3);
+        assert_eq!(cats[1].name, "Mid");
+        assert_eq!(cats[1].topic_count, 1);
+        assert_eq!(cats[2].name, "Cold");
+        assert_eq!(cats[2].topic_count, 0);
+    }
+
+    #[test]
+    fn test_get_categories_with_counts_empty() {
+        let store = Store::open_in_memory().unwrap();
+        let cats = store.get_categories_with_counts().unwrap();
+        assert!(cats.is_empty());
     }
 }

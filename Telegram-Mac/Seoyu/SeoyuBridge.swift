@@ -12,6 +12,7 @@ public final class SeoyuBridge {
     public private(set) var seoyu: Seoyu?
     public private(set) var initializationError: Error?
     private var ingestDisposable: Disposable?
+    private let wikiObserverBridge = WikiObserverBridge()
 
     private init() {}
 
@@ -49,6 +50,21 @@ public final class SeoyuBridge {
         self.ingestDisposable?.dispose()
         let observer = SeoyuIngestObserver(seoyu: seoyu)
         self.ingestDisposable = postbox.installGlobalStoreOrUpdateMessageAction(action: observer)
+
+        do {
+            try seoyu.startWikiWorker()
+            NSLog("[seoyu] wiki worker started")
+            seoyu.setWikiObserver(observer: self.wikiObserverBridge)
+            NSLog("[seoyu] wiki observer attached")
+        } catch {
+            NSLog("[seoyu] wiki worker start failed: %@", String(describing: error))
+        }
+    }
+
+    deinit {
+        self.ingestDisposable?.dispose()
+        self.seoyu?.setWikiObserver(observer: nil)
+        self.seoyu?.stopWikiWorker()
     }
 
     /// Run a global Korean-aware search. Returns an empty list if the

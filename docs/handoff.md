@@ -1,98 +1,128 @@
 # Session Handoff
-> Generated: 2026-04-23 17:05
+> Generated: 2026-04-23 (Phase 3-5 inline execution)
 
 ## Task
-Rebuild TelegramSwift fork with latest Seoyu source, confirm Korean search
-(Seoyu sidecar) is live in the running app binary.
+Ship wiki panel UI Phase 3-5 on `wiki-feature` branch. User chose
+**option 2** from prior handoff: write Swift in worktree, defer Xcode
+build verification to merge time on the main tree.
 
 ## Status
 
-### Completed
-- Stale Apr 1 dev binary killed (was PID 25602).
-- Diagnosed recurring Xcode 26 Metal-cryptex linker bug. Same bug
-  previously resolved and documented in
-  `docs/XCODE26-BLOCKER.md` — workaround is a linker shim at
-  `scripts/ld-cryptex-shim.sh`, plus `scripts/fix-shallow-frameworks.sh`
-  to re-version Firebase/GoogleAppMeasurement macos-slices each build.
-- Rebuilt cleanly using documented recipe:
-  ```
-  ./scripts/fix-shallow-frameworks.sh
-  xcodebuild build -workspace Telegram-Mac.xcworkspace -scheme Telegram \
-    -configuration Debug -destination 'generic/platform=macOS' \
-    ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
-    LD=$PWD/scripts/ld-cryptex-shim.sh \
-    LDPLUSPLUS=$PWD/scripts/ld-cryptex-shim.sh \
-    -derivedDataPath ~/Library/Developer/Xcode/DerivedData/Telegram-Mac-basjkgxsmvqzctcrxcuexrxbttgq
-  ```
-- Binary fresh: `stat -f "%Sm"` on
-  `~/Library/Developer/Xcode/DerivedData/Telegram-Mac-basjkgxsmvqzctcrxcuexrxbttgq/Build/Products/Debug/Telegram.app/Contents/MacOS/Telegram`
-  → `Apr 23 17:00:46 2026`.
-- Seoyu symbols linked: `nm Telegram.debug.dylib | grep -ic seoyu` → **2658**.
-- App launched (PID 83825), sidecar store active:
-  `~/Library/Application Support/telegram-korean-search/tg-korean-search.db`
-  mtime Apr 23 17:02, WAL growing → ingest live.
+### Completed on branch `wiki-feature` (24 commits ahead of `main`)
 
-### Verified indirectly
-- No `[seoyu] opened store at ...` os_log lines captured. NSLog in Xcode
-  debug builds routes to stderr, not `os_log` subsystem. DB mtime is the
-  authoritative proof the Rust sidecar opened. OS log shows
-  `com.seoyu.telegram-seoyu` bundle id on AVFoundation/UserNotifications
-  events, confirming the running process is the fresh Seoyu build.
+**Phase 3 — trending list** (commit `feat(wiki): trending list + digest + category chips`):
+- `Telegram-Mac/Seoyu/Wiki/WikiListViewController.swift` — table backed by
+  `seoyu.wikiTrending(...)`, throttled reload on `.seoyuWikiTopicsChanged`,
+  language-swap on `.seoyuWikiLanguageChanged`, optional `seed:` init for
+  search results, empty-state label, progress placeholder.
+- `Telegram-Mac/Seoyu/Wiki/WikiDigestCardView.swift` — "N topics · M msgs
+  today" + hot-topic strip; hides when digest empty.
+- `Telegram-Mac/Seoyu/Wiki/WikiCategoryChipsView.swift` — chip row with
+  "All" + first 6 + overflow expander, accent-tinted selection.
+- `Telegram-Mac/Seoyu/Wiki/WikiTabController.swift` — replaced placeholder
+  with push-based nav stack (`push(_:)`, `popToRoot()`).
+
+**Phase 4 — article view** (commit `feat(wiki): article view + source-message navigation`):
+- `Telegram-Mac/Seoyu/Wiki/MarkdownRenderer.swift` — in-tree md →
+  `NSAttributedString`. Supports `#`/`##`, `**bold**`, `*italic*`,
+  inline `` `code` ``, bullets (`-`/`*`), paragraphs. No deps.
+- `Telegram-Mac/Seoyu/Wiki/WikiSourceCellView.swift` — two-line source
+  cell using `RelativeDateTimeFormatter`.
+- `Telegram-Mac/Seoyu/Wiki/WikiArticleViewController.swift` — title +
+  scrollable rendered article + sources table. Click source → invokes
+  `openChat(chatId, messageId)` closure.
+- `Telegram-Mac/MainViewController.swift:776` — passes an `openChat`
+  closure that pushes `ChatController(... focusTarget: .init(messageId:))`
+  via `context.bindings.rootNavigation()`.
+
+**Phase 5 — polish** (commit `feat(wiki): toolbar + progress/error banners`):
+- WikiTabController toolbar: EN/KO toggle, Search (modal sheet → seeded
+  `WikiListViewController`), Run classify (`seoyu.wikiRunPendingNow()`,
+  enabled iff `pendingCount > 0`).
+- WikiListViewController: top dismissible error banner (recoverable=false),
+  bottom auto-dismissing 3s toast (recoverable=true).
+
+### NOT done (deferred, requires real build env)
+
+- **`Telegram.xcodeproj/project.pbxproj` updates** — six new files added
+  in this session are NOT in the pbxproj yet:
+  - `Telegram-Mac/Seoyu/Wiki/WikiListViewController.swift`
+  - `Telegram-Mac/Seoyu/Wiki/WikiDigestCardView.swift`
+  - `Telegram-Mac/Seoyu/Wiki/WikiCategoryChipsView.swift`
+  - `Telegram-Mac/Seoyu/Wiki/MarkdownRenderer.swift`
+  - `Telegram-Mac/Seoyu/Wiki/WikiSourceCellView.swift`
+  - `Telegram-Mac/Seoyu/Wiki/WikiArticleViewController.swift`
+- **Xcode build verification** — worktree env still missing libwebp /
+  ffmpeg / webrtc xcframeworks per prior handoff. Build moves to the
+  main tree post-merge.
+- **P5.T3 smoke test** — needs running app.
 
 ## Resume Here
-1. App is already running (PID 83825). Focus the window.
-2. Search "삼성전" in the search bar. Expect Seoyu-augmented hits in
-   the global results list, merged in
-   `Telegram-Mac/SearchController.swift:1254`.
-3. If no Seoyu hits appear:
-   - Verify ingest completed: FTS row count via
-     `sqlite3 ~/Library/Application\ Support/telegram-korean-search/tg-korean-search.db "SELECT COUNT(*) FROM messages_fts;"`
-   - Stream app stderr (not os_log):
-     `log stream --process Telegram --debug --info` and watch for
-     `[seoyu]` prefix, OR relaunch under Xcode debugger.
-   - Bridge search path:
-     `Telegram-Mac/Seoyu/SeoyuBridge.swift:57` — `search(query:limit:)`
-     catches errors silently and returns `[]`. Add a breakpoint there
-     if the augment merge looks empty.
+
+1. **Switch to main tree** `/Users/sskys/Mine/telegram-korean-search`,
+   working Xcode env there.
+2. **Merge `wiki-feature` → `main`** (fast-forward expected, 24 commits).
+3. In Xcode, **drag the six new files** from `Telegram-Mac/Seoyu/Wiki/`
+   into the Telegram target (or run a `xcodeproj` ruby script following
+   the pattern from the prior `feat(wiki): WikiTabController scaffold`
+   pbxproj diff).
+4. **Build via** `./scripts/build-dev.sh --run` (preferred — wires
+   `ld-cryptex-shim.sh` for Xcode 26 Metal cryptex bug). Or in Xcode,
+   build the **Telegram** scheme (not `All`). Verify mtime fresh:
+   ```
+   stat -f "%Sm" ~/Library/Developer/Xcode/DerivedData/Telegram-Mac-basjkgxsmvqzctcrxcuexrxbttgq/Build/Products/Debug/Telegram.app/Contents/MacOS/Telegram
+   ```
+5. **Smoke test** (P5.T3): launch, log in, wait for ingest, watch logs:
+   ```
+   /usr/bin/log stream --predicate 'process == "Telegram" AND eventMessage CONTAINS "seoyu"'
+   ```
+   Expect `[seoyu] wiki worker started` + `[seoyu] wiki observer attached`.
+6. Open Wiki tab → digest + chips + trending visible. Click topic →
+   article + sources. Click source row → main window focuses the chat at
+   that message.
+7. Toggle EN/KO → titles + article body switch language.
+8. Search button → modal → enter "삼성" → seeded results list.
+9. Restart app → language preference persists.
 
 ## Decisions
-- **CLI build, not GUI**: user had no signing cert in login keychain
-  (`security find-identity -p codesigning -v` → 0 identities). CLI path
-  with `CODE_SIGNING_ALLOWED=NO` + the documented ld-cryptex shim
-  produced a working unsigned arm64 build that launches and reaches
-  Seoyu bootstrap.
-- **Single-arch**: `ARCHS=arm64 ONLY_ACTIVE_ARCH=YES` — halves link
-  time, matches the XCODE26-BLOCKER recipe, no x86_64 needed on this
-  box.
+
+- **Inline execution** of Phase 3-5 in the worktree, no per-phase build
+  gate — accepted by user explicitly. All four sub-phase commits land on
+  `wiki-feature` already.
+- **Forward reference allowed**: WikiTabController in Phase 3 commit
+  references `WikiArticleViewController` (added in Phase 4 commit). Each
+  commit is internally consistent within the branch but `wiki-feature@P3`
+  alone won't compile — fine because we never check out that intermediate
+  state.
+- **PeerId/MessageId construction in MainViewController**: uses
+  `PeerId(chatId)` + `MessageId(peerId:, namespace: Namespaces.Message.Cloud, id: Int32(messageId))`,
+  matching the pattern at `AppDelegate.swift:1346`.
 
 ## Gotchas
-- `xcodebuild build -workspace ... -scheme Telegram` without a
-  `-destination` flag fails silently with "Supported platforms ...
-  is empty". Always pass `-destination 'generic/platform=macOS'` (or
-  `platform=macOS`).
-- Two concurrent `xcodebuild` against the same DerivedData lock each
-  other via `build.db is locked`. Previous-session zombie xcodebuild
-  will block the current build. `pgrep -lf xcodebuild` before starting.
-- Metal-cryptex linker error signature is unchanged from the previous
-  incident. If you see it again, the shim was not applied — check that
-  `LD=` and `LDPLUSPLUS=` both point at
-  `scripts/ld-cryptex-shim.sh` and that the script is executable.
-- Setting `TOOLCHAINS=com.apple.dt.toolchain.XcodeDefault` to "fix"
-  the cryptex path breaks the Metal shader compile step (it needs the
-  Metal toolchain). The shim is the correct fix — do not revert to the
-  TOOLCHAINS workaround.
-- `CODE_SIGNING_ALLOWED=NO` unsigned builds reach Seoyu bootstrap
-  (NSLog + SQLite), but Keychain-backed features (session secrets in
-  `sidecar/src/security/keychain.rs`) will fail silently if you exercise
-  them. Sign properly in Xcode GUI for full feature validation.
+
+- **pbxproj is the manual step**. The six Swift files are on disk +
+  committed but Xcode won't see them until you add file refs. Without
+  this, the build fails with `cannot find type 'WikiListViewController'`
+  etc.
+- **NSTextField.action firing**: the search sheet wires
+  `field.action = #selector(submitSearch(_:))` so Enter submits. If you
+  don't see it fire, ensure the field is the window's
+  `initialFirstResponder` (already set).
+- **ForeignEmitter debounces topics-changed at 500ms** AND
+  WikiListViewController throttles `reload()` at 500ms — redundant but
+  cheap, leave it.
+- **Run-classify button disabled until first progress event with
+  `pending > 0`**. On a fresh empty queue it stays disabled — expected.
 
 ## Context
-- **Branch**: main, clean except pre-existing
-  `M docs/handoff.md`, `M .gitignore`, untracked
-  `docs/plans/`, `docs/specs/`, `default.profraw`.
-- **Build artifacts**:
-  `~/Library/Developer/Xcode/DerivedData/Telegram-Mac-basjkgxsmvqzctcrxcuexrxbttgq/Build/Products/Debug/Telegram.app`
-- **Running proc**: dev build PID 83825.
-  Official `/Applications/Telegram.app` also running — do not confuse.
-- **Sidecar state**: `tg-korean-search.db` 194 MB, WAL 112 MB, live.
-- **Prior handoff**: superseded. Git `docs/handoff.md@HEAD~1`.
+
+- **Branch**: `wiki-feature` in `/Users/sskys/Mine/telegram-korean-search/.worktrees/wiki-feature`.
+- **Main branch ref**: `c216dbb9d` (24 commits behind `wiki-feature`).
+- **Tests**: sidecar `cargo test --lib` last green at 107 passed (Phase 1
+  baseline). Not re-run this session — Phase 3-5 is Swift-only, sidecar
+  untouched.
+- **Plans**: `docs/plans/2026-04-23-wiki-panel-ui.md` — P1, P2, P3, P4,
+  P5.T1, P5.T2 shipped; P5.T3 (smoke test) and pbxproj manual step
+  remain.
+- **Spec**: `docs/specs/2026-04-23-wiki-panel-design.md` (approved).
+- **Unpushed**: entire `wiki-feature` branch.

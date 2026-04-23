@@ -22,12 +22,14 @@
 //! `try` / `catch`. Do not panic across the FFI boundary; convert to
 //! an error instead.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::search::{engine, SearchResult as CoreSearchResult};
 use crate::store::chat::ChatRow;
 use crate::store::message::{strip_whitespace, Cursor, MessageRow};
 use crate::store::Store;
+use crate::wiki::worker::WorkerHandle;
 
 /// Swift-facing errors. Anything that went wrong inside the crate is
 /// flattened into one of these three variants. The actual backtrace
@@ -123,6 +125,29 @@ pub struct WikiTopicDetail {
     pub article_md_ko: Option<String>,
 }
 
+#[derive(uniffi::Record, Clone)]
+pub struct WikiDigest {
+    pub date_ymd: String,
+    pub topic_count: i64,
+    pub message_count: i64,
+    pub hot_topics: Vec<WikiTopicSummary>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WikiCategory {
+    pub id: i64,
+    pub name: String,
+    pub name_ko: Option<String>,
+    pub topic_count: i64,
+}
+
+#[uniffi::export(with_foreign)]
+pub trait WikiObserver: Send + Sync {
+    fn on_progress(&self, processed: u64, pending: u64, total: u64);
+    fn on_error(&self, message: String, recoverable: bool);
+    fn on_topics_changed(&self);
+}
+
 // ---------- The Swift-facing `Seoyu` object ----------
 
 /// Root handle the Swift shell keeps for the lifetime of the app.
@@ -131,6 +156,9 @@ pub struct WikiTopicDetail {
 #[derive(uniffi::Object)]
 pub struct Seoyu {
     store: Arc<Mutex<Store>>,
+    wiki_worker: Mutex<Option<WorkerHandle>>,
+    wiki_observer: Arc<Mutex<Option<Arc<dyn WikiObserver>>>>,
+    wiki_wake: Arc<AtomicBool>,
 }
 
 #[uniffi::export]
@@ -145,6 +173,9 @@ impl Seoyu {
         let store = Store::open(&path)?;
         Ok(Arc::new(Seoyu {
             store: Arc::new(Mutex::new(store)),
+            wiki_worker: Mutex::new(None),
+            wiki_observer: Arc::new(Mutex::new(None)),
+            wiki_wake: Arc::new(AtomicBool::new(false)),
         }))
     }
 
@@ -279,6 +310,89 @@ impl Seoyu {
         }
         Ok(out)
     }
+
+    pub fn start_wiki_worker(&self) -> Result<(), SeoyuError> {
+        let mut guard = self.wiki_worker.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return Ok(());
+        }
+        let emitter = Arc::new(crate::wiki::worker::ForeignEmitter::new(Arc::clone(
+            &self.wiki_observer,
+        )));
+        let handle = crate::wiki::worker::start_worker(
+            Arc::clone(&self.store),
+            emitter,
+            Arc::clone(&self.wiki_wake),
+        )
+        .map_err(|e| SeoyuError::Other(format!("spawn wiki worker: {e}")))?;
+        *guard = Some(handle);
+        Ok(())
+    }
+
+    pub fn set_wiki_observer(&self, observer: Option<Arc<dyn WikiObserver>>) {
+        let mut slot = self.wiki_observer.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = observer;
+    }
+
+    pub fn wiki_run_pending_now(&self) {
+        self.wiki_wake.store(true, Ordering::Relaxed);
+    }
+
+    pub fn stop_wiki_worker(&self) {
+        let handle = {
+            let mut guard = self.wiki_worker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        if let Some(h) = handle {
+            h.stop();
+            h.join();
+        }
+    }
+
+    pub fn wiki_digest_today(&self) -> Result<WikiDigest, SeoyuError> {
+        let store = self.lock_store();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let (day_start, ymd) = local_day_start(now_secs);
+        let (topic_count, message_count) = store.wiki_counts_since(day_start)?;
+        let hot_topics = store
+            .get_trending_topics(3, 0, None)?
+            .into_iter()
+            .map(wiki_topic_to_summary)
+            .collect();
+        Ok(WikiDigest {
+            date_ymd: ymd,
+            topic_count,
+            message_count,
+            hot_topics,
+        })
+    }
+
+    pub fn wiki_topic_messages(
+        &self,
+        topic_id: i64,
+        limit: u32,
+    ) -> Result<Vec<SearchHit>, SeoyuError> {
+        let store = self.lock_store();
+        let rows = store.get_topic_messages(topic_id, limit as usize)?;
+        Ok(rows.into_iter().map(topic_row_to_hit).collect())
+    }
+
+    pub fn wiki_categories(&self) -> Result<Vec<WikiCategory>, SeoyuError> {
+        let store = self.lock_store();
+        let cats = store.get_categories_with_counts()?;
+        Ok(cats
+            .into_iter()
+            .map(|c| WikiCategory {
+                id: c.id,
+                name: c.name,
+                name_ko: c.name_ko,
+                topic_count: c.topic_count,
+            })
+            .collect())
+    }
 }
 
 impl Seoyu {
@@ -329,5 +443,48 @@ fn wiki_topic_to_summary(t: crate::store::wiki_topic::WikiTopic) -> WikiTopicSum
         category: t.category_name.unwrap_or_else(|| "Uncategorized".into()),
         message_count: t.message_count,
         trending_score: t.trending_score,
+    }
+}
+
+impl Drop for Seoyu {
+    fn drop(&mut self) {
+        self.set_wiki_observer(None);
+        self.stop_wiki_worker();
+    }
+}
+
+fn local_day_start(now_secs: i64) -> (i64, String) {
+    use std::mem::MaybeUninit;
+    unsafe {
+        let t: libc::time_t = now_secs as libc::time_t;
+        let mut local: MaybeUninit<libc::tm> = MaybeUninit::uninit();
+        if libc::localtime_r(&t, local.as_mut_ptr()).is_null() {
+            return (now_secs - now_secs.rem_euclid(86_400), "1970-01-01".into());
+        }
+        let local = local.assume_init();
+        let ymd = format!(
+            "{:04}-{:02}-{:02}",
+            local.tm_year + 1900,
+            local.tm_mon + 1,
+            local.tm_mday,
+        );
+        let day_start = now_secs
+            - (local.tm_hour as i64) * 3600
+            - (local.tm_min as i64) * 60
+            - (local.tm_sec as i64);
+        (day_start, ymd)
+    }
+}
+
+fn topic_row_to_hit(row: crate::store::wiki_topic::TopicMessageRow) -> SearchHit {
+    SearchHit {
+        chat_id: row.chat_id,
+        message_id: row.message_id,
+        timestamp: row.timestamp,
+        text: row.text,
+        link: row.link,
+        chat_title: row.chat_title,
+        highlight_starts: Vec::new(),
+        highlight_ends: Vec::new(),
     }
 }
