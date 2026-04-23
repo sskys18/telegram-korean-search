@@ -127,6 +127,14 @@ impl Store {
                     msg_rowid,
                     &jamo,
                 )?;
+
+                let mut q = self.conn.prepare(
+                    "INSERT OR IGNORE INTO wiki_classify_queue (chat_id, message_id)
+                     VALUES (?, ?)",
+                )?;
+                q.bind((1, msg.chat_id))?;
+                q.bind((2, msg.message_id))?;
+                q.next()?;
             }
         }
             Ok(())
