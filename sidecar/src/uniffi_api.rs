@@ -28,6 +28,7 @@ use crate::search::{engine, SearchResult as CoreSearchResult};
 use crate::store::chat::ChatRow;
 use crate::store::message::{strip_whitespace, Cursor, MessageRow};
 use crate::store::Store;
+use crate::wiki::worker::{start_worker, LogEmitter, WorkerHandle};
 
 /// Swift-facing errors. Anything that went wrong inside the crate is
 /// flattened into one of these three variants. The actual backtrace
@@ -131,6 +132,7 @@ pub struct WikiTopicDetail {
 #[derive(uniffi::Object)]
 pub struct Seoyu {
     store: Arc<Mutex<Store>>,
+    wiki_worker: Mutex<Option<WorkerHandle>>,
 }
 
 #[uniffi::export]
@@ -145,6 +147,7 @@ impl Seoyu {
         let store = Store::open(&path)?;
         Ok(Arc::new(Seoyu {
             store: Arc::new(Mutex::new(store)),
+            wiki_worker: Mutex::new(None),
         }))
     }
 
@@ -279,6 +282,28 @@ impl Seoyu {
         }
         Ok(out)
     }
+
+    pub fn start_wiki_worker(&self) -> Result<(), SeoyuError> {
+        let mut guard = self.wiki_worker.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_some() {
+            return Ok(());
+        }
+        let handle = start_worker(Arc::clone(&self.store), Arc::new(LogEmitter))
+            .map_err(|e| SeoyuError::Other(format!("spawn wiki worker: {e}")))?;
+        *guard = Some(handle);
+        Ok(())
+    }
+
+    pub fn stop_wiki_worker(&self) {
+        let handle = {
+            let mut guard = self.wiki_worker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        if let Some(h) = handle {
+            h.stop();
+            h.join();
+        }
+    }
 }
 
 impl Seoyu {
@@ -329,5 +354,11 @@ fn wiki_topic_to_summary(t: crate::store::wiki_topic::WikiTopic) -> WikiTopicSum
         category: t.category_name.unwrap_or_else(|| "Uncategorized".into()),
         message_count: t.message_count,
         trending_score: t.trending_score,
+    }
+}
+
+impl Drop for Seoyu {
+    fn drop(&mut self) {
+        self.stop_wiki_worker();
     }
 }

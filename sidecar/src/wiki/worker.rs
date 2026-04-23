@@ -47,9 +47,7 @@ pub struct LogEmitter;
 
 impl EventEmitter for LogEmitter {
     fn wiki_progress(&self, processed: u64, pending: u64, total: u64) {
-        log::info!(
-            "wiki progress: processed={processed} pending={pending} total={total}"
-        );
+        log::info!("wiki progress: processed={processed} pending={pending} total={total}");
     }
     fn wiki_error(&self, message: &str, recoverable: bool) {
         log::warn!("wiki error (recoverable={recoverable}): {message}");
@@ -81,10 +79,7 @@ impl WorkerHandle {
 /// runtime. The worker owns an `Arc<Mutex<Store>>` handle so it can
 /// run alongside the IPC server without blocking incoming requests
 /// beyond individual short critical sections.
-pub fn start_worker<E>(
-    store: Arc<Mutex<Store>>,
-    emitter: Arc<E>,
-) -> std::io::Result<WorkerHandle>
+pub fn start_worker<E>(store: Arc<Mutex<Store>>, emitter: Arc<E>) -> std::io::Result<WorkerHandle>
 where
     E: EventEmitter,
 {

@@ -5,9 +5,7 @@
 //! the FFI types and in the wiring that forwards to the core
 //! modules.
 
-use seoyu::uniffi_api::{
-    ChatInfo, IndexedMessage, SearchScope, Seoyu,
-};
+use seoyu::uniffi_api::{ChatInfo, IndexedMessage, SearchScope, Seoyu};
 
 fn tmp_db(tag: &str) -> String {
     let pid = std::process::id();
