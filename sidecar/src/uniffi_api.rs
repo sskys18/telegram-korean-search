@@ -124,6 +124,29 @@ pub struct WikiTopicDetail {
     pub article_md_ko: Option<String>,
 }
 
+#[derive(uniffi::Record, Clone)]
+pub struct WikiDigest {
+    pub date_ymd: String,
+    pub topic_count: i64,
+    pub message_count: i64,
+    pub hot_topics: Vec<WikiTopicSummary>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WikiCategory {
+    pub id: i64,
+    pub name: String,
+    pub name_ko: Option<String>,
+    pub topic_count: i64,
+}
+
+#[uniffi::export(with_foreign)]
+pub trait WikiObserver: Send + Sync {
+    fn on_progress(&self, processed: u64, pending: u64, total: u64);
+    fn on_error(&self, message: String, recoverable: bool);
+    fn on_topics_changed(&self);
+}
+
 // ---------- The Swift-facing `Seoyu` object ----------
 
 /// Root handle the Swift shell keeps for the lifetime of the app.
