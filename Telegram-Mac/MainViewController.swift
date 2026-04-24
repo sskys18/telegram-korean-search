@@ -406,12 +406,7 @@ class MainViewController: TelegramViewController {
         wikiToggleButton.toolTip = "Wiki"
 
         installWikiTitlebarAccessory()
-
-        if FastSettings.wikiPanelShown {
-            DispatchQueue.main.async { [weak self] in
-                self?.openWikiPanel()
-            }
-        }
+        FastSettings.wikiPanelShown = false
     }
 
     private func installWikiTitlebarAccessory() {
@@ -443,7 +438,6 @@ class MainViewController: TelegramViewController {
 
         let panelWidth = Self.wikiPanelWidth
 
-        // Identify the main content view (anything that's not our panel).
         let mainView = host.subviews.first(where: { $0 !== wikiPanelView })
         self.wikiMainContentRef = mainView
         if let main = mainView, self.wikiMainSavedAutoresizing == nil {
@@ -451,15 +445,15 @@ class MainViewController: TelegramViewController {
             main.autoresizingMask = []
         }
 
-        // Build panel contents once.
         if wikiPanelView.superview == nil {
             wikiPanelView.wantsLayer = true
             wikiPanelView.layer?.backgroundColor = theme.colors.background.cgColor
             wikiPanelView.layer?.borderWidth = 1
             wikiPanelView.layer?.borderColor = theme.colors.border.cgColor
+            wiki.loadViewIfNeeded(NSRect(x: 0, y: 0, width: panelWidth, height: max(host.bounds.height, 600)))
             let child = wiki.view
-            child.frame = NSRect(x: 0, y: 0, width: panelWidth, height: host.bounds.height)
-            child.autoresizingMask = [.width, .height]
+            child.translatesAutoresizingMaskIntoConstraints = true
+            child.autoresizingMask = []
             wikiPanelView.addSubview(child)
         }
         if wikiPanelView.superview !== host {
@@ -468,13 +462,10 @@ class MainViewController: TelegramViewController {
         wikiPanelView.isHidden = false
         wikiPanelView.autoresizingMask = []
 
-        // Grow window to make room for the panel; pin main at its current
-        // width so the chat area does not expand into the new space.
         var wf = window.frame
         wf.size.width += panelWidth
         window.setFrame(wf, display: true, animate: false)
 
-        // After the frame change we lay the panel out at the right edge.
         layoutWikiExpansion()
         installWikiResizeObserver()
         FastSettings.wikiPanelShown = true
@@ -486,14 +477,15 @@ class MainViewController: TelegramViewController {
         wikiPanelView.removeFromSuperview()
         removeWikiResizeObserver()
 
-        if let main = wikiMainContentRef, let saved = wikiMainSavedAutoresizing {
-            main.autoresizingMask = saved
-        }
-        wikiMainSavedAutoresizing = nil
-
         var wf = window.frame
         wf.size.width = max(wf.size.width - Self.wikiPanelWidth, window.minSize.width)
         window.setFrame(wf, display: true, animate: false)
+
+        if let main = wikiMainContentRef, let saved = wikiMainSavedAutoresizing {
+            main.frame = NSRect(x: 0, y: 0, width: wf.size.width, height: main.frame.height)
+            main.autoresizingMask = saved
+        }
+        wikiMainSavedAutoresizing = nil
         FastSettings.wikiPanelShown = false
     }
 
@@ -523,6 +515,9 @@ class MainViewController: TelegramViewController {
             main.frame = NSRect(x: 0, y: 0, width: mainWidth, height: host.bounds.height)
         }
         wikiPanelView.frame = NSRect(x: mainWidth, y: 0, width: panelWidth, height: host.bounds.height)
+        if let wv = wikiTabController?.view, wv.superview === wikiPanelView {
+            wv.frame = wikiPanelView.bounds
+        }
     }
 
     private func showCallsTab() {

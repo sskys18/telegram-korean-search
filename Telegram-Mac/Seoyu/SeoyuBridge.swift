@@ -56,6 +56,7 @@ public final class SeoyuBridge {
             NSLog("[seoyu] wiki worker started")
             seoyu.setWikiObserver(observer: self.wikiObserverBridge)
             NSLog("[seoyu] wiki observer attached")
+            seoyu.wikiRunPendingNow()
         } catch {
             NSLog("[seoyu] wiki worker start failed: %@", String(describing: error))
         }
