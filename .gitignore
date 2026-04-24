@@ -68,3 +68,7 @@ submodules/libwebp/SharedHeaders
 submodules/Mozjpeg/SharedHeaders
 submodules/OpenSSLEncryptionProvider/SharedHeaders
 .worktrees/
+
+*.profraw
+default.profraw
+xcuserdata/
