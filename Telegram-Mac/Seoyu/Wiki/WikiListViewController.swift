@@ -35,6 +35,10 @@ public final class WikiListViewController: NSViewController,
         root.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 0, right: 8)
         root.translatesAutoresizingMaskIntoConstraints = false
 
+        let header = NSTextField(labelWithString: "Wiki")
+        header.font = .systemFont(ofSize: 18, weight: .bold)
+        header.textColor = .labelColor
+        root.addArrangedSubview(header)
         root.addArrangedSubview(digestView)
         root.addArrangedSubview(chipsView)
 
@@ -42,7 +46,10 @@ public final class WikiListViewController: NSViewController,
         column.width = 400
         tableView.addTableColumn(column)
         tableView.headerView = nil
-        tableView.rowHeight = 44
+        tableView.rowHeight = 68
+        tableView.intercellSpacing = NSSize(width: 0, height: 6)
+        tableView.selectionHighlightStyle = .regular
+        tableView.gridStyleMask = []
         tableView.dataSource = self
         tableView.delegate = self
         tableView.target = self
@@ -239,22 +246,66 @@ public final class WikiListViewController: NSViewController,
         let topic = topics[row]
         let cell = NSTableCellView()
         cell.identifier = .init("topicCell")
+
         let title = NSTextField(labelWithString: titleForCurrentLanguage(topic))
-        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = .systemFont(ofSize: 14, weight: .semibold)
+        title.textColor = .labelColor
         title.lineBreakMode = .byTruncatingTail
-        let count = NSTextField(labelWithString: "\(topic.messageCount) msgs")
-        count.textColor = .secondaryLabelColor
-        count.translatesAutoresizingMaskIntoConstraints = false
-        let stack = NSStackView(views: [title, NSView(), count])
-        stack.orientation = .horizontal
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        cell.addSubview(stack)
+        title.translatesAutoresizingMaskIntoConstraints = false
+
+        let category = Self.makeCategoryPill(topic.category)
+        let msgs = NSTextField(labelWithString: "\(topic.messageCount) msgs")
+        msgs.font = .systemFont(ofSize: 11, weight: .medium)
+        msgs.textColor = .secondaryLabelColor
+        msgs.translatesAutoresizingMaskIntoConstraints = false
+
+        var metaItems: [NSView] = [category, msgs]
+        if topic.trendingScore >= 1.0 {
+            let fire = NSTextField(labelWithString: String(format: "🔥 %.1f", topic.trendingScore))
+            fire.font = .systemFont(ofSize: 11, weight: .semibold)
+            fire.textColor = .systemOrange
+            metaItems.append(fire)
+        }
+        metaItems.append(NSView())
+        let meta = NSStackView(views: metaItems)
+        meta.orientation = .horizontal
+        meta.spacing = 8
+        meta.alignment = .centerY
+        meta.translatesAutoresizingMaskIntoConstraints = false
+
+        let vStack = NSStackView(views: [title, meta])
+        vStack.orientation = .vertical
+        vStack.alignment = .leading
+        vStack.spacing = 6
+        vStack.translatesAutoresizingMaskIntoConstraints = false
+
+        cell.addSubview(vStack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 12),
-            stack.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -12),
-            stack.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            vStack.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 14),
+            vStack.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -14),
+            vStack.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
         ])
         return cell
+    }
+
+    private static func makeCategoryPill(_ name: String) -> NSView {
+        let label = NSTextField(labelWithString: name)
+        label.font = .systemFont(ofSize: 10, weight: .semibold)
+        label.textColor = .controlAccentColor
+        let pill = NSView()
+        pill.wantsLayer = true
+        pill.layer?.cornerRadius = 8
+        pill.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.15).cgColor
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        label.translatesAutoresizingMaskIntoConstraints = false
+        pill.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 8),
+            label.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -8),
+            label.topAnchor.constraint(equalTo: pill.topAnchor, constant: 3),
+            label.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -3),
+        ])
+        return pill
     }
 
     private func titleForCurrentLanguage(_ topic: WikiTopicSummary) -> String {

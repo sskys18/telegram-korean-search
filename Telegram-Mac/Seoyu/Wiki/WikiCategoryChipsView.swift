@@ -45,7 +45,7 @@ public final class WikiCategoryChipsView: NSView {
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
             scroll.topAnchor.constraint(equalTo: topAnchor),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
-            heightAnchor.constraint(equalToConstant: 28),
+            heightAnchor.constraint(equalToConstant: 32),
         ])
 
         overflowButton.bezelStyle = .inline
@@ -83,10 +83,27 @@ public final class WikiCategoryChipsView: NSView {
 
     private func makeChip(title: String, value: String?, selected: Bool) -> NSButton {
         let btn = NSButton(title: title, target: self, action: #selector(chipClicked(_:)))
-        btn.bezelStyle = .inline
+        btn.isBordered = false
         btn.setButtonType(.momentaryPushIn)
-        btn.contentTintColor = selected ? .controlAccentColor : .labelColor
         btn.identifier = .init(value ?? "__all__")
+        btn.wantsLayer = true
+        btn.layer?.cornerRadius = 12
+        btn.font = .systemFont(ofSize: 11, weight: selected ? .semibold : .regular)
+        if selected {
+            btn.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+            btn.contentTintColor = .white
+            btn.attributedTitle = NSAttributedString(string: title, attributes: [
+                .foregroundColor: NSColor.white,
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            ])
+        } else {
+            btn.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+            btn.contentTintColor = .labelColor
+            btn.attributedTitle = NSAttributedString(string: title, attributes: [
+                .foregroundColor: NSColor.labelColor,
+                .font: NSFont.systemFont(ofSize: 11),
+            ])
+        }
         return btn
     }
 
