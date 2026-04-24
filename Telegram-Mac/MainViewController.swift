@@ -464,6 +464,16 @@ class MainViewController: TelegramViewController {
 
         var wf = window.frame
         wf.size.width += panelWidth
+        if let screen = window.screen ?? NSScreen.main {
+            let vf = screen.visibleFrame
+            if wf.maxX > vf.maxX {
+                wf.origin.x = max(vf.minX, vf.maxX - wf.size.width)
+            }
+            if wf.size.width > vf.size.width {
+                wf.size.width = vf.size.width
+                wf.origin.x = vf.minX
+            }
+        }
         window.setFrame(wf, display: true, animate: false)
 
         layoutWikiExpansion()
@@ -517,6 +527,9 @@ class MainViewController: TelegramViewController {
         wikiPanelView.frame = NSRect(x: mainWidth, y: 0, width: panelWidth, height: host.bounds.height)
         if let wv = wikiTabController?.view, wv.superview === wikiPanelView {
             wv.frame = wikiPanelView.bounds
+            wv.needsLayout = true
+            wv.layoutSubtreeIfNeeded()
+            wikiTabController?.viewDidResized(wv.frame.size)
         }
     }
 

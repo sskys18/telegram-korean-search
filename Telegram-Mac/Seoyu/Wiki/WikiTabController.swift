@@ -40,6 +40,7 @@ public final class WikiTabController: ViewController {
         layoutManual()
 
         push(listController, animated: false)
+        layoutManual()
 
         NotificationCenter.default.addObserver(
             forName: .seoyuWikiProgress,
@@ -84,10 +85,12 @@ public final class WikiTabController: ViewController {
         statusLabel.frame = NSRect(x: max(w - sidePad - statusW, x + btnGap), y: topPad + 4, width: statusW, height: toolbarH - 4)
         let containerY = topPad + toolbarH + spacing
         containerView.frame = NSRect(x: 0, y: containerY, width: w, height: max(h - containerY, 0))
-        childWidthC?.constant = containerView.bounds.width
-        childHeightC?.constant = containerView.bounds.height
         for child in pageStack {
+            child.view.frame = containerView.bounds
+            child.view.needsUpdateConstraints = true
+            child.view.updateConstraintsForSubtreeIfNeeded()
             child.view.needsLayout = true
+            child.view.layoutSubtreeIfNeeded()
         }
     }
 
@@ -196,23 +199,14 @@ public final class WikiTabController: ViewController {
         push(article, animated: true)
     }
 
-    private var childWidthC: NSLayoutConstraint?
-    private var childHeightC: NSLayoutConstraint?
     private func push(_ child: NSViewController, animated: Bool) {
         if let current = pageStack.last {
             current.view.removeFromSuperview()
         }
-        child.view.translatesAutoresizingMaskIntoConstraints = false
+        child.view.translatesAutoresizingMaskIntoConstraints = true
+        child.view.autoresizingMask = [.width, .height]
+        child.view.frame = containerView.bounds
         containerView.addSubview(child.view)
-        let w = child.view.widthAnchor.constraint(equalToConstant: containerView.bounds.width)
-        let h = child.view.heightAnchor.constraint(equalToConstant: containerView.bounds.height)
-        NSLayoutConstraint.activate([
-            child.view.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
-            child.view.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
-            w, h,
-        ])
-        childWidthC = w
-        childHeightC = h
         pageStack.append(child)
         // viewDidAppear is unreliable without proper VC parenting, so
         // poke the new page to load its data immediately.
@@ -231,17 +225,10 @@ public final class WikiTabController: ViewController {
             top.view.removeFromSuperview()
         }
         if let root = pageStack.last {
-            root.view.translatesAutoresizingMaskIntoConstraints = false
+            root.view.translatesAutoresizingMaskIntoConstraints = true
+            root.view.autoresizingMask = [.width, .height]
+            root.view.frame = containerView.bounds
             containerView.addSubview(root.view)
-            let w = root.view.widthAnchor.constraint(equalToConstant: containerView.bounds.width)
-            let h = root.view.heightAnchor.constraint(equalToConstant: containerView.bounds.height)
-            NSLayoutConstraint.activate([
-                root.view.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
-                root.view.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
-                w, h,
-            ])
-            childWidthC = w
-            childHeightC = h
         }
         return true
     }
