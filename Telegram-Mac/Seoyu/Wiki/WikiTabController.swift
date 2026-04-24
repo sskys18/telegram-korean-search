@@ -89,12 +89,6 @@ public final class WikiTabController: ViewController {
         for child in pageStack {
             child.view.needsLayout = true
         }
-        if let list = pageStack.first {
-            NSLog("[wiki-layout3] view=%@ lang=%@ container=%@ list.view=%@ list.subs=%d", NSStringFromRect(view.frame), NSStringFromRect(langButton.frame), NSStringFromRect(containerView.frame), NSStringFromRect(list.view.frame), list.view.subviews.count)
-            for (i, sv) in list.view.subviews.enumerated() {
-                NSLog("[wiki-layout3]  list.sub[%d] %@ frame=%@ hidden=%d", i, NSStringFromClass(type(of: sv)), NSStringFromRect(sv.frame), sv.isHidden ? 1 : 0)
-            }
-        }
     }
 
     private func setupToolbar() {
@@ -214,7 +208,7 @@ public final class WikiTabController: ViewController {
         let h = child.view.heightAnchor.constraint(equalToConstant: containerView.bounds.height)
         NSLayoutConstraint.activate([
             child.view.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
-            child.view.topAnchor.constraint(equalTo: containerView.topAnchor),
+            child.view.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
             w, h,
         ])
         childWidthC = w
@@ -243,7 +237,7 @@ public final class WikiTabController: ViewController {
             let h = root.view.heightAnchor.constraint(equalToConstant: containerView.bounds.height)
             NSLayoutConstraint.activate([
                 root.view.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
-                root.view.topAnchor.constraint(equalTo: containerView.topAnchor),
+                root.view.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
                 w, h,
             ])
             childWidthC = w
