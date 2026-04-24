@@ -7,7 +7,6 @@ public final class WikiListViewController: NSViewController,
     private let seoyu: Seoyu
     private let tableView = NSTableView()
     private let digestView = WikiDigestCardView()
-    private let chipsView = WikiCategoryChipsView()
     private let emptyLabel = NSTextField(labelWithString: "")
     private let errorBanner = NSView()
     private let errorLabel = NSTextField(labelWithString: "")
@@ -15,7 +14,6 @@ public final class WikiListViewController: NSViewController,
 
     private var topics: [WikiTopicSummary] = []
     private var seedTopics: [WikiTopicSummary]?
-    private var selectedCategory: String? = nil
 
     public var onTopicSelected: ((WikiTopicSummary) -> Void)?
 
@@ -35,12 +33,11 @@ public final class WikiListViewController: NSViewController,
         root.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 0, right: 8)
         root.translatesAutoresizingMaskIntoConstraints = false
 
-        let header = NSTextField(labelWithString: "Wiki")
+        let header = NSTextField(labelWithString: "Trending")
         header.font = .systemFont(ofSize: 18, weight: .bold)
         header.textColor = .labelColor
         root.addArrangedSubview(header)
         root.addArrangedSubview(digestView)
-        root.addArrangedSubview(chipsView)
 
         let column = NSTableColumn(identifier: .init("topic"))
         column.width = 400
@@ -118,11 +115,6 @@ public final class WikiListViewController: NSViewController,
         ])
         self.view = container
 
-        chipsView.onCategorySelected = { [weak self] name in
-            self?.selectedCategory = name
-            self?.reload()
-        }
-
         NotificationCenter.default.addObserver(
             forName: .seoyuWikiTopicsChanged,
             object: nil,
@@ -198,15 +190,12 @@ public final class WikiListViewController: NSViewController,
             return
         }
         let seoyu = self.seoyu
-        let cat = self.selectedCategory
         DispatchQueue.global(qos: .userInitiated).async {
-            let topics = (try? seoyu.wikiTrending(limit: 40, offset: 0, category: cat)) ?? []
+            let topics = (try? seoyu.wikiTrending(limit: 40, offset: 0, category: nil)) ?? []
             let digest = try? seoyu.wikiDigestToday()
-            let cats = (try? seoyu.wikiCategories()) ?? []
             DispatchQueue.main.async {
                 self.topics = topics
                 self.digestView.configure(with: digest)
-                self.chipsView.configure(with: cats, selected: cat)
                 self.tableView.reloadData()
                 self.updateEmptyState()
             }
@@ -232,6 +221,7 @@ public final class WikiListViewController: NSViewController,
 
     @objc private func onRowClicked() {
         let row = tableView.clickedRow
+        NSLog("[wiki-list] row clicked=%d count=%d", row, topics.count)
         guard row >= 0, row < topics.count else { return }
         onTopicSelected?(topics[row])
     }
@@ -253,13 +243,12 @@ public final class WikiListViewController: NSViewController,
         title.lineBreakMode = .byTruncatingTail
         title.translatesAutoresizingMaskIntoConstraints = false
 
-        let category = Self.makeCategoryPill(topic.category)
         let msgs = NSTextField(labelWithString: "\(topic.messageCount) msgs")
         msgs.font = .systemFont(ofSize: 11, weight: .medium)
         msgs.textColor = .secondaryLabelColor
         msgs.translatesAutoresizingMaskIntoConstraints = false
 
-        var metaItems: [NSView] = [category, msgs]
+        var metaItems: [NSView] = [msgs]
         if topic.trendingScore >= 1.0 {
             let fire = NSTextField(labelWithString: String(format: "🔥 %.1f", topic.trendingScore))
             fire.font = .systemFont(ofSize: 11, weight: .semibold)
@@ -288,25 +277,6 @@ public final class WikiListViewController: NSViewController,
         return cell
     }
 
-    private static func makeCategoryPill(_ name: String) -> NSView {
-        let label = NSTextField(labelWithString: name)
-        label.font = .systemFont(ofSize: 10, weight: .semibold)
-        label.textColor = .controlAccentColor
-        let pill = NSView()
-        pill.wantsLayer = true
-        pill.layer?.cornerRadius = 8
-        pill.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.15).cgColor
-        pill.translatesAutoresizingMaskIntoConstraints = false
-        label.translatesAutoresizingMaskIntoConstraints = false
-        pill.addSubview(label)
-        NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 8),
-            label.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -8),
-            label.topAnchor.constraint(equalTo: pill.topAnchor, constant: 3),
-            label.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -3),
-        ])
-        return pill
-    }
 
     private func titleForCurrentLanguage(_ topic: WikiTopicSummary) -> String {
         switch WikiLocale.current {
