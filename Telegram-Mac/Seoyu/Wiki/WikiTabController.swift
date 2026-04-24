@@ -6,6 +6,7 @@ public final class WikiTabController: ViewController {
     private let seoyu: Seoyu
     public var openChat: ((Int64, Int64) -> Void)?
 
+    private let backButton = NSButton()
     private let langButton = NSButton()
     private let searchButton = NSButton()
     private let statusLabel = NSTextField(labelWithString: "")
@@ -74,13 +75,23 @@ public final class WikiTabController: ViewController {
         let spacing: CGFloat = 6
         let btnGap: CGFloat = 8
         let sidePad: CGFloat = 8
+        backButton.sizeToFit()
         langButton.sizeToFit()
         searchButton.sizeToFit()
         statusLabel.sizeToFit()
+        let onArticle = pageStack.count > 1
+        backButton.isHidden = !onArticle
+        langButton.isHidden = onArticle
+        searchButton.isHidden = onArticle
         var x = sidePad
-        langButton.frame = NSRect(x: x, y: topPad, width: langButton.frame.width, height: toolbarH)
-        x += langButton.frame.width + btnGap
-        searchButton.frame = NSRect(x: x, y: topPad, width: searchButton.frame.width, height: toolbarH)
+        if onArticle {
+            backButton.frame = NSRect(x: x, y: topPad, width: max(backButton.frame.width, 24), height: toolbarH)
+            x += backButton.frame.width + btnGap
+        } else {
+            langButton.frame = NSRect(x: x, y: topPad, width: langButton.frame.width, height: toolbarH)
+            x += langButton.frame.width + btnGap
+            searchButton.frame = NSRect(x: x, y: topPad, width: searchButton.frame.width, height: toolbarH)
+        }
         let statusW = statusLabel.frame.width
         statusLabel.frame = NSRect(x: max(w - sidePad - statusW, x + btnGap), y: topPad + 4, width: statusW, height: toolbarH - 4)
         let containerY = topPad + toolbarH + spacing
@@ -95,6 +106,19 @@ public final class WikiTabController: ViewController {
     }
 
     private func setupToolbar() {
+        backButton.bezelStyle = .inline
+        backButton.isBordered = false
+        backButton.target = self
+        backButton.action = #selector(popBack)
+        backButton.isHidden = true
+        let cfg = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+        backButton.image = NSImage(systemSymbolName: "chevron.backward", accessibilityDescription: "Back")?.withSymbolConfiguration(cfg)
+        backButton.imagePosition = .imageLeading
+        backButton.attributedTitle = NSAttributedString(string: " Back", attributes: [
+            .foregroundColor: NSColor.controlAccentColor,
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+        ])
+
         langButton.bezelStyle = .inline
         langButton.target = self
         langButton.action = #selector(toggleLanguage)
@@ -109,9 +133,26 @@ public final class WikiTabController: ViewController {
         statusLabel.textColor = .secondaryLabelColor
         updateStatusLabel()
 
+        view.addSubview(backButton)
         view.addSubview(langButton)
         view.addSubview(searchButton)
         view.addSubview(statusLabel)
+    }
+
+    @objc private func popBack() {
+        guard pageStack.count > 1 else { return }
+        let top = pageStack.removeLast()
+        top.view.removeFromSuperview()
+        if let prev = pageStack.last {
+            prev.view.translatesAutoresizingMaskIntoConstraints = true
+            prev.view.autoresizingMask = [.width, .height]
+            prev.view.frame = containerView.bounds
+            containerView.addSubview(prev.view)
+            if let list = prev as? WikiListViewController {
+                list.forceReload()
+            }
+        }
+        layoutManual()
     }
 
     private func updateLangButton() {
@@ -215,6 +256,7 @@ public final class WikiTabController: ViewController {
         } else if let article = child as? WikiArticleViewController {
             article.forceReload()
         }
+        layoutManual()
     }
 
     @discardableResult
