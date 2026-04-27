@@ -27,7 +27,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::search::{engine, SearchResult as CoreSearchResult};
 use crate::store::chat::ChatRow;
-use crate::store::message::{strip_whitespace, Cursor, MessageRow};
+use crate::store::message::{
+    strip_whitespace, Cursor, IndexOutcome as CoreIndexOutcome, MessageRef as CoreMessageRef,
+    MessageRow,
+};
 use crate::store::Store;
 use crate::wiki::worker::WorkerHandle;
 
@@ -68,6 +71,18 @@ pub struct IndexedMessage {
 }
 
 #[derive(uniffi::Record, Clone)]
+pub struct IndexOutcome {
+    pub inserted: u64,
+    pub updated: u64,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct MessageRef {
+    pub chat_id: i64,
+    pub message_id: i64,
+}
+
+#[derive(uniffi::Record, Clone)]
 pub struct ChatInfo {
     pub chat_id: i64,
     pub title: String,
@@ -97,6 +112,7 @@ pub struct SearchPage {
 
 #[derive(uniffi::Record, Clone)]
 pub struct SearchCursor {
+    pub rank: f64,
     pub timestamp: i64,
     pub chat_id: i64,
     pub message_id: i64,
@@ -201,13 +217,17 @@ impl Seoyu {
         Ok(())
     }
 
-    /// Mirror a batch of messages into the local store, populating
-    /// every FTS5 auxiliary index (plain, nospace, jamo).
-    /// Returns the number of inputs accepted (duplicates are
-    /// silently skipped by `INSERT OR IGNORE`).
-    pub fn index_messages(&self, messages: Vec<IndexedMessage>) -> Result<u64, SeoyuError> {
+    /// Mirror a batch of messages into the local store, updating FTS
+    /// rows for edited text and returning accurate insert/update counts.
+    pub fn index_messages(
+        &self,
+        messages: Vec<IndexedMessage>,
+    ) -> Result<IndexOutcome, SeoyuError> {
         if messages.is_empty() {
-            return Ok(0);
+            return Ok(IndexOutcome {
+                inserted: 0,
+                updated: 0,
+            });
         }
         let rows: Vec<MessageRow> = messages
             .into_iter()
@@ -220,10 +240,23 @@ impl Seoyu {
                 link: m.link,
             })
             .collect();
-        let count = rows.len() as u64;
         let store = self.lock_store();
-        store.insert_messages_batch(&rows)?;
-        Ok(count)
+        Ok(to_index_outcome(store.insert_messages_batch(&rows)?))
+    }
+
+    pub fn delete_messages(&self, refs: Vec<MessageRef>) -> Result<u64, SeoyuError> {
+        if refs.is_empty() {
+            return Ok(0);
+        }
+        let core_refs: Vec<CoreMessageRef> = refs
+            .into_iter()
+            .map(|r| CoreMessageRef {
+                chat_id: r.chat_id,
+                message_id: r.message_id,
+            })
+            .collect();
+        let store = self.lock_store();
+        Ok(store.delete_messages(&core_refs)?)
     }
 
     /// Run the Korean-aware query planner. Passing `limit = 0` means
@@ -240,6 +273,7 @@ impl Seoyu {
             SearchScope::Chat { chat_id } => engine::SearchScope::Chat(chat_id),
         };
         let core_cursor = cursor.as_ref().map(|c| Cursor {
+            rank: c.rank,
             timestamp: c.timestamp,
             chat_id: c.chat_id,
             message_id: c.message_id,
@@ -428,10 +462,18 @@ fn to_search_page(result: CoreSearchResult) -> SearchPage {
     SearchPage {
         items,
         next_cursor: result.next_cursor.map(|c| SearchCursor {
+            rank: c.rank,
             timestamp: c.timestamp,
             chat_id: c.chat_id,
             message_id: c.message_id,
         }),
+    }
+}
+
+fn to_index_outcome(outcome: CoreIndexOutcome) -> IndexOutcome {
+    IndexOutcome {
+        inserted: outcome.inserted,
+        updated: outcome.updated,
     }
 }
 

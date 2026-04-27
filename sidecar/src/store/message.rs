@@ -4,16 +4,38 @@ use super::Store;
 
 fn fts_insert(
     conn: &sqlite::Connection,
-    table: &str,
-    column: &str,
     rowid: i64,
-    value: &str,
+    text_plain: &str,
+    text_stripped: &str,
+    text_jamo: &str,
 ) -> Result<(), sqlite::Error> {
-    let mut stmt = conn.prepare(format!(
-        "INSERT INTO {table}(rowid, {column}) VALUES (?, ?)"
-    ))?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO messages_fts(rowid, text_plain, text_stripped, text_jamo)
+         VALUES (?, ?, ?, ?)",
+    )?;
     stmt.bind((1, rowid))?;
-    stmt.bind((2, value))?;
+    stmt.bind((2, text_plain))?;
+    stmt.bind((3, text_stripped))?;
+    stmt.bind((4, text_jamo))?;
+    stmt.next()?;
+    Ok(())
+}
+
+fn fts_delete(
+    conn: &sqlite::Connection,
+    rowid: i64,
+    text_plain: &str,
+    text_stripped: &str,
+    text_jamo: &str,
+) -> Result<(), sqlite::Error> {
+    let mut stmt = conn.prepare(
+        "INSERT INTO messages_fts(messages_fts, rowid, text_plain, text_stripped, text_jamo)
+         VALUES('delete', ?, ?, ?, ?)",
+    )?;
+    stmt.bind((1, rowid))?;
+    stmt.bind((2, text_plain))?;
+    stmt.bind((3, text_stripped))?;
+    stmt.bind((4, text_jamo))?;
     stmt.next()?;
     Ok(())
 }
@@ -28,6 +50,18 @@ pub struct MessageRow {
     pub link: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IndexOutcome {
+    pub inserted: u64,
+    pub updated: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageRef {
+    pub chat_id: i64,
+    pub message_id: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageWithChat {
     pub message_id: i64,
@@ -36,10 +70,13 @@ pub struct MessageWithChat {
     pub text_plain: String,
     pub link: Option<String>,
     pub chat_title: String,
+    pub rank: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cursor {
+    #[serde(default)]
+    pub rank: f64,
     pub timestamp: i64,
     pub chat_id: i64,
     pub message_id: i64,
@@ -49,14 +86,41 @@ pub fn strip_whitespace(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+fn enqueue_wiki_classify(
+    conn: &sqlite::Connection,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<(), sqlite::Error> {
+    let mut q = conn.prepare(
+        "INSERT OR IGNORE INTO wiki_classify_queue (chat_id, message_id)
+         VALUES (?, ?)",
+    )?;
+    q.bind((1, chat_id))?;
+    q.bind((2, message_id))?;
+    q.next()?;
+    Ok(())
+}
+
+fn like_variants(term: &str) -> [String; 3] {
+    [
+        term.to_string(),
+        strip_whitespace(term),
+        crate::search::hangul::decompose_jamo(term),
+    ]
+}
+
 impl Store {
-    pub fn insert_messages_batch(&self, messages: &[MessageRow]) -> Result<(), sqlite::Error> {
+    pub fn insert_messages_batch(
+        &self,
+        messages: &[MessageRow],
+    ) -> Result<IndexOutcome, sqlite::Error> {
         // Clean up any transaction leftover from a previous failed call so
         // this one does not hit "cannot start a transaction within a
         // transaction". Ignore the error if no txn is active.
         let _ = self.conn.execute("ROLLBACK");
         self.conn.execute("BEGIN")?;
-        let result = (|| -> Result<(), sqlite::Error> {
+        let result = (|| -> Result<IndexOutcome, sqlite::Error> {
+            let mut outcome = IndexOutcome::default();
             // Satisfy the FK from messages.chat_id -> chats.chat_id without
             // requiring callers to call upsert_chat first. The shell (Swift)
             // mirror may upsert a richer ChatInfo later; this stub keeps
@@ -74,75 +138,179 @@ impl Store {
             }
             for msg in messages {
                 let jamo = crate::search::hangul::decompose_jamo(&msg.text_plain);
-
-                let mut stmt = self.conn.prepare(
-                    "INSERT OR IGNORE INTO messages
-                    (message_id, chat_id, timestamp, text_plain, text_stripped, link,
-                     text_jamo)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                )?;
-                stmt.bind((1, msg.message_id))?;
-                stmt.bind((2, msg.chat_id))?;
-                stmt.bind((3, msg.timestamp))?;
-                stmt.bind((4, msg.text_plain.as_str()))?;
-                stmt.bind((5, msg.text_stripped.as_str()))?;
-                match &msg.link {
-                    Some(l) => stmt.bind((6, l.as_str()))?,
-                    None => stmt.bind((6, sqlite::Value::Null))?,
+                let prior = {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT rowid, timestamp, text_plain, text_stripped, text_jamo, link
+                         FROM messages WHERE chat_id = ? AND message_id = ?",
+                    )?;
+                    stmt.bind((1, msg.chat_id))?;
+                    stmt.bind((2, msg.message_id))?;
+                    if let sqlite::State::Row = stmt.next()? {
+                        Some((
+                            stmt.read::<i64, _>(0)?,
+                            stmt.read::<i64, _>(1)?,
+                            stmt.read::<String, _>(2)?,
+                            stmt.read::<String, _>(3)?,
+                            stmt.read::<String, _>(4)?,
+                            stmt.read::<Option<String>, _>(5)?,
+                        ))
+                    } else {
+                        None
+                    }
                 };
-                stmt.bind((7, jamo.as_str()))?;
-                stmt.next()?;
 
-                // Check if the row was actually inserted (not a duplicate)
-                let mut changes_stmt = self.conn.prepare("SELECT changes()")?;
-                changes_stmt.next()?;
-                let changes: i64 = changes_stmt.read(0)?;
+                match prior {
+                    None => {
+                        let mut stmt = self.conn.prepare(
+                            "INSERT INTO messages
+                                (message_id, chat_id, timestamp, text_plain, text_stripped, link,
+                                 text_jamo)
+                             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        )?;
+                        stmt.bind((1, msg.message_id))?;
+                        stmt.bind((2, msg.chat_id))?;
+                        stmt.bind((3, msg.timestamp))?;
+                        stmt.bind((4, msg.text_plain.as_str()))?;
+                        stmt.bind((5, msg.text_stripped.as_str()))?;
+                        match &msg.link {
+                            Some(l) => stmt.bind((6, l.as_str()))?,
+                            None => stmt.bind((6, sqlite::Value::Null))?,
+                        };
+                        stmt.bind((7, jamo.as_str()))?;
+                        stmt.next()?;
 
-                if changes > 0 {
-                    let mut rowid_stmt = self.conn.prepare("SELECT last_insert_rowid()")?;
-                    rowid_stmt.next()?;
-                    let msg_rowid: i64 = rowid_stmt.read(0)?;
+                        let mut rowid_stmt = self.conn.prepare("SELECT last_insert_rowid()")?;
+                        rowid_stmt.next()?;
+                        let rowid: i64 = rowid_stmt.read(0)?;
 
-                    // Keep every external-content FTS5 table in sync. Each
-                    // one was rebuilt during the v6 migration; these
-                    // inserts cover the hot path for new messages.
-                    fts_insert(
-                        &self.conn,
-                        "messages_fts",
-                        "text_plain",
-                        msg_rowid,
-                        &msg.text_plain,
-                    )?;
-                    fts_insert(
-                        &self.conn,
-                        "messages_fts_nospace",
-                        "text_stripped",
-                        msg_rowid,
-                        &msg.text_stripped,
-                    )?;
-                    fts_insert(
-                        &self.conn,
-                        "messages_fts_jamo",
-                        "text_jamo",
-                        msg_rowid,
-                        &jamo,
-                    )?;
+                        fts_insert(
+                            &self.conn,
+                            rowid,
+                            &msg.text_plain,
+                            &msg.text_stripped,
+                            &jamo,
+                        )?;
+                        enqueue_wiki_classify(&self.conn, msg.chat_id, msg.message_id)?;
+                        outcome.inserted += 1;
+                    }
+                    Some((rowid, old_ts, old_plain, old_stripped, old_jamo, old_link)) => {
+                        if old_ts == msg.timestamp
+                            && old_plain == msg.text_plain
+                            && old_stripped == msg.text_stripped
+                            && old_jamo == jamo
+                            && old_link == msg.link
+                        {
+                            continue;
+                        }
 
-                    let mut q = self.conn.prepare(
-                        "INSERT OR IGNORE INTO wiki_classify_queue (chat_id, message_id)
-                     VALUES (?, ?)",
-                    )?;
-                    q.bind((1, msg.chat_id))?;
-                    q.bind((2, msg.message_id))?;
-                    q.next()?;
+                        let text_changed = old_plain != msg.text_plain
+                            || old_stripped != msg.text_stripped
+                            || old_jamo != jamo;
+
+                        let mut stmt = self.conn.prepare(
+                            "UPDATE messages
+                             SET timestamp = ?, text_plain = ?, text_stripped = ?, link = ?, text_jamo = ?
+                             WHERE rowid = ?",
+                        )?;
+                        stmt.bind((1, msg.timestamp))?;
+                        stmt.bind((2, msg.text_plain.as_str()))?;
+                        stmt.bind((3, msg.text_stripped.as_str()))?;
+                        match &msg.link {
+                            Some(l) => stmt.bind((4, l.as_str()))?,
+                            None => stmt.bind((4, sqlite::Value::Null))?,
+                        };
+                        stmt.bind((5, jamo.as_str()))?;
+                        stmt.bind((6, rowid))?;
+                        stmt.next()?;
+
+                        if text_changed {
+                            fts_delete(&self.conn, rowid, &old_plain, &old_stripped, &old_jamo)?;
+                            fts_insert(
+                                &self.conn,
+                                rowid,
+                                &msg.text_plain,
+                                &msg.text_stripped,
+                                &jamo,
+                            )?;
+                            enqueue_wiki_classify(&self.conn, msg.chat_id, msg.message_id)?;
+                        }
+                        outcome.updated += 1;
+                    }
                 }
             }
-            Ok(())
+            Ok(outcome)
         })();
         match result {
-            Ok(()) => {
+            Ok(outcome) => {
                 self.conn.execute("COMMIT")?;
-                Ok(())
+                Ok(outcome)
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    pub fn delete_messages(&self, refs: &[MessageRef]) -> Result<u64, sqlite::Error> {
+        if refs.is_empty() {
+            return Ok(0);
+        }
+
+        let _ = self.conn.execute("ROLLBACK");
+        self.conn.execute("BEGIN")?;
+        let result = (|| -> Result<u64, sqlite::Error> {
+            let mut deleted = 0_u64;
+            for msg in refs {
+                let prior = {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT rowid, text_plain, text_stripped, text_jamo
+                         FROM messages WHERE chat_id = ? AND message_id = ?",
+                    )?;
+                    stmt.bind((1, msg.chat_id))?;
+                    stmt.bind((2, msg.message_id))?;
+                    if let sqlite::State::Row = stmt.next()? {
+                        Some((
+                            stmt.read::<i64, _>(0)?,
+                            stmt.read::<String, _>(1)?,
+                            stmt.read::<String, _>(2)?,
+                            stmt.read::<String, _>(3)?,
+                        ))
+                    } else {
+                        None
+                    }
+                };
+                let Some((rowid, text_plain, text_stripped, text_jamo)) = prior else {
+                    continue;
+                };
+
+                fts_delete(&self.conn, rowid, &text_plain, &text_stripped, &text_jamo)?;
+
+                let mut queue_stmt = self.conn.prepare(
+                    "DELETE FROM wiki_classify_queue WHERE chat_id = ? AND message_id = ?",
+                )?;
+                queue_stmt.bind((1, msg.chat_id))?;
+                queue_stmt.bind((2, msg.message_id))?;
+                queue_stmt.next()?;
+
+                let mut topic_stmt = self.conn.prepare(
+                    "DELETE FROM wiki_topic_messages WHERE chat_id = ? AND message_id = ?",
+                )?;
+                topic_stmt.bind((1, msg.chat_id))?;
+                topic_stmt.bind((2, msg.message_id))?;
+                topic_stmt.next()?;
+
+                let mut msg_stmt = self.conn.prepare("DELETE FROM messages WHERE rowid = ?")?;
+                msg_stmt.bind((1, rowid))?;
+                msg_stmt.next()?;
+                deleted += 1;
+            }
+            Ok(deleted)
+        })();
+        match result {
+            Ok(deleted) => {
+                self.conn.execute("COMMIT")?;
+                Ok(deleted)
             }
             Err(e) => {
                 let _ = self.conn.execute("ROLLBACK");
@@ -176,87 +344,78 @@ impl Store {
         }
     }
 
-    /// Union-of-indexes search. Each `(fts_table, fts_query, priority)`
-    /// entry is turned into one FTS5 `MATCH` branch. Results that
-    /// appear in multiple branches are kept once, ranked by the
-    /// lowest (best) priority they appeared under. Within a priority
-    /// bucket, rows are ordered by `timestamp DESC` like every other
-    /// search path.
-    pub fn search_messages_multi_fts(
+    pub fn search_messages_bm25(
         &self,
-        branches: &[(&str, &str, i64)],
+        fts_query: &str,
         scope_chat: Option<i64>,
         cursor: Option<&Cursor>,
         limit: usize,
     ) -> Result<Vec<MessageWithChat>, sqlite::Error> {
-        if branches.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut hits_sql = String::new();
-        for (i, (table, _query, priority)) in branches.iter().enumerate() {
-            if i > 0 {
-                hits_sql.push_str(" UNION ALL ");
-            }
-            hits_sql.push_str(&format!(
-                "SELECT rowid, {priority} AS priority FROM {table} WHERE {table} MATCH ?"
-            ));
-        }
-
-        let cursor_clause = if cursor.is_some() {
-            "AND (m.timestamp < ?
-                  OR (m.timestamp = ? AND m.chat_id > ?)
-                  OR (m.timestamp = ? AND m.chat_id = ? AND m.message_id > ?))"
-        } else {
-            ""
-        };
         let chat_clause = if scope_chat.is_some() {
             "AND m.chat_id = ?"
         } else {
             ""
         };
+        let cursor_clause = if cursor.is_some() {
+            "AND (r.rank > ?
+                  OR (r.rank = ? AND m.timestamp < ?)
+                  OR (r.rank = ? AND m.timestamp = ? AND m.chat_id > ?)
+                  OR (r.rank = ? AND m.timestamp = ? AND m.chat_id = ? AND m.message_id > ?))"
+        } else {
+            ""
+        };
 
         let sql = format!(
-            "WITH hits AS ({hits_sql}),
-                  ranked AS (
-                      SELECT rowid, MIN(priority) AS best FROM hits GROUP BY rowid
-                  )
-             SELECT m.message_id, m.chat_id, m.timestamp, m.text_plain, m.link, c.title
-             FROM messages m
+            "WITH ranked AS (
+                 SELECT f.rowid,
+                        bm25(messages_fts, 1.0, 0.7, 0.5)
+                          - (m.timestamp / 86400.0) * 0.05 AS rank
+                 FROM messages_fts f
+                 JOIN messages m ON m.rowid = f.rowid
+                 WHERE messages_fts MATCH ?
+             )
+             SELECT m.message_id, m.chat_id, m.timestamp, m.text_plain, m.link, c.title, r.rank
+             FROM ranked r
+             JOIN messages m ON m.rowid = r.rowid
              JOIN chats c ON m.chat_id = c.chat_id
-             JOIN ranked r ON r.rowid = m.rowid
              WHERE c.is_excluded = 0
              {chat_clause}
              {cursor_clause}
-             ORDER BY r.best ASC, m.timestamp DESC, m.chat_id ASC, m.message_id ASC
+             ORDER BY r.rank ASC, m.timestamp DESC, m.chat_id ASC, m.message_id ASC
              LIMIT ?"
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut bind_idx = 1_i64;
-        for (_, query, _) in branches {
-            stmt.bind((bind_idx as usize, *query))?;
-            bind_idx += 1;
-        }
+        let mut bind_idx = 1;
+        stmt.bind((bind_idx, fts_query))?;
+        bind_idx += 1;
         if let Some(chat_id) = scope_chat {
-            stmt.bind((bind_idx as usize, chat_id))?;
+            stmt.bind((bind_idx, chat_id))?;
             bind_idx += 1;
         }
         if let Some(c) = cursor {
-            stmt.bind((bind_idx as usize, c.timestamp))?;
+            stmt.bind((bind_idx, c.rank))?;
             bind_idx += 1;
-            stmt.bind((bind_idx as usize, c.timestamp))?;
+            stmt.bind((bind_idx, c.rank))?;
             bind_idx += 1;
-            stmt.bind((bind_idx as usize, c.chat_id))?;
+            stmt.bind((bind_idx, c.timestamp))?;
             bind_idx += 1;
-            stmt.bind((bind_idx as usize, c.timestamp))?;
+            stmt.bind((bind_idx, c.rank))?;
             bind_idx += 1;
-            stmt.bind((bind_idx as usize, c.chat_id))?;
+            stmt.bind((bind_idx, c.timestamp))?;
             bind_idx += 1;
-            stmt.bind((bind_idx as usize, c.message_id))?;
+            stmt.bind((bind_idx, c.chat_id))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.rank))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.timestamp))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.chat_id))?;
+            bind_idx += 1;
+            stmt.bind((bind_idx, c.message_id))?;
             bind_idx += 1;
         }
-        stmt.bind((bind_idx as usize, limit as i64))?;
+        stmt.bind((bind_idx, limit as i64))?;
 
         let mut results = Vec::new();
         while let Ok(sqlite::State::Row) = stmt.next() {
@@ -267,8 +426,10 @@ impl Store {
                 text_plain: stmt.read::<String, _>(3)?,
                 link: stmt.read::<Option<String>, _>(4)?,
                 chat_title: stmt.read::<String, _>(5)?,
+                rank: stmt.read::<f64, _>(6)?,
             });
         }
+
         Ok(results)
     }
 
@@ -327,6 +488,7 @@ impl Store {
                 text_plain: stmt.read::<String, _>(3)?,
                 link: stmt.read::<Option<String>, _>(4)?,
                 chat_title: stmt.read::<String, _>(5)?,
+                rank: 0.0,
             });
         }
 
@@ -384,6 +546,7 @@ impl Store {
                 text_plain: stmt.read::<String, _>(3)?,
                 link: stmt.read::<Option<String>, _>(4)?,
                 chat_title: stmt.read::<String, _>(5)?,
+                rank: 0.0,
             });
         }
 
@@ -404,7 +567,12 @@ impl Store {
 
         let like_clauses: Vec<String> = terms
             .iter()
-            .map(|_| "m.text_plain LIKE '%' || ? || '%'".to_string())
+            .map(|_| {
+                "(m.text_plain LIKE '%' || ? || '%'
+                  OR m.text_stripped LIKE '%' || ? || '%'
+                  OR m.text_jamo LIKE '%' || ? || '%')"
+                    .to_string()
+            })
             .collect();
         let like_where = like_clauses.join(" AND ");
 
@@ -430,8 +598,10 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let mut bind_idx = 1;
         for term in terms {
-            stmt.bind((bind_idx, term.as_str()))?;
-            bind_idx += 1;
+            for variant in like_variants(term) {
+                stmt.bind((bind_idx, variant.as_str()))?;
+                bind_idx += 1;
+            }
         }
         if let Some(c) = cursor {
             stmt.bind((bind_idx, c.timestamp))?;
@@ -458,6 +628,7 @@ impl Store {
                 text_plain: stmt.read::<String, _>(3)?,
                 link: stmt.read::<Option<String>, _>(4)?,
                 chat_title: stmt.read::<String, _>(5)?,
+                rank: 0.0,
             });
         }
 
@@ -477,7 +648,12 @@ impl Store {
 
         let like_clauses: Vec<String> = terms
             .iter()
-            .map(|_| "m.text_plain LIKE '%' || ? || '%'".to_string())
+            .map(|_| {
+                "(m.text_plain LIKE '%' || ? || '%'
+                  OR m.text_stripped LIKE '%' || ? || '%'
+                  OR m.text_jamo LIKE '%' || ? || '%')"
+                    .to_string()
+            })
             .collect();
         let like_where = like_clauses.join(" AND ");
 
@@ -502,8 +678,10 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let mut bind_idx = 1;
         for term in terms {
-            stmt.bind((bind_idx, term.as_str()))?;
-            bind_idx += 1;
+            for variant in like_variants(term) {
+                stmt.bind((bind_idx, variant.as_str()))?;
+                bind_idx += 1;
+            }
         }
         stmt.bind((bind_idx, chat_id))?;
         bind_idx += 1;
@@ -526,6 +704,7 @@ impl Store {
                 text_plain: stmt.read::<String, _>(3)?,
                 link: stmt.read::<Option<String>, _>(4)?,
                 chat_title: stmt.read::<String, _>(5)?,
+                rank: 0.0,
             });
         }
 

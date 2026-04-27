@@ -118,7 +118,8 @@ async fn index_then_search_round_trip() {
     )
     .await;
     assert_eq!(index["id"], 10);
-    assert_eq!(index["result"]["indexed"], 2);
+    assert_eq!(index["result"]["inserted"], 2);
+    assert_eq!(index["result"]["updated"], 0);
 
     let search = connect_and_call(
         &socket,

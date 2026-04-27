@@ -62,6 +62,15 @@ if [[ "$DMG" == 1 ]]; then
 fi
 
 if [[ "$RUN" == 1 ]]; then
+  DB="$HOME/Library/Application Support/telegram-korean-search/tg-korean-search.db"
+  if [[ -f "$DB" ]]; then
+    mkdir -p "$ROOT/.backup"
+    TS="$(date +%Y%m%d-%H%M%S)"
+    BACKUP="$ROOT/.backup/tg-korean-search.$TS.db"
+    cp -p "$DB" "$BACKUP"
+    echo "==> Backed up live Seoyu DB before launch: $BACKUP"
+  fi
+
   echo "==> Launching"
   open "$APP"
 fi

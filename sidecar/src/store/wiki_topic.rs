@@ -326,6 +326,7 @@ impl Store {
                 text_plain: stmt.read::<String, _>("text_plain")?,
                 link: stmt.read::<Option<String>, _>("link")?,
                 chat_title: stmt.read::<String, _>("chat_title")?,
+                rank: 0.0,
             });
         }
         Ok(msgs)

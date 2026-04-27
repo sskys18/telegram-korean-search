@@ -10,12 +10,13 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::ipc::protocol::{
-    IndexBatchParams, IndexBatchResult, IndexMessageInput, Method, Notification, NotifyIn, Outcome,
-    PongResult, Request, Response, ResponsePayload, RpcError, SearchParams, SearchScopeInput,
-    WikiSearchParams, WikiTopicDetail, WikiTopicDetailParams, WikiTopicSummary, WikiTrendingParams,
+    DeleteMessageParams, IndexBatchParams, IndexBatchResult, IndexMessageInput, Method,
+    Notification, NotifyIn, Outcome, PongResult, Request, Response, ResponsePayload, RpcError,
+    SearchParams, SearchScopeInput, WikiSearchParams, WikiTopicDetail, WikiTopicDetailParams,
+    WikiTopicSummary, WikiTrendingParams,
 };
 use crate::search::{engine, SearchResult};
-use crate::store::message::{strip_whitespace, MessageRow};
+use crate::store::message::{strip_whitespace, IndexOutcome, MessageRef, MessageRow};
 use crate::store::wiki_topic::WikiTopic;
 use crate::store::Store;
 
@@ -57,15 +58,23 @@ pub fn dispatch_request(state: &SidecarState, req: Request) -> Dispatch {
             return Dispatch::Shutdown;
         }
         Method::IndexMessagesBatch(params) => match index_messages_batch(state, params) {
-            Ok(count) => Outcome::Ok {
-                result: ResponsePayload::IndexBatch(IndexBatchResult { indexed: count }),
+            Ok(outcome) => Outcome::Ok {
+                result: ResponsePayload::IndexBatch(IndexBatchResult {
+                    inserted: outcome.inserted,
+                    updated: outcome.updated,
+                }),
             },
             Err(e) => Outcome::Err {
                 error: RpcError::internal(e.to_string()),
             },
         },
-        Method::DeleteMessage(_params) => Outcome::Err {
-            error: RpcError::internal("delete_message not yet implemented"),
+        Method::DeleteMessage(params) => match delete_message(state, params) {
+            Ok(_) => Outcome::Ok {
+                result: ResponsePayload::DeleteAck,
+            },
+            Err(e) => Outcome::Err {
+                error: RpcError::internal(e.to_string()),
+            },
         },
         Method::Search(params) => match run_search(state, params) {
             Ok(result) => Outcome::Ok {
@@ -120,15 +129,21 @@ pub fn handle_notification(_state: &SidecarState, note: Notification) {
 fn index_messages_batch(
     state: &SidecarState,
     params: IndexBatchParams,
-) -> Result<u64, sqlite::Error> {
+) -> Result<IndexOutcome, sqlite::Error> {
     let rows: Vec<MessageRow> = params.messages.into_iter().map(to_message_row).collect();
-    let count = rows.len() as u64;
     if rows.is_empty() {
-        return Ok(0);
+        return Ok(IndexOutcome::default());
     }
     let store = state.lock_store();
-    store.insert_messages_batch(&rows)?;
-    Ok(count)
+    store.insert_messages_batch(&rows)
+}
+
+fn delete_message(state: &SidecarState, params: DeleteMessageParams) -> Result<u64, sqlite::Error> {
+    let store = state.lock_store();
+    store.delete_messages(&[MessageRef {
+        chat_id: params.chat_id,
+        message_id: params.message_id,
+    }])
 }
 
 fn to_message_row(msg: IndexMessageInput) -> MessageRow {

@@ -1,7 +1,7 @@
 use crate::store::message::{strip_whitespace, Cursor, MessageWithChat};
 use crate::store::Store;
 
-use super::hangul::{contains_bare_jamo, decompose_jamo};
+use super::hangul::decompose_jamo;
 use super::highlight::find_highlights;
 use super::{SearchItem, SearchResult};
 
@@ -25,73 +25,34 @@ fn build_fts_query(query: &str) -> String {
         .join(" ")
 }
 
-/// One planned hit against a specific FTS5 index. `priority` is used
-/// by the SQL side to rank results: lower is better, so exact
-/// `text_plain` matches rank above jamo or nospace fallbacks.
-struct Branch {
-    table: &'static str,
-    query: String,
-    priority: i64,
-}
-
-/// Decide which FTS5 tables to hit for this user query. Always
-/// produces at least one branch as long as the query is long enough
-/// for the trigram tokenizer; returns an empty vec for short queries
-/// so the caller can fall back to LIKE.
-fn plan_branches(raw_query: &str) -> Vec<Branch> {
+/// Build one MATCH expression over the combined v8 FTS table. The
+/// variants preserve the old plain, nospace, and jamo match behavior
+/// while BM25 ranks the single result set.
+fn build_match_query(raw_query: &str) -> Option<String> {
     let trimmed = raw_query.trim();
     if trimmed.is_empty() {
-        return Vec::new();
+        return None;
     }
 
-    let mut plan = Vec::new();
-
-    // 2. Plain trigram. Best-quality hits; highest priority.
-    let plain = build_fts_query(trimmed);
-    if trigram_ready(&plain) && !contains_bare_jamo(trimmed) {
-        plan.push(Branch {
-            table: "messages_fts",
-            query: plain,
-            priority: 10,
-        });
-    }
-
-    // 3. Whitespace-insensitive. Always run against the nospace index
-    //    so the query can match messages that HAVE whitespace even
-    //    when the query itself does not (e.g. `삼성전자` should hit
-    //    `삼성 전자 실적`).
     let stripped = strip_whitespace(trimmed);
-    if !contains_bare_jamo(trimmed) {
-        let nospace_src = if stripped.is_empty() {
-            trimmed
-        } else {
-            &stripped
-        };
-        let stripped_q = build_fts_query(nospace_src);
-        if trigram_ready(&stripped_q) {
-            plan.push(Branch {
-                table: "messages_fts_nospace",
-                query: stripped_q,
-                priority: 20,
-            });
-        }
-    }
-
-    // 4. Jamo decomposition. Catches bare-jamo queries (ㅅ전자) and
-    //    the common case where the user typed a partial syllable.
     let jamo = decompose_jamo(trimmed);
-    if !jamo.is_empty() {
-        let jamo_q = build_fts_query(&jamo);
-        if trigram_ready(&jamo_q) {
-            plan.push(Branch {
-                table: "messages_fts_jamo",
-                query: jamo_q,
-                priority: 30,
-            });
+    let mut variants = Vec::new();
+
+    for variant in [trimmed.to_string(), stripped, jamo] {
+        if variant.is_empty() {
+            continue;
+        }
+        let query = build_fts_query(&variant);
+        if trigram_ready(&query) && !variants.contains(&query) {
+            variants.push(query);
         }
     }
 
-    plan
+    if variants.is_empty() {
+        None
+    } else {
+        Some(variants.join(" OR "))
+    }
 }
 
 /// FTS5 trigram refuses queries whose longest term is < 3 chars.
@@ -124,13 +85,15 @@ pub fn search(
         .map(|s| s.to_string())
         .collect();
 
-    let branches = plan_branches(query_trimmed);
+    let fts_query = build_match_query(query_trimmed);
     let scope_chat = match scope {
         SearchScope::All => None,
         SearchScope::Chat(id) => Some(*id),
     };
 
-    let messages = if branches.is_empty() {
+    let messages = if let Some(fts_query) = fts_query {
+        store.search_messages_bm25(&fts_query, scope_chat, cursor, limit + 1)?
+    } else {
         // Trigram needs >=3 chars; fall back to LIKE.
         match scope {
             SearchScope::All => store.search_messages_like(&tokens, cursor, limit + 1)?,
@@ -138,12 +101,6 @@ pub fn search(
                 store.search_messages_like_in_chat(&tokens, *chat_id, cursor, limit + 1)?
             }
         }
-    } else {
-        let branch_refs: Vec<(&str, &str, i64)> = branches
-            .iter()
-            .map(|b| (b.table, b.query.as_str(), b.priority))
-            .collect();
-        store.search_messages_multi_fts(&branch_refs, scope_chat, cursor, limit + 1)?
     };
 
     let has_more = messages.len() > limit;
@@ -155,6 +112,7 @@ pub fn search(
 
     let next_cursor = if has_more {
         results.last().map(|last| Cursor {
+            rank: last.rank,
             timestamp: last.timestamp,
             chat_id: last.chat_id,
             message_id: last.message_id,
@@ -349,6 +307,24 @@ mod tests {
     }
 
     #[test]
+    fn bm25_strong_match_beats_newer_weak_match() {
+        let store = test_store();
+        setup(&store);
+        insert_msg(
+            &store,
+            1,
+            1,
+            1000,
+            "bitcoin etf bitcoin etf bitcoin etf confirmed inflows",
+        );
+        insert_msg(&store, 1, 2, 1001, "bitcoin etf mentioned once");
+
+        let result = search(&store, "bitcoin etf", &SearchScope::All, None, None).unwrap();
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.items[0].message_id, 1);
+    }
+
+    #[test]
     fn test_build_fts_query() {
         assert_eq!(build_fts_query("hello world"), "\"hello\" \"world\"");
         assert_eq!(build_fts_query("삼성전자"), "\"삼성전자\"");
@@ -405,9 +381,20 @@ mod tests {
     }
 
     #[test]
+    fn korean_short_jamo_like_fallback() {
+        let store = korean_store();
+        let result = search(&store, "ㅅㅏ", &SearchScope::All, None, None).unwrap();
+        let ids: Vec<i64> = result.items.iter().map(|i| i.message_id).collect();
+        assert!(
+            ids.contains(&1) || ids.contains(&2),
+            "expected short jamo LIKE fallback to hit 삼성 rows, got {ids:?}"
+        );
+    }
+
+    #[test]
     fn plan_branches_falls_back_to_like_for_short_queries() {
-        // One-char query should skip every trigram branch.
-        assert!(plan_branches("a").is_empty());
-        assert!(plan_branches("ㅅ").is_empty());
+        // One-char query should skip FTS so the LIKE path can handle it.
+        assert!(build_match_query("a").is_none());
+        assert!(build_match_query("ㅅ").is_none());
     }
 }

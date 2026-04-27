@@ -66,6 +66,40 @@ pub fn run_migrations(conn: &Connection) -> Result<(), sqlite::Error> {
     // this codebase no longer creates chosung in the first place.
     migrate_drop_chosung(conn)?;
 
+    // Phase 8: Collapse Korean search indexes into one external-content
+    // FTS5 table over plain, nospace, and jamo-normalized text.
+    migrate_message_index_v8(conn)?;
+
+    Ok(())
+}
+
+fn migrate_message_index_v8(conn: &Connection) -> Result<(), sqlite::Error> {
+    if get_schema_version(conn) >= 8 {
+        return Ok(());
+    }
+
+    if !column_exists(conn, "messages", "text_jamo")? {
+        conn.execute("ALTER TABLE messages ADD COLUMN text_jamo TEXT NOT NULL DEFAULT ''")?;
+    }
+
+    backfill_message_search_columns(conn)?;
+
+    conn.execute("DROP TABLE IF EXISTS messages_fts")?;
+    conn.execute("DROP TABLE IF EXISTS messages_fts_nospace")?;
+    conn.execute("DROP TABLE IF EXISTS messages_fts_jamo")?;
+
+    conn.execute(
+        "CREATE VIRTUAL TABLE messages_fts USING fts5(
+            text_plain, text_stripped, text_jamo,
+            content='messages',
+            content_rowid='rowid',
+            tokenize='trigram case_sensitive 0'
+        )",
+    )?;
+
+    conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")?;
+    conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '8')")?;
+
     Ok(())
 }
 
@@ -140,7 +174,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, s
 }
 
 fn backfill_korean_columns(conn: &Connection) -> Result<(), sqlite::Error> {
-    const BATCH: usize = 500;
+    const BATCH: usize = 5000;
     loop {
         let mut rows: Vec<(i64, String)> = Vec::with_capacity(BATCH);
         {
@@ -164,6 +198,44 @@ fn backfill_korean_columns(conn: &Connection) -> Result<(), sqlite::Error> {
             let mut stmt = conn.prepare("UPDATE messages SET text_jamo = ? WHERE rowid = ?")?;
             stmt.bind((1, jamo.as_str()))?;
             stmt.bind((2, *rowid))?;
+            stmt.next()?;
+        }
+        conn.execute("COMMIT")?;
+
+        if rows.len() < BATCH {
+            return Ok(());
+        }
+    }
+}
+
+fn backfill_message_search_columns(conn: &Connection) -> Result<(), sqlite::Error> {
+    const BATCH: usize = 5000;
+    loop {
+        let mut rows: Vec<(i64, String)> = Vec::with_capacity(BATCH);
+        {
+            let mut stmt = conn.prepare(
+                "SELECT rowid, text_plain FROM messages
+                 WHERE text_stripped = '' OR text_jamo = ''
+                 LIMIT ?",
+            )?;
+            stmt.bind((1, BATCH as i64))?;
+            while let sqlite::State::Row = stmt.next()? {
+                rows.push((stmt.read::<i64, _>(0)?, stmt.read::<String, _>(1)?));
+            }
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        conn.execute("BEGIN")?;
+        for (rowid, text) in &rows {
+            let stripped = crate::store::message::strip_whitespace(text);
+            let jamo = crate::search::hangul::decompose_jamo(text);
+            let mut stmt = conn
+                .prepare("UPDATE messages SET text_stripped = ?, text_jamo = ? WHERE rowid = ?")?;
+            stmt.bind((1, stripped.as_str()))?;
+            stmt.bind((2, jamo.as_str()))?;
+            stmt.bind((3, *rowid))?;
             stmt.next()?;
         }
         conn.execute("COMMIT")?;
@@ -511,6 +583,23 @@ mod tests {
             .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = 'messages_fts'")
             .unwrap();
         assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
+    }
+
+    #[test]
+    fn test_v8_single_message_fts_table_created() {
+        let store = Store::open_in_memory().unwrap();
+        let mut tables = Vec::new();
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            tables.push(stmt.read::<String, _>("name").unwrap());
+        }
+
+        assert!(tables.contains(&"messages_fts".to_string()));
+        assert!(!tables.contains(&"messages_fts_nospace".to_string()));
+        assert!(!tables.contains(&"messages_fts_jamo".to_string()));
     }
 
     #[test]

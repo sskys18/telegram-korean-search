@@ -175,7 +175,8 @@ pub struct IndexMessageInput {
 
 #[derive(Debug, Serialize)]
 pub struct IndexBatchResult {
-    pub indexed: u64,
+    pub inserted: u64,
+    pub updated: u64,
 }
 
 #[derive(Debug, Deserialize)]
