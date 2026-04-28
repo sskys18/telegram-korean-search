@@ -254,6 +254,7 @@ public final class WikiTabController: ViewController, NSSearchFieldDelegate {
             root.view.frame = containerView.bounds
             containerView.addSubview(root.view)
         }
+        layoutManual()
         return true
     }
 }

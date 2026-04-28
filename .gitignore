@@ -69,6 +69,11 @@ submodules/Mozjpeg/SharedHeaders
 submodules/OpenSSLEncryptionProvider/SharedHeaders
 .worktrees/
 
+# Local Seoyu DB backups (contain live message data) and per-session
+# Claude state — never commit
+.backup/
+.claude/
+
 *.profraw
 default.profraw
 xcuserdata/
