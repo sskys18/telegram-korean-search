@@ -1,18 +1,15 @@
 import Cocoa
 import TGUIKit
+import TelegramCore
 import Seoyu
 
-public final class WikiTabController: ViewController {
+public final class WikiTabController: ViewController, NSSearchFieldDelegate {
     private let seoyu: Seoyu
     public var openChat: ((Int64, Int64) -> Void)?
 
     private let backButton = NSButton()
-    private let langButton = NSButton()
-    private let searchButton = NSButton()
-    private let statusLabel = NSTextField(labelWithString: "")
-    private var pendingCount: UInt64 = 0
-    private var processedCount: UInt64 = 0
-    private var totalCount: UInt64 = 0
+    private let settingsButton = NSButton()
+    private let searchField = NSSearchField()
 
     private let containerView = NSView()
     private lazy var listController: WikiListViewController = {
@@ -42,28 +39,41 @@ public final class WikiTabController: ViewController {
 
         push(listController, animated: false)
         layoutManual()
-
-        NotificationCenter.default.addObserver(
-            forName: .seoyuWikiProgress,
-            object: nil,
-            queue: .main
-        ) { [weak self] note in
-            guard let self else { return }
-            self.pendingCount = (note.userInfo?["pending"] as? UInt64) ?? 0
-            self.processedCount = (note.userInfo?["processed"] as? UInt64) ?? 0
-            self.totalCount = (note.userInfo?["total"] as? UInt64) ?? 0
-            self.updateStatusLabel()
-        }
-        NotificationCenter.default.addObserver(
-            forName: .seoyuWikiLanguageChanged,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in self?.updateLangButton() }
+        listController.showTrending()
     }
 
     public override func viewDidResized(_ size: NSSize) {
         super.viewDidResized(size)
         layoutManual()
+        registerSearchResponder()
+    }
+
+    public override func firstResponder() -> NSResponder? {
+        if pageStack.count <= 1 {
+            return searchField
+        }
+        return nil
+    }
+
+    private var responderRegistered = false
+
+    private func registerSearchResponder() {
+        guard !responderRegistered, let win = view.window as? Window else { return }
+        responderRegistered = true
+        win.set(responder: { [weak self] () -> NSResponder? in
+            guard let self else { return nil }
+            if self.pageStack.count > 1 { return nil }
+            guard let window = self.view.window else { return nil }
+            let fr = window.firstResponder
+            if fr === self.searchField { return self.searchField }
+            if let view = fr as? NSView, view.isDescendant(of: self.view) {
+                return self.searchField
+            }
+            if let editor = fr as? NSText, let host = editor.delegate as? NSView, host.isDescendant(of: self.view) {
+                return self.searchField
+            }
+            return nil
+        }, with: self, priority: .modal)
     }
 
     private func layoutManual() {
@@ -73,27 +83,26 @@ public final class WikiTabController: ViewController {
         let toolbarH: CGFloat = 24
         let topPad: CGFloat = 6
         let spacing: CGFloat = 6
-        let btnGap: CGFloat = 8
         let sidePad: CGFloat = 8
         backButton.sizeToFit()
-        langButton.sizeToFit()
-        searchButton.sizeToFit()
-        statusLabel.sizeToFit()
+        settingsButton.sizeToFit()
         let onArticle = pageStack.count > 1
         backButton.isHidden = !onArticle
-        langButton.isHidden = onArticle
-        searchButton.isHidden = onArticle
-        var x = sidePad
+        searchField.isHidden = onArticle
+        let leftEdge: CGFloat
         if onArticle {
-            backButton.frame = NSRect(x: x, y: topPad, width: max(backButton.frame.width, 24), height: toolbarH)
-            x += backButton.frame.width + btnGap
+            backButton.frame = NSRect(x: sidePad, y: topPad, width: max(backButton.frame.width, 24), height: toolbarH)
+            leftEdge = sidePad + backButton.frame.width + 8
         } else {
-            langButton.frame = NSRect(x: x, y: topPad, width: langButton.frame.width, height: toolbarH)
-            x += langButton.frame.width + btnGap
-            searchButton.frame = NSRect(x: x, y: topPad, width: searchButton.frame.width, height: toolbarH)
+            leftEdge = sidePad
         }
-        let statusW = statusLabel.frame.width
-        statusLabel.frame = NSRect(x: max(w - sidePad - statusW, x + btnGap), y: topPad + 4, width: statusW, height: toolbarH - 4)
+        let gearW = max(settingsButton.frame.width, 24)
+        let gearX = w - sidePad - gearW
+        settingsButton.frame = NSRect(x: gearX, y: topPad, width: gearW, height: toolbarH)
+        if !onArticle {
+            let searchW = max(gearX - 8 - leftEdge, 0)
+            searchField.frame = NSRect(x: leftEdge, y: topPad, width: searchW, height: toolbarH)
+        }
         let containerY = topPad + toolbarH + spacing
         containerView.frame = NSRect(x: 0, y: containerY, width: w, height: max(h - containerY, 0))
         for child in pageStack {
@@ -119,25 +128,75 @@ public final class WikiTabController: ViewController {
             .font: NSFont.systemFont(ofSize: 12, weight: .medium),
         ])
 
-        langButton.bezelStyle = .inline
-        langButton.target = self
-        langButton.action = #selector(toggleLanguage)
-        updateLangButton()
+        settingsButton.bezelStyle = .inline
+        settingsButton.isBordered = false
+        settingsButton.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Settings")?.withSymbolConfiguration(cfg)
+        settingsButton.imagePosition = .imageOnly
+        settingsButton.target = self
+        settingsButton.action = #selector(showSettingsMenu(_:))
 
-        searchButton.bezelStyle = .inline
-        searchButton.title = "Search"
-        searchButton.target = self
-        searchButton.action = #selector(presentSearch)
-
-        statusLabel.font = NSFont.systemFont(ofSize: 11)
-        statusLabel.textColor = .secondaryLabelColor
-        updateStatusLabel()
+        searchField.placeholderString = "Search wiki"
+        searchField.target = self
+        searchField.action = #selector(onSearchSubmit(_:))
+        searchField.delegate = self
+        searchField.sendsSearchStringImmediately = false
+        searchField.sendsWholeSearchString = true
+        searchField.controlSize = .small
+        searchField.font = .systemFont(ofSize: 12)
 
         view.addSubview(backButton)
-        view.addSubview(langButton)
-        view.addSubview(searchButton)
-        view.addSubview(statusLabel)
+        view.addSubview(settingsButton)
+        view.addSubview(searchField)
     }
+
+    @objc private func onSearchSubmit(_ sender: NSSearchField) {
+        Logger.shared.log("wiki", "search submit q=\(sender.stringValue)")
+        if pageStack.last !== listController {
+            popToRoot()
+        }
+        listController.applySearch(query: sender.stringValue)
+    }
+
+    public func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+            Logger.shared.log("wiki", "search enter")
+            onSearchSubmit(searchField)
+            return true
+        }
+        return false
+    }
+
+    @objc private func showSettingsMenu(_ sender: NSButton) {
+        let menu = NSMenu()
+        let trending = NSMenuItem(title: "24h Trending", action: #selector(showTrending), keyEquivalent: "")
+        trending.target = self
+        menu.addItem(trending)
+        menu.addItem(.separator())
+        let langItem = NSMenuItem(title: "Language", action: nil, keyEquivalent: "")
+        let langSub = NSMenu()
+        let ko = NSMenuItem(title: "한국어", action: #selector(setLangKo), keyEquivalent: "")
+        ko.target = self
+        ko.state = WikiLocale.current == .ko ? .on : .off
+        let en = NSMenuItem(title: "English", action: #selector(setLangEn), keyEquivalent: "")
+        en.target = self
+        en.state = WikiLocale.current == .en ? .on : .off
+        langSub.addItem(ko)
+        langSub.addItem(en)
+        langItem.submenu = langSub
+        menu.addItem(langItem)
+        let p = NSPoint(x: 0, y: sender.bounds.height)
+        menu.popUp(positioning: nil, at: p, in: sender)
+    }
+
+    @objc private func showTrending() {
+        if pageStack.last !== listController {
+            popToRoot()
+        }
+        listController.showTrending()
+    }
+
+    @objc private func setLangKo() { WikiLocale.current = .ko }
+    @objc private func setLangEn() { WikiLocale.current = .en }
 
     @objc private func popBack() {
         guard pageStack.count > 1 else { return }
@@ -153,80 +212,6 @@ public final class WikiTabController: ViewController {
             }
         }
         layoutManual()
-    }
-
-    private func updateLangButton() {
-        langButton.title = WikiLocale.current == .en ? "EN" : "KO"
-    }
-
-    private func updateStatusLabel() {
-        if pendingCount > 0 {
-            statusLabel.stringValue = "queued \(pendingCount)"
-        } else if totalCount > 0 {
-            statusLabel.stringValue = "\(processedCount)/\(totalCount)"
-        } else {
-            statusLabel.stringValue = "idle"
-        }
-        statusLabel.sizeToFit()
-        layoutManual()
-    }
-
-    @objc private func toggleLanguage() {
-        WikiLocale.current = (WikiLocale.current == .en) ? .ko : .en
-        updateLangButton()
-    }
-
-    @objc private func presentSearch() {
-        let sheet = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 320, height: 80),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
-        )
-        sheet.title = "Search wiki"
-        let field = NSTextField(frame: NSRect(x: 12, y: 36, width: 296, height: 24))
-        field.placeholderString = "Topic title"
-        field.target = self
-        field.action = #selector(submitSearch(_:))
-        let cancel = NSButton(frame: NSRect(x: 232, y: 6, width: 76, height: 24))
-        cancel.title = "Cancel"
-        cancel.bezelStyle = .rounded
-        cancel.target = self
-        cancel.action = #selector(cancelSearch(_:))
-        sheet.contentView?.addSubview(field)
-        sheet.contentView?.addSubview(cancel)
-        sheet.initialFirstResponder = field
-        searchSheet = sheet
-        view.window?.beginSheet(sheet, completionHandler: nil)
-    }
-
-    private weak var searchSheet: NSWindow?
-
-    @objc private func cancelSearch(_ sender: NSButton) {
-        if let sheet = searchSheet {
-            view.window?.endSheet(sheet)
-            searchSheet = nil
-        }
-    }
-
-    @objc private func submitSearch(_ sender: NSTextField) {
-        let query = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let sheet = searchSheet {
-            view.window?.endSheet(sheet)
-            searchSheet = nil
-        }
-        guard !query.isEmpty else { return }
-        let seoyu = self.seoyu
-        DispatchQueue.global(qos: .userInitiated).async {
-            let results = (try? seoyu.wikiSearch(query: query, limit: 50)) ?? []
-            DispatchQueue.main.async {
-                let resultsVC = WikiListViewController(seoyu: seoyu, seed: results)
-                resultsVC.onTopicSelected = { [weak self] topic in
-                    self?.pushArticle(topicId: topic.id)
-                }
-                self.push(resultsVC, animated: true)
-            }
-        }
     }
 
     private func pushArticle(topicId: Int64) {

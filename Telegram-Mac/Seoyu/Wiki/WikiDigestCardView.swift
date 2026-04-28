@@ -3,10 +3,6 @@ import Seoyu
 
 public final class WikiDigestCardView: NSView {
     private let dateLabel = NSTextField(labelWithString: "")
-    private let topicCountLabel = NSTextField(labelWithString: "0")
-    private let topicCaptionLabel = NSTextField(labelWithString: "topics")
-    private let msgCountLabel = NSTextField(labelWithString: "0")
-    private let msgCaptionLabel = NSTextField(labelWithString: "msgs")
     private let hotStack = NSStackView()
 
     public override init(frame frameRect: NSRect) {
@@ -25,36 +21,12 @@ public final class WikiDigestCardView: NSView {
         dateLabel.font = .systemFont(ofSize: 11, weight: .medium)
         dateLabel.textColor = .tertiaryLabelColor
 
-        topicCountLabel.font = .systemFont(ofSize: 22, weight: .bold)
-        topicCountLabel.textColor = .controlAccentColor
-        topicCaptionLabel.font = .systemFont(ofSize: 11)
-        topicCaptionLabel.textColor = .secondaryLabelColor
-
-        msgCountLabel.font = .systemFont(ofSize: 22, weight: .bold)
-        msgCountLabel.textColor = .labelColor
-        msgCaptionLabel.font = .systemFont(ofSize: 11)
-        msgCaptionLabel.textColor = .secondaryLabelColor
-
-        let topicStack = verticalStack(topicCountLabel, topicCaptionLabel)
-        let msgStack = verticalStack(msgCountLabel, msgCaptionLabel)
-
-        let divider = NSView()
-        divider.wantsLayer = true
-        divider.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        divider.translatesAutoresizingMaskIntoConstraints = false
-        divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
-
-        let numbersRow = NSStackView(views: [topicStack, divider, msgStack])
-        numbersRow.orientation = .horizontal
-        numbersRow.spacing = 18
-        numbersRow.alignment = .centerY
-
         hotStack.orientation = .vertical
         hotStack.alignment = .leading
         hotStack.spacing = 3
         hotStack.translatesAutoresizingMaskIntoConstraints = false
 
-        let root = NSStackView(views: [dateLabel, numbersRow, hotStack])
+        let root = NSStackView(views: [dateLabel, hotStack])
         root.orientation = .vertical
         root.alignment = .leading
         root.spacing = 8
@@ -65,27 +37,16 @@ public final class WikiDigestCardView: NSView {
             root.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
             root.topAnchor.constraint(equalTo: topAnchor, constant: 12),
             root.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12),
-            divider.heightAnchor.constraint(equalToConstant: 28),
         ])
     }
 
-    private func verticalStack(_ a: NSView, _ b: NSView) -> NSStackView {
-        let s = NSStackView(views: [a, b])
-        s.orientation = .vertical
-        s.alignment = .leading
-        s.spacing = 0
-        return s
-    }
-
     public func configure(with digest: WikiDigest?) {
-        guard let d = digest, d.topicCount > 0 || d.messageCount > 0 else {
+        guard let d = digest, !d.hotTopics.isEmpty else {
             isHidden = true
             return
         }
         isHidden = false
         dateLabel.stringValue = "TODAY · \(d.dateYmd)"
-        topicCountLabel.stringValue = "\(d.topicCount)"
-        msgCountLabel.stringValue = "\(d.messageCount)"
         hotStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         for topic in d.hotTopics.prefix(3) {
             let row = NSStackView(views: [

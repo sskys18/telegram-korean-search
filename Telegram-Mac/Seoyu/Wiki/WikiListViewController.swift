@@ -11,9 +11,11 @@ public final class WikiListViewController: NSViewController,
     private let errorBanner = NSView()
     private let errorLabel = NSTextField(labelWithString: "")
     private let toastLabel = NSTextField(labelWithString: "")
+    private let headerLabel = NSTextField(labelWithString: "Trending")
 
     private var topics: [WikiTopicSummary] = []
     private var seedTopics: [WikiTopicSummary]?
+    private var isSearchMode = false
 
     public var onTopicSelected: ((WikiTopicSummary) -> Void)?
 
@@ -32,11 +34,15 @@ public final class WikiListViewController: NSViewController,
         root.spacing = 8
         root.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 0, right: 8)
         root.translatesAutoresizingMaskIntoConstraints = false
+        root.detachesHiddenViews = true
+        root.distribution = .fill
+        root.alignment = .leading
 
-        let header = NSTextField(labelWithString: "Trending")
-        header.font = .systemFont(ofSize: 18, weight: .bold)
-        header.textColor = .labelColor
-        root.addArrangedSubview(header)
+        headerLabel.font = .systemFont(ofSize: 18, weight: .bold)
+        headerLabel.textColor = .labelColor
+        headerLabel.isHidden = true
+        root.addArrangedSubview(headerLabel)
+        digestView.isHidden = true
         root.addArrangedSubview(digestView)
 
         let column = NSTableColumn(identifier: .init("topic"))
@@ -57,6 +63,10 @@ public final class WikiListViewController: NSViewController,
         scroll.hasVerticalScroller = true
         scroll.translatesAutoresizingMaskIntoConstraints = false
         root.addArrangedSubview(scroll)
+        scroll.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        headerLabel.setContentHuggingPriority(.required, for: .vertical)
+        headerLabel.setContentCompressionResistancePriority(.required, for: .vertical)
+        digestView.setContentHuggingPriority(.required, for: .vertical)
 
         emptyLabel.alignment = .center
         emptyLabel.textColor = .secondaryLabelColor
@@ -161,46 +171,31 @@ public final class WikiListViewController: NSViewController,
 
     public override func viewDidAppear() {
         super.viewDidAppear()
-        reload()
     }
 
-    /// Public so a host (e.g. WikiTabController) can force initial load
-    /// without relying on viewDidAppear (which only fires when the VC
-    /// is part of a window via NSViewController parenting).
     public func forceReload() {
-        reload()
+        updateEmptyState()
     }
 
-    private var lastReload: Date = .distantPast
-
-    private func throttledReload() {
-        let now = Date()
-        if now.timeIntervalSince(lastReload) < 0.5 {
-            return
-        }
-        lastReload = now
-        reload()
-    }
-
-    private func reload() {
-        if let seed = seedTopics {
-            self.topics = seed
-            self.tableView.reloadData()
-            self.updateEmptyState()
-            return
-        }
+    public func showTrending() {
+        isSearchMode = false
+        headerLabel.isHidden = false
+        headerLabel.stringValue = "24h Trending"
+        digestView.isHidden = true
         let seoyu = self.seoyu
         DispatchQueue.global(qos: .userInitiated).async {
             let topics = (try? seoyu.wikiTrending(limit: 40, offset: 0, category: nil)) ?? []
-            let digest = try? seoyu.wikiDigestToday()
             DispatchQueue.main.async {
                 self.topics = topics
-                self.digestView.configure(with: digest)
                 self.tableView.reloadData()
                 self.updateEmptyState()
             }
         }
     }
+
+    private var lastReload: Date = .distantPast
+
+    private func throttledReload() {}
 
     private func handleProgress(_ note: Notification) {
         let total = (note.userInfo?["total"] as? UInt64) ?? 0
@@ -212,16 +207,44 @@ public final class WikiListViewController: NSViewController,
 
     private func updateEmptyState() {
         if topics.isEmpty {
-            emptyLabel.stringValue = "No topics yet"
+            emptyLabel.stringValue = isSearchMode ? "No results" : "Type to search wiki"
             emptyLabel.isHidden = false
         } else {
             emptyLabel.isHidden = true
         }
     }
 
+    public func applySearch(query: String) {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        NSLog("[wiki-list] applySearch q=%@ raw=%@", q, query)
+        if q.isEmpty {
+            isSearchMode = false
+            headerLabel.isHidden = true
+            digestView.isHidden = true
+            self.topics = []
+            self.tableView.reloadData()
+            self.updateEmptyState()
+            return
+        }
+        isSearchMode = true
+        headerLabel.isHidden = false
+        headerLabel.stringValue = "Results for \"\(q)\""
+        digestView.isHidden = true
+        let seoyu = self.seoyu
+        DispatchQueue.global(qos: .userInitiated).async {
+            let results = (try? seoyu.wikiSearch(query: q, limit: 50)) ?? []
+            NSLog("[wiki-list] search returned count=%d", results.count)
+            DispatchQueue.main.async {
+                self.topics = results
+                self.tableView.reloadData()
+                self.updateEmptyState()
+            }
+        }
+    }
+
     @objc private func onRowClicked() {
         let row = tableView.clickedRow
-        NSLog("[wiki-list] row clicked=%d count=%d", row, topics.count)
+        NSLog("[wiki-list] row clicked=%d count=%d hasCallback=%@", row, topics.count, onTopicSelected == nil ? "no" : "yes")
         guard row >= 0, row < topics.count else { return }
         onTopicSelected?(topics[row])
     }
