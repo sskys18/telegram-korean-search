@@ -332,6 +332,22 @@ impl Store {
                      WHERE topic_id = {0}",
                     topic_id
                 ))?;
+                self.conn.execute(format!(
+                    "DELETE FROM topic_stats_daily WHERE topic_id = {0};
+                     INSERT INTO topic_stats_daily (topic_id, date, msg_count)
+                     SELECT {0}, date(m.timestamp, 'unixepoch') AS d, COUNT(*)
+                     FROM wiki_topic_messages tm
+                     JOIN messages m ON m.chat_id = tm.chat_id AND m.message_id = tm.message_id
+                     WHERE tm.topic_id = {0}
+                     GROUP BY d;
+                     DELETE FROM topic_channel_membership WHERE topic_id = {0};
+                     INSERT OR IGNORE INTO topic_channel_membership (topic_id, date, chat_id)
+                     SELECT {0}, date(m.timestamp, 'unixepoch'), m.chat_id
+                     FROM wiki_topic_messages tm
+                     JOIN messages m ON m.chat_id = tm.chat_id AND m.message_id = tm.message_id
+                     WHERE tm.topic_id = {0};",
+                    topic_id
+                ))?;
                 self.recompute_topic_trending_score(*topic_id)?;
             }
             Ok(deleted)

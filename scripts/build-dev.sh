@@ -67,7 +67,15 @@ if [[ "$RUN" == 1 ]]; then
     mkdir -p "$ROOT/.backup"
     TS="$(date +%Y%m%d-%H%M%S)"
     BACKUP="$ROOT/.backup/tg-korean-search.$TS.db"
-    cp -p "$DB" "$BACKUP"
+    # Use sqlite3 .backup so WAL/SHM are checkpointed into the snapshot.
+    # Falls back to cp + cp -p of -wal/-shm if sqlite3 unavailable.
+    if command -v sqlite3 >/dev/null 2>&1; then
+      sqlite3 "$DB" ".backup '$BACKUP'"
+    else
+      cp -p "$DB" "$BACKUP"
+      [[ -f "$DB-wal" ]] && cp -p "$DB-wal" "$BACKUP-wal"
+      [[ -f "$DB-shm" ]] && cp -p "$DB-shm" "$BACKUP-shm"
+    fi
     echo "==> Backed up live Seoyu DB before launch: $BACKUP"
   fi
 
