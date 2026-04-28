@@ -15,12 +15,19 @@ public final class SeoyuIngestObserver: StoreOrUpdateMessageAction, DeleteMessag
 
     public func addOrUpdate(messages: [StoreMessage], transaction: Transaction) {
         var batch: [IndexedMessage] = []
+        var emptied: [MessageRef] = []
         batch.reserveCapacity(messages.count)
         for message in messages {
             guard case let .Id(messageId) = message.id else { continue }
             guard messageId.namespace == Namespaces.Message.Cloud else { continue }
             let text = message.text
-            guard !text.isEmpty else { continue }
+            if text.isEmpty {
+                emptied.append(MessageRef(
+                    chatId: messageId.peerId.toInt64(),
+                    messageId: Int64(messageId.id)
+                ))
+                continue
+            }
             batch.append(IndexedMessage(
                 chatId: messageId.peerId.toInt64(),
                 messageId: Int64(messageId.id),
@@ -29,11 +36,19 @@ public final class SeoyuIngestObserver: StoreOrUpdateMessageAction, DeleteMessag
                 link: nil
             ))
         }
-        guard !batch.isEmpty else { return }
-        do {
-            _ = try seoyu.indexMessages(messages: batch)
-        } catch {
-            NSLog("[seoyu] index failed for %d messages: %@", batch.count, String(describing: error))
+        if !batch.isEmpty {
+            do {
+                _ = try seoyu.indexMessages(messages: batch)
+            } catch {
+                NSLog("[seoyu] index failed for %d messages: %@", batch.count, String(describing: error))
+            }
+        }
+        if !emptied.isEmpty {
+            do {
+                _ = try seoyu.deleteMessages(refs: emptied)
+            } catch {
+                NSLog("[seoyu] delete-on-empty failed for %d refs: %@", emptied.count, String(describing: error))
+            }
         }
     }
 

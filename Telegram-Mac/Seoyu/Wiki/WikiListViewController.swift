@@ -17,6 +17,7 @@ public final class WikiListViewController: NSViewController,
     private var seedTopics: [WikiTopicSummary]?
     private var isSearchMode = false
     private var trendingMode = false
+    private var loadGen: UInt64 = 0
 
     public var onTopicSelected: ((WikiTopicSummary) -> Void)?
 
@@ -188,11 +189,13 @@ public final class WikiListViewController: NSViewController,
     }
 
     private func loadTrending() {
+        loadGen += 1
+        let myGen = loadGen
         let seoyu = self.seoyu
         DispatchQueue.global(qos: .userInitiated).async {
             let topics = (try? seoyu.wikiTrending(limit: 40, offset: 0, category: nil)) ?? []
             DispatchQueue.main.async {
-                guard self.trendingMode, !self.isSearchMode else { return }
+                guard myGen == self.loadGen, self.trendingMode, !self.isSearchMode else { return }
                 self.topics = topics
                 self.tableView.reloadData()
                 self.updateEmptyState()
@@ -246,10 +249,13 @@ public final class WikiListViewController: NSViewController,
         headerLabel.isHidden = false
         headerLabel.stringValue = "Results for \"\(q)\""
         digestView.isHidden = true
+        loadGen += 1
+        let myGen = loadGen
         let seoyu = self.seoyu
         DispatchQueue.global(qos: .userInitiated).async {
             let results = (try? seoyu.wikiSearch(query: q, limit: 50)) ?? []
             DispatchQueue.main.async {
+                guard myGen == self.loadGen else { return }
                 self.topics = results
                 self.tableView.reloadData()
                 self.updateEmptyState()

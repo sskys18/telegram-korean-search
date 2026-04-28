@@ -239,6 +239,32 @@ impl Store {
         Ok(())
     }
 
+    pub fn recompute_topic_trending_score(&self, topic_id: i64) -> Result<(), sqlite::Error> {
+        use crate::wiki::trending::calculate_trending_score;
+        let topic = match self.get_topic(topic_id)? {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let msgs_24h = self.get_topic_msg_count_days(topic_id, 1).unwrap_or(0);
+        let msgs_7d = self.get_topic_msg_count_days(topic_id, 7).unwrap_or(0);
+        let channels_7d = self.get_topic_channel_count_days(topic_id, 7).unwrap_or(0);
+        let total_channels = self.get_total_active_channels().unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let score = calculate_trending_score(
+            topic.message_count,
+            topic.last_seen_at.unwrap_or(0),
+            msgs_24h,
+            msgs_7d,
+            channels_7d,
+            total_channels,
+            now,
+        );
+        self.update_trending_score(topic_id, score)
+    }
+
     pub fn update_trending_score(&self, topic_id: i64, score: f64) -> Result<(), sqlite::Error> {
         let mut stmt = self
             .conn()

@@ -332,6 +332,7 @@ impl Store {
                      WHERE topic_id = {0}",
                     topic_id
                 ))?;
+                self.recompute_topic_trending_score(*topic_id)?;
             }
             Ok(deleted)
         })();
