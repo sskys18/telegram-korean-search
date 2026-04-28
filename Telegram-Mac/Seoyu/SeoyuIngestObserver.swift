@@ -6,7 +6,7 @@ import Seoyu
 /// Postbox observer that forwards every stored or updated message into
 /// the Rust sidecar so the Korean-aware index stays in sync with the
 /// authoritative message history.
-public final class SeoyuIngestObserver: StoreOrUpdateMessageAction {
+public final class SeoyuIngestObserver: StoreOrUpdateMessageAction, DeleteMessagesAction {
     private let seoyu: Seoyu
 
     public init(seoyu: Seoyu) {
@@ -34,6 +34,24 @@ public final class SeoyuIngestObserver: StoreOrUpdateMessageAction {
             _ = try seoyu.indexMessages(messages: batch)
         } catch {
             NSLog("[seoyu] index failed for %d messages: %@", batch.count, String(describing: error))
+        }
+    }
+
+    public func deleted(ids: [MessageId], transaction: Transaction) {
+        var refs: [MessageRef] = []
+        refs.reserveCapacity(ids.count)
+        for id in ids {
+            guard id.namespace == Namespaces.Message.Cloud else { continue }
+            refs.append(MessageRef(
+                chatId: id.peerId.toInt64(),
+                messageId: Int64(id.id)
+            ))
+        }
+        guard !refs.isEmpty else { return }
+        do {
+            _ = try seoyu.deleteMessages(refs: refs)
+        } catch {
+            NSLog("[seoyu] delete failed for %d refs: %@", refs.count, String(describing: error))
         }
     }
 }

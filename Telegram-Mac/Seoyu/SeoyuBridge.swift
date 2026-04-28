@@ -12,6 +12,7 @@ public final class SeoyuBridge {
     public private(set) var seoyu: Seoyu?
     public private(set) var initializationError: Error?
     private var ingestDisposable: Disposable?
+    private var deleteDisposable: Disposable?
     private let wikiObserverBridge = WikiObserverBridge()
 
     private init() {}
@@ -48,8 +49,10 @@ public final class SeoyuBridge {
     public func attach(postbox: Postbox) {
         guard let seoyu else { return }
         self.ingestDisposable?.dispose()
+        self.deleteDisposable?.dispose()
         let observer = SeoyuIngestObserver(seoyu: seoyu)
         self.ingestDisposable = postbox.installGlobalStoreOrUpdateMessageAction(action: observer)
+        self.deleteDisposable = postbox.installGlobalDeleteMessagesAction(action: observer)
 
         do {
             try seoyu.startWikiWorker()
@@ -64,6 +67,7 @@ public final class SeoyuBridge {
 
     deinit {
         self.ingestDisposable?.dispose()
+        self.deleteDisposable?.dispose()
         self.seoyu?.setWikiObserver(observer: nil)
         self.seoyu?.stopWikiWorker()
     }
