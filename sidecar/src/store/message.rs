@@ -261,6 +261,8 @@ impl Store {
         self.conn.execute("BEGIN")?;
         let result = (|| -> Result<u64, sqlite::Error> {
             let mut deleted = 0_u64;
+            let mut affected_topics: std::collections::BTreeSet<i64> =
+                std::collections::BTreeSet::new();
             for msg in refs {
                 let prior = {
                     let mut stmt = self.conn.prepare(
@@ -293,6 +295,16 @@ impl Store {
                 queue_stmt.bind((2, msg.message_id))?;
                 queue_stmt.next()?;
 
+                {
+                    let mut find_stmt = self.conn.prepare(
+                        "SELECT topic_id FROM wiki_topic_messages WHERE chat_id = ? AND message_id = ?",
+                    )?;
+                    find_stmt.bind((1, msg.chat_id))?;
+                    find_stmt.bind((2, msg.message_id))?;
+                    while let sqlite::State::Row = find_stmt.next()? {
+                        affected_topics.insert(find_stmt.read::<i64, _>(0)?);
+                    }
+                }
                 let mut topic_stmt = self.conn.prepare(
                     "DELETE FROM wiki_topic_messages WHERE chat_id = ? AND message_id = ?",
                 )?;
@@ -304,6 +316,22 @@ impl Store {
                 msg_stmt.bind((1, rowid))?;
                 msg_stmt.next()?;
                 deleted += 1;
+            }
+            for topic_id in &affected_topics {
+                self.conn.execute(format!(
+                    "UPDATE wiki_topics SET
+                        message_count = (SELECT COUNT(*) FROM wiki_topic_messages WHERE topic_id = {0}),
+                        channel_count = (SELECT COUNT(DISTINCT chat_id) FROM wiki_topic_messages WHERE topic_id = {0}),
+                        first_seen_at = (SELECT MIN(m.timestamp) FROM wiki_topic_messages tm
+                            JOIN messages m ON m.chat_id = tm.chat_id AND m.message_id = tm.message_id
+                            WHERE tm.topic_id = {0}),
+                        last_seen_at = (SELECT MAX(m.timestamp) FROM wiki_topic_messages tm
+                            JOIN messages m ON m.chat_id = tm.chat_id AND m.message_id = tm.message_id
+                            WHERE tm.topic_id = {0}),
+                        updated_at = datetime('now')
+                     WHERE topic_id = {0}",
+                    topic_id
+                ))?;
             }
             Ok(deleted)
         })();

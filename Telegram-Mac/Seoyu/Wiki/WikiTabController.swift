@@ -1,6 +1,5 @@
 import Cocoa
 import TGUIKit
-import TelegramCore
 import Seoyu
 
 public final class WikiTabController: ViewController, NSSearchFieldDelegate {
@@ -150,7 +149,6 @@ public final class WikiTabController: ViewController, NSSearchFieldDelegate {
     }
 
     @objc private func onSearchSubmit(_ sender: NSSearchField) {
-        Logger.shared.log("wiki", "search submit q=\(sender.stringValue)")
         if pageStack.last !== listController {
             popToRoot()
         }
@@ -159,7 +157,6 @@ public final class WikiTabController: ViewController, NSSearchFieldDelegate {
 
     public func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-            Logger.shared.log("wiki", "search enter")
             onSearchSubmit(searchField)
             return true
         }

@@ -16,6 +16,7 @@ public final class WikiListViewController: NSViewController,
     private var topics: [WikiTopicSummary] = []
     private var seedTopics: [WikiTopicSummary]?
     private var isSearchMode = false
+    private var trendingMode = false
 
     public var onTopicSelected: ((WikiTopicSummary) -> Void)?
 
@@ -179,13 +180,19 @@ public final class WikiListViewController: NSViewController,
 
     public func showTrending() {
         isSearchMode = false
+        trendingMode = true
         headerLabel.isHidden = false
         headerLabel.stringValue = "24h Trending"
         digestView.isHidden = true
+        loadTrending()
+    }
+
+    private func loadTrending() {
         let seoyu = self.seoyu
         DispatchQueue.global(qos: .userInitiated).async {
             let topics = (try? seoyu.wikiTrending(limit: 40, offset: 0, category: nil)) ?? []
             DispatchQueue.main.async {
+                guard self.trendingMode, !self.isSearchMode else { return }
                 self.topics = topics
                 self.tableView.reloadData()
                 self.updateEmptyState()
@@ -195,7 +202,13 @@ public final class WikiListViewController: NSViewController,
 
     private var lastReload: Date = .distantPast
 
-    private func throttledReload() {}
+    private func throttledReload() {
+        guard trendingMode, !isSearchMode else { return }
+        let now = Date()
+        if now.timeIntervalSince(lastReload) < 0.5 { return }
+        lastReload = now
+        loadTrending()
+    }
 
     private func handleProgress(_ note: Notification) {
         let total = (note.userInfo?["total"] as? UInt64) ?? 0
@@ -216,14 +229,17 @@ public final class WikiListViewController: NSViewController,
 
     public func applySearch(query: String) {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        NSLog("[wiki-list] applySearch q=%@ raw=%@", q, query)
         if q.isEmpty {
             isSearchMode = false
-            headerLabel.isHidden = true
-            digestView.isHidden = true
-            self.topics = []
-            self.tableView.reloadData()
-            self.updateEmptyState()
+            if trendingMode {
+                showTrending()
+            } else {
+                headerLabel.isHidden = true
+                digestView.isHidden = true
+                self.topics = []
+                self.tableView.reloadData()
+                self.updateEmptyState()
+            }
             return
         }
         isSearchMode = true
@@ -233,7 +249,6 @@ public final class WikiListViewController: NSViewController,
         let seoyu = self.seoyu
         DispatchQueue.global(qos: .userInitiated).async {
             let results = (try? seoyu.wikiSearch(query: q, limit: 50)) ?? []
-            NSLog("[wiki-list] search returned count=%d", results.count)
             DispatchQueue.main.async {
                 self.topics = results
                 self.tableView.reloadData()
@@ -244,7 +259,6 @@ public final class WikiListViewController: NSViewController,
 
     @objc private func onRowClicked() {
         let row = tableView.clickedRow
-        NSLog("[wiki-list] row clicked=%d count=%d hasCallback=%@", row, topics.count, onTopicSelected == nil ? "no" : "yes")
         guard row >= 0, row < topics.count else { return }
         onTopicSelected?(topics[row])
     }
