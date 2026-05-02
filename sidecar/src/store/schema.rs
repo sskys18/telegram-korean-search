@@ -70,6 +70,250 @@ pub fn run_migrations(conn: &Connection) -> Result<(), sqlite::Error> {
     // FTS5 table over plain, nospace, and jamo-normalized text.
     migrate_message_index_v8(conn)?;
 
+    // Phase 9: Wiki v2 tables (per docs/specs/2026-04-24-reindex-and-wiki-v2-design.md §5).
+    // v1 wiki tables stay untouched at this phase. v9 tables that would
+    // collide with v1 names (wiki_pages, wiki_classify_queue) get a
+    // `_v2` suffix; phase-13 drop_v1_wiki swaps them in. End state is
+    // identical to spec rename-then-drop. This deviation keeps the v1
+    // wiki module code (10 files) compiling until phase 6 rebuild.
+    migrate_to_v9(conn)?;
+
+    Ok(())
+}
+
+fn migrate_to_v9(conn: &Connection) -> Result<(), sqlite::Error> {
+    if get_schema_version(conn) >= 9 {
+        return Ok(());
+    }
+
+    conn.execute("BEGIN")?;
+    let result = (|| -> Result<(), sqlite::Error> {
+        conn.execute(
+            "
+            CREATE TABLE IF NOT EXISTS wiki_pages_v2 (
+                id                          INTEGER PRIMARY KEY,
+                kind                        TEXT NOT NULL
+                                                CHECK (kind IN ('topic','event','entity')),
+                title                       TEXT NOT NULL,
+                title_norm                  TEXT NOT NULL,
+                summary_md                  TEXT NOT NULL DEFAULT '',
+                summary_rev                 INTEGER NOT NULL DEFAULT 0,
+                state                       TEXT NOT NULL DEFAULT 'active'
+                                                CHECK (state IN ('active','resolved','frozen','hidden')),
+                pinned                      INTEGER NOT NULL DEFAULT 0,
+                facts                       TEXT,
+                facts_version               INTEGER NOT NULL DEFAULT 1,
+                evidence_count              INTEGER NOT NULL DEFAULT 0,
+                last_rewrite_evidence_count INTEGER NOT NULL DEFAULT 0,
+                last_evidence_at            INTEGER,
+                last_rewrite_at             INTEGER,
+                created_at                  INTEGER NOT NULL,
+                updated_at                  INTEGER NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_pages_v2_title_norm
+                ON wiki_pages_v2 (title_norm);
+            CREATE INDEX IF NOT EXISTS ix_pages_v2_active_evidence
+                ON wiki_pages_v2 (state, last_evidence_at DESC)
+                WHERE state = 'active';
+            CREATE INDEX IF NOT EXISTS ix_pages_v2_kind_state
+                ON wiki_pages_v2 (kind, state);
+
+            CREATE TABLE IF NOT EXISTS wiki_page_aliases (
+                page_id    INTEGER NOT NULL
+                               REFERENCES wiki_pages_v2(id) ON DELETE CASCADE,
+                alias_norm TEXT NOT NULL,
+                alias_raw  TEXT NOT NULL,
+                PRIMARY KEY (page_id, alias_norm)
+            );
+            CREATE INDEX IF NOT EXISTS ix_aliases_norm
+                ON wiki_page_aliases (alias_norm);
+
+            CREATE TABLE IF NOT EXISTS wiki_evidence (
+                id           INTEGER PRIMARY KEY,
+                page_id      INTEGER NOT NULL
+                                 REFERENCES wiki_pages_v2(id) ON DELETE CASCADE,
+                msg_id       INTEGER NOT NULL,
+                chat_id      INTEGER NOT NULL,
+                sender_id    INTEGER NOT NULL,
+                ts           INTEGER NOT NULL,
+                excerpt      TEXT NOT NULL,
+                excerpt_jamo TEXT NOT NULL DEFAULT '',
+                source_hash  BLOB NOT NULL,
+                salience     REAL NOT NULL DEFAULT 0.5,
+                cited        INTEGER NOT NULL DEFAULT 0,
+                created_at   INTEGER NOT NULL,
+                UNIQUE (page_id, msg_id, chat_id)
+            );
+            CREATE INDEX IF NOT EXISTS ix_evidence_source_hash
+                ON wiki_evidence (source_hash);
+            CREATE INDEX IF NOT EXISTS ix_evidence_page_ts
+                ON wiki_evidence (page_id, ts DESC);
+            CREATE INDEX IF NOT EXISTS ix_evidence_chat_ts
+                ON wiki_evidence (chat_id, ts DESC);
+            CREATE INDEX IF NOT EXISTS ix_evidence_ts
+                ON wiki_evidence (ts DESC);
+            CREATE INDEX IF NOT EXISTS ix_evidence_msg
+                ON wiki_evidence (msg_id, chat_id);
+
+            CREATE TABLE IF NOT EXISTS wiki_classify_queue_v2 (
+                msg_id          INTEGER NOT NULL,
+                chat_id         INTEGER NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending'
+                                    CHECK (status IN ('pending','processing','failed','done')),
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                last_error      TEXT,
+                hint            TEXT,
+                hint_page_id    INTEGER REFERENCES wiki_pages_v2(id) ON DELETE SET NULL,
+                text_hash       BLOB NOT NULL,
+                enqueued_at     INTEGER NOT NULL,
+                claimed_at      INTEGER,
+                next_attempt_at INTEGER,
+                PRIMARY KEY (msg_id, chat_id)
+            );
+            CREATE INDEX IF NOT EXISTS ix_classify_v2_ready
+                ON wiki_classify_queue_v2 (status, next_attempt_at)
+                WHERE status = 'pending';
+
+            CREATE TABLE IF NOT EXISTS wiki_rewrite_queue (
+                page_id         INTEGER PRIMARY KEY
+                                    REFERENCES wiki_pages_v2(id) ON DELETE CASCADE,
+                status          TEXT NOT NULL DEFAULT 'pending'
+                                    CHECK (status IN ('pending','processing','failed','done')),
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                last_error      TEXT,
+                enqueued_at     INTEGER NOT NULL,
+                claimed_at      INTEGER,
+                next_attempt_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS trending_cache (
+                window         TEXT NOT NULL CHECK (window IN ('1h','24h','7d')),
+                page_id        INTEGER NOT NULL
+                                   REFERENCES wiki_pages_v2(id) ON DELETE CASCADE,
+                rank           INTEGER NOT NULL,
+                hook           TEXT NOT NULL,
+                reason_code    TEXT NOT NULL,
+                reason_metrics TEXT NOT NULL,
+                sparkline      TEXT NOT NULL,
+                computed_at    INTEGER NOT NULL,
+                PRIMARY KEY (window, page_id),
+                UNIQUE (window, rank)
+            );
+            CREATE INDEX IF NOT EXISTS ix_trending_window_rank
+                ON trending_cache (window, rank);
+
+            CREATE TABLE IF NOT EXISTS trending_watermark (
+                window           TEXT PRIMARY KEY CHECK (window IN ('1h','24h','7d')),
+                last_evidence_id INTEGER NOT NULL DEFAULT 0,
+                last_computed_at INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS ask_history (
+                id            INTEGER PRIMARY KEY,
+                query         TEXT NOT NULL,
+                answer_md     TEXT NOT NULL,
+                cited_sources TEXT NOT NULL,
+                model         TEXT NOT NULL,
+                status        TEXT NOT NULL
+                                  CHECK (status IN ('streaming','done','cancelled','failed')),
+                created_at    INTEGER NOT NULL,
+                finished_at   INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS wiki_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS wiki_last_open (
+                chat_id      INTEGER PRIMARY KEY,
+                last_open_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS wiki_pages_index (
+                page_id      INTEGER PRIMARY KEY
+                                 REFERENCES wiki_pages_v2(id) ON DELETE CASCADE,
+                title        TEXT NOT NULL,
+                aliases      TEXT NOT NULL DEFAULT '',
+                summary_md   TEXT NOT NULL DEFAULT '',
+                title_jamo   TEXT NOT NULL DEFAULT '',
+                aliases_jamo TEXT NOT NULL DEFAULT '',
+                summary_jamo TEXT NOT NULL DEFAULT ''
+            );
+            ",
+        )?;
+
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(
+                title, aliases, summary_md,
+                title_jamo, aliases_jamo, summary_jamo,
+                content='wiki_pages_index',
+                content_rowid='page_id',
+                tokenize='trigram case_sensitive 0'
+            )",
+        )?;
+
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS evidence_fts USING fts5(
+                excerpt, excerpt_jamo,
+                content='wiki_evidence',
+                content_rowid='id',
+                tokenize='trigram case_sensitive 0'
+            )",
+        )?;
+
+        seed_wiki_settings(conn)?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO app_meta (key, value) VALUES ('schema_version', '9')",
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+fn seed_wiki_settings(conn: &Connection) -> Result<(), sqlite::Error> {
+    const DEFAULTS: &[(&str, &str)] = &[
+        ("max_codex_calls_per_hour_total", "500"),
+        ("model_classify", "gpt-5.5-nano"),
+        ("model_rewrite", "gpt-5.5"),
+        ("model_trending", "gpt-5.5"),
+        ("model_ask", "gpt-5.5-fast"),
+        ("classify_batch_size", "20"),
+        ("rewrite_per_hour_cap", "30"),
+        ("trend_refresh_min_interval_sec", "300"),
+        ("trend_window_min_refresh_sec", "3600"),
+        ("min_classify_chars", "12"),
+        ("max_classify_attempts", "3"),
+        ("max_rewrite_attempts", "3"),
+        ("max_ask_attempts", "2"),
+        ("retention_evidence_per_page", "200"),
+        ("fuzzy_title_dedup", "0"),
+        ("pause_codex", "0"),
+        ("pause_on_low_battery", "1"),
+        ("low_battery_threshold_percent", "20"),
+        ("v2_backfill_complete", "0"),
+        ("v2_backfill_allow_failed_tolerance", "100"),
+        ("schema_v9_marker", "1"),
+    ];
+    for (key, value) in DEFAULTS {
+        let mut stmt =
+            conn.prepare("INSERT OR IGNORE INTO wiki_settings (key, value) VALUES (?, ?)")?;
+        stmt.bind((1, *key))?;
+        stmt.bind((2, *value))?;
+        stmt.next()?;
+    }
     Ok(())
 }
 
@@ -656,6 +900,82 @@ mod tests {
         assert!(tables.contains(&"wiki_classify_queue".to_string()));
         assert!(tables.contains(&"topic_stats_daily".to_string()));
         assert!(tables.contains(&"topic_channel_membership".to_string()));
+    }
+
+    #[test]
+    fn test_v9_tables_created() {
+        let store = Store::open_in_memory().unwrap();
+        let mut tables = Vec::new();
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name")
+            .unwrap();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            tables.push(stmt.read::<String, _>("name").unwrap());
+        }
+
+        for name in [
+            "wiki_pages_v2",
+            "wiki_page_aliases",
+            "wiki_evidence",
+            "wiki_classify_queue_v2",
+            "wiki_rewrite_queue",
+            "trending_cache",
+            "trending_watermark",
+            "ask_history",
+            "wiki_settings",
+            "wiki_last_open",
+            "wiki_pages_index",
+            "pages_fts",
+            "evidence_fts",
+        ] {
+            assert!(tables.contains(&name.to_string()), "missing table: {name}");
+        }
+    }
+
+    #[test]
+    fn test_schema_version_is_9() {
+        let store = Store::open_in_memory().unwrap();
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT value FROM app_meta WHERE key = 'schema_version'")
+            .unwrap();
+        assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
+        assert_eq!(stmt.read::<String, _>(0).unwrap(), "9");
+    }
+
+    #[test]
+    fn test_v9_settings_seeded() {
+        let store = Store::open_in_memory().unwrap();
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT value FROM wiki_settings WHERE key = 'schema_v9_marker'")
+            .unwrap();
+        assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
+        assert_eq!(stmt.read::<String, _>(0).unwrap(), "1");
+
+        let mut count_stmt = store
+            .conn()
+            .prepare("SELECT COUNT(*) FROM wiki_settings")
+            .unwrap();
+        count_stmt.next().unwrap();
+        let count: i64 = count_stmt.read(0).unwrap();
+        assert_eq!(count, 21);
+    }
+
+    #[test]
+    fn test_v9_idempotent() {
+        let store = Store::open_in_memory().unwrap();
+        // Re-running migrations is a no-op.
+        super::run_migrations(store.conn()).unwrap();
+        super::run_migrations(store.conn()).unwrap();
+
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT value FROM app_meta WHERE key = 'schema_version'")
+            .unwrap();
+        assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
+        assert_eq!(stmt.read::<String, _>(0).unwrap(), "9");
     }
 
     #[test]
