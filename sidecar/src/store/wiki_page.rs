@@ -193,6 +193,375 @@ impl Store {
     }
 }
 
+/// PageRef: returned by classify validator after dedup_or_insert.
+#[derive(Debug, Clone)]
+pub struct PageRefV2 {
+    pub id: i64,
+    pub state: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CandidatePage {
+    pub id: i64,
+    pub kind: String,
+    pub title: String,
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewEvidenceV2<'a> {
+    pub page_id: i64,
+    pub msg_id: i64,
+    pub chat_id: i64,
+    pub sender_id: i64,
+    pub ts: i64,
+    pub excerpt: &'a str,
+    pub salience: f64,
+}
+
+impl Store {
+    /// Dedup by `title_norm`, then alias hits, otherwise insert a v2 page.
+    /// Must be called inside the caller's transaction.
+    pub fn dedup_or_insert_page_v2(
+        &self,
+        kind: &str,
+        title: &str,
+        aliases: &[String],
+    ) -> Result<PageRefV2, sqlite::Error> {
+        use crate::wiki::norm::{nfc, title_norm};
+
+        let title_n = title_norm(title);
+        let now = crate::wiki::norm::unix_now();
+
+        let mut existing_id = {
+            let mut s = self
+                .conn()
+                .prepare("SELECT id FROM wiki_pages_v2 WHERE title_norm = ?")?;
+            s.bind((1, title_n.as_str()))?;
+            if let sqlite::State::Row = s.next()? {
+                Some(s.read::<i64, _>(0)?)
+            } else {
+                None
+            }
+        };
+
+        if existing_id.is_none() && !aliases.is_empty() {
+            let mut alias_norms: Vec<String> = aliases
+                .iter()
+                .map(|a| title_norm(a))
+                .filter(|a| !a.is_empty())
+                .collect();
+            alias_norms.push(title_n.clone());
+            alias_norms.sort();
+            alias_norms.dedup();
+
+            let placeholders = alias_norms
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let q = format!(
+                "SELECT page_id, COUNT(*) AS hits
+                   FROM wiki_page_aliases
+                  WHERE alias_norm IN ({})
+                  GROUP BY page_id
+                  ORDER BY hits DESC, page_id
+                  LIMIT 1",
+                placeholders
+            );
+            let mut s = self.conn().prepare(q)?;
+            for (i, a) in alias_norms.iter().enumerate() {
+                s.bind((i + 1, a.as_str()))?;
+            }
+            if let sqlite::State::Row = s.next()? {
+                existing_id = Some(s.read::<i64, _>("page_id")?);
+            }
+        }
+
+        let page_id = match existing_id {
+            Some(id) => id,
+            None => {
+                let mut s = self.conn().prepare(
+                    "INSERT INTO wiki_pages_v2
+                        (kind, title, title_norm, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?)",
+                )?;
+                s.bind((1, kind))?;
+                s.bind((2, nfc(title).as_str()))?;
+                s.bind((3, title_n.as_str()))?;
+                s.bind((4, now))?;
+                s.bind((5, now))?;
+                s.next()?;
+                self.last_insert_rowid()?
+            }
+        };
+
+        let mut alias_stmt = self.conn().prepare(
+            "INSERT OR IGNORE INTO wiki_page_aliases (page_id, alias_norm, alias_raw)
+             VALUES (?, ?, ?)",
+        )?;
+        for a in aliases {
+            let an = title_norm(a);
+            if an.is_empty() {
+                continue;
+            }
+            alias_stmt.bind((1, page_id))?;
+            alias_stmt.bind((2, an.as_str()))?;
+            alias_stmt.bind((3, nfc(a).as_str()))?;
+            alias_stmt.next()?;
+            alias_stmt.reset()?;
+        }
+        alias_stmt.bind((1, page_id))?;
+        alias_stmt.bind((2, title_n.as_str()))?;
+        alias_stmt.bind((3, nfc(title).as_str()))?;
+        alias_stmt.next()?;
+
+        self.refresh_pages_index(page_id)?;
+
+        let mut s = self
+            .conn()
+            .prepare("SELECT state, kind FROM wiki_pages_v2 WHERE id = ?")?;
+        s.bind((1, page_id))?;
+        s.next()?;
+        let state = s.read::<String, _>("state")?;
+        let kind_out = s.read::<String, _>("kind")?;
+
+        Ok(PageRefV2 {
+            id: page_id,
+            state,
+            kind: kind_out,
+        })
+    }
+
+    /// Rebuild `wiki_pages_index` and `pages_fts` for one page.
+    /// Must be called inside the caller's transaction.
+    pub fn refresh_pages_index(&self, page_id: i64) -> Result<(), sqlite::Error> {
+        use crate::search::hangul::decompose_jamo;
+
+        let (title, summary_md): (String, String) = {
+            let mut s = self
+                .conn()
+                .prepare("SELECT title, summary_md FROM wiki_pages_v2 WHERE id = ?")?;
+            s.bind((1, page_id))?;
+            s.next()?;
+            (s.read::<String, _>(0)?, s.read::<String, _>(1)?)
+        };
+        let aliases = {
+            let mut s = self.conn().prepare(
+                "SELECT alias_raw FROM wiki_page_aliases WHERE page_id = ? ORDER BY alias_norm",
+            )?;
+            s.bind((1, page_id))?;
+            let mut parts = Vec::new();
+            while let sqlite::State::Row = s.next()? {
+                parts.push(s.read::<String, _>(0)?);
+            }
+            parts.join(" ")
+        };
+        let title_jamo = decompose_jamo(&title);
+        let aliases_jamo = decompose_jamo(&aliases);
+        let summary_jamo = decompose_jamo(&summary_md);
+
+        self.conn()
+            .execute(format!("DELETE FROM pages_fts WHERE rowid = {}", page_id))?;
+        self.conn().execute(format!(
+            "DELETE FROM wiki_pages_index WHERE page_id = {}",
+            page_id
+        ))?;
+
+        let mut ins = self.conn().prepare(
+            "INSERT INTO wiki_pages_index
+                (page_id, title, aliases, summary_md, title_jamo, aliases_jamo, summary_jamo)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )?;
+        ins.bind((1, page_id))?;
+        ins.bind((2, title.as_str()))?;
+        ins.bind((3, aliases.as_str()))?;
+        ins.bind((4, summary_md.as_str()))?;
+        ins.bind((5, title_jamo.as_str()))?;
+        ins.bind((6, aliases_jamo.as_str()))?;
+        ins.bind((7, summary_jamo.as_str()))?;
+        ins.next()?;
+
+        let mut fts = self.conn().prepare(
+            "INSERT INTO pages_fts
+                (rowid, title, aliases, summary_md, title_jamo, aliases_jamo, summary_jamo)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )?;
+        fts.bind((1, page_id))?;
+        fts.bind((2, title.as_str()))?;
+        fts.bind((3, aliases.as_str()))?;
+        fts.bind((4, summary_md.as_str()))?;
+        fts.bind((5, title_jamo.as_str()))?;
+        fts.bind((6, aliases_jamo.as_str()))?;
+        fts.bind((7, summary_jamo.as_str()))?;
+        fts.next()?;
+        Ok(())
+    }
+
+    /// Insert evidence row, bump page counters, and insert `evidence_fts`.
+    /// Returns `None` on duplicate `(page_id,msg_id,chat_id)`.
+    /// Must be called inside the caller's transaction.
+    pub fn insert_evidence_v2(
+        &self,
+        evidence: &NewEvidenceV2<'_>,
+    ) -> Result<Option<i64>, sqlite::Error> {
+        use crate::search::hangul::decompose_jamo;
+        use crate::wiki::norm::{evidence_source_hash, nfc};
+
+        let excerpt_nfc = nfc(evidence.excerpt);
+        let excerpt_jamo = decompose_jamo(&excerpt_nfc);
+        let source_hash = evidence_source_hash(
+            evidence.page_id,
+            evidence.msg_id,
+            evidence.chat_id,
+            &excerpt_nfc,
+        );
+        let now = crate::wiki::norm::unix_now();
+
+        {
+            let mut s = self.conn().prepare(
+                "SELECT 1 FROM wiki_evidence WHERE page_id = ? AND msg_id = ? AND chat_id = ?",
+            )?;
+            s.bind((1, evidence.page_id))?;
+            s.bind((2, evidence.msg_id))?;
+            s.bind((3, evidence.chat_id))?;
+            if let sqlite::State::Row = s.next()? {
+                return Ok(None);
+            }
+        }
+
+        let mut ins = self.conn().prepare(
+            "INSERT INTO wiki_evidence
+                (page_id, msg_id, chat_id, sender_id, ts,
+                 excerpt, excerpt_jamo, source_hash, salience, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )?;
+        ins.bind((1, evidence.page_id))?;
+        ins.bind((2, evidence.msg_id))?;
+        ins.bind((3, evidence.chat_id))?;
+        ins.bind((4, evidence.sender_id))?;
+        ins.bind((5, evidence.ts))?;
+        ins.bind((6, excerpt_nfc.as_str()))?;
+        ins.bind((7, excerpt_jamo.as_str()))?;
+        ins.bind((8, source_hash.as_slice()))?;
+        ins.bind((9, evidence.salience))?;
+        ins.bind((10, now))?;
+        ins.next()?;
+        let evid_id = self.last_insert_rowid()?;
+
+        let mut bump = self.conn().prepare(
+            "UPDATE wiki_pages_v2
+                SET evidence_count = evidence_count + 1,
+                    last_evidence_at = MAX(COALESCE(last_evidence_at, 0), ?),
+                    updated_at = ?
+              WHERE id = ?",
+        )?;
+        bump.bind((1, evidence.ts))?;
+        bump.bind((2, now))?;
+        bump.bind((3, evidence.page_id))?;
+        bump.next()?;
+
+        let mut fts = self
+            .conn()
+            .prepare("INSERT INTO evidence_fts (rowid, excerpt, excerpt_jamo) VALUES (?, ?, ?)")?;
+        fts.bind((1, evid_id))?;
+        fts.bind((2, excerpt_nfc.as_str()))?;
+        fts.bind((3, excerpt_jamo.as_str()))?;
+        fts.next()?;
+        Ok(Some(evid_id))
+    }
+
+    /// Build candidates per spec §6.2: alias-direct first, then FTS fill.
+    pub fn classify_candidates_v2(
+        &self,
+        normalized_tokens: &[String],
+        fts_query: &str,
+        cap: usize,
+    ) -> Result<Vec<CandidatePage>, sqlite::Error> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        if !normalized_tokens.is_empty() {
+            let placeholders = normalized_tokens
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let q = format!(
+                "SELECT DISTINCT a.page_id
+                   FROM wiki_page_aliases a
+                   JOIN wiki_pages_v2 p ON p.id = a.page_id
+                  WHERE a.alias_norm IN ({})
+                    AND p.state IN ('active','resolved')",
+                placeholders
+            );
+            let mut s = self.conn().prepare(q)?;
+            for (i, t) in normalized_tokens.iter().enumerate() {
+                s.bind((i + 1, t.as_str()))?;
+            }
+            while let sqlite::State::Row = s.next()? {
+                let id = s.read::<i64, _>(0)?;
+                if seen.insert(id) {
+                    out.push(self.load_candidate(id)?);
+                    if out.len() >= cap {
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+
+        if !fts_query.trim().is_empty() {
+            let mut s = self.conn().prepare(
+                "SELECT p.id
+                   FROM pages_fts f
+                   JOIN wiki_pages_v2 p ON p.id = f.rowid
+                  WHERE pages_fts MATCH ?
+                    AND p.state IN ('active','resolved')
+                  ORDER BY bm25(pages_fts)
+                  LIMIT 30",
+            )?;
+            s.bind((1, fts_query))?;
+            while let sqlite::State::Row = s.next()? {
+                let id = s.read::<i64, _>(0)?;
+                if seen.insert(id) {
+                    out.push(self.load_candidate(id)?);
+                    if out.len() >= cap {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn load_candidate(&self, page_id: i64) -> Result<CandidatePage, sqlite::Error> {
+        let (kind, title) = {
+            let mut s = self
+                .conn()
+                .prepare("SELECT kind, title FROM wiki_pages_v2 WHERE id = ?")?;
+            s.bind((1, page_id))?;
+            s.next()?;
+            (s.read::<String, _>(0)?, s.read::<String, _>(1)?)
+        };
+        let mut aliases = Vec::new();
+        let mut s = self.conn().prepare(
+            "SELECT alias_raw FROM wiki_page_aliases WHERE page_id = ? ORDER BY alias_norm",
+        )?;
+        s.bind((1, page_id))?;
+        while let sqlite::State::Row = s.next()? {
+            aliases.push(s.read::<String, _>(0)?);
+        }
+        Ok(CandidatePage {
+            id: page_id,
+            kind,
+            title,
+            aliases,
+        })
+    }
+}
+
 pub fn compute_source_hash(sources: &[(i64, i64)]) -> String {
     let mut hasher = Sha256::new();
     for &(chat_id, message_id) in sources {
@@ -204,6 +573,7 @@ pub fn compute_source_hash(sources: &[(i64, i64)]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::NewEvidenceV2;
     use crate::store::message::MessageRow;
     use crate::store::Store;
 
@@ -305,5 +675,88 @@ mod tests {
         };
         store.link_message_to_topic(&link2).unwrap();
         assert!(store.needs_regeneration(topic_id).unwrap());
+    }
+
+    #[test]
+    fn dedup_or_insert_page_v2_dedups_by_title_norm() {
+        let store = setup();
+        store.conn().execute("BEGIN").unwrap();
+        let a = store
+            .dedup_or_insert_page_v2("topic", "Bitcoin ETF", &["BTC ETF".into()])
+            .unwrap();
+        let b = store
+            .dedup_or_insert_page_v2("topic", "  bitcoin   ETF  ", &[])
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+        assert_eq!(a.id, b.id);
+
+        let mut s = store
+            .conn()
+            .prepare("SELECT COUNT(*) FROM wiki_page_aliases WHERE page_id = ?")
+            .unwrap();
+        s.bind((1, a.id)).unwrap();
+        s.next().unwrap();
+        let n: i64 = s.read(0).unwrap();
+        assert!(n >= 2);
+    }
+
+    #[test]
+    fn dedup_or_insert_page_v2_dedups_by_alias() {
+        let store = setup();
+        store.conn().execute("BEGIN").unwrap();
+        let a = store
+            .dedup_or_insert_page_v2("topic", "Strategy Bitcoin Purchases", &["MSTR Buys".into()])
+            .unwrap();
+        let b = store
+            .dedup_or_insert_page_v2("topic", "MicroStrategy Bitcoin", &["MSTR Buys".into()])
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+        assert_eq!(a.id, b.id);
+    }
+
+    #[test]
+    fn insert_evidence_v2_idempotent_and_bumps_count() {
+        let store = setup();
+        store.conn().execute("BEGIN").unwrap();
+        let p = store.dedup_or_insert_page_v2("topic", "Test", &[]).unwrap();
+        let evidence = NewEvidenceV2 {
+            page_id: p.id,
+            msg_id: 1,
+            chat_id: 1,
+            sender_id: 0,
+            ts: 1000,
+            excerpt: "hello",
+            salience: 0.7,
+        };
+        let id1 = store.insert_evidence_v2(&evidence).unwrap();
+        let id2 = store.insert_evidence_v2(&evidence).unwrap();
+        store.conn().execute("COMMIT").unwrap();
+        assert!(id1.is_some());
+        assert!(id2.is_none());
+        let mut s = store
+            .conn()
+            .prepare("SELECT evidence_count FROM wiki_pages_v2 WHERE id = ?")
+            .unwrap();
+        s.bind((1, p.id)).unwrap();
+        s.next().unwrap();
+        assert_eq!(s.read::<i64, _>(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn classify_candidates_v2_alias_then_fts() {
+        let store = setup();
+        store.conn().execute("BEGIN").unwrap();
+        let p1 = store
+            .dedup_or_insert_page_v2("topic", "Bitcoin ETF", &["BTC ETF".into()])
+            .unwrap();
+        let _p2 = store
+            .dedup_or_insert_page_v2("topic", "Ethereum Layer 2", &["L2".into()])
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+
+        let cands = store
+            .classify_candidates_v2(&["btc etf".to_string()], "ethereum", 30)
+            .unwrap();
+        assert!(cands.iter().any(|c| c.id == p1.id));
     }
 }
