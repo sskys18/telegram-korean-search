@@ -8,12 +8,16 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::store::wiki_page::{CandidatePage, NewEvidenceV2, PageRefV2, RewriteApply};
+use crate::store::wiki_page::{
+    derive_reason_code, CandidatePage, NewEvidenceV2, PageRefV2, RewriteApply, TrendingApplyRow,
+    TrendingCandidate, TrendingSnapshot, TrendingWindow,
+};
 use crate::store::wiki_queue::{ClassifyV2Item, QueueStats, RewriteQueueItem};
 use crate::store::Store;
 use crate::wiki::llm::{
-    validate_v2_assignment, validate_v2_rewrite, LlmClient, V2Assignment, V2ExistingPage, V2Input,
-    V2InputMessage, V2PageRef, V2Policies, V2RewriteEvidenceIn, V2RewriteInput,
+    validate_trending, validate_v2_assignment, validate_v2_rewrite, LlmClient, V2Assignment,
+    V2ExistingPage, V2Input, V2InputMessage, V2PageRef, V2Policies, V2RewriteEvidenceIn,
+    V2RewriteInput, V2TrendingCandidateIn, V2TrendingInput,
 };
 use crate::wiki::norm::title_norm;
 
@@ -284,6 +288,12 @@ async fn run_worker<E>(
                 emit_progress_v2(&emitter, &store);
                 continue;
             }
+            // Idle path: piggyback one trending refresh per tick (spec §6.4).
+            // Picks the most-overdue dirty window; clean ticks are cheap
+            // (one MAX(id) + 3 watermark reads).
+            if let Err(e) = maybe_refresh_trending(&store, &llm, &emitter).await {
+                log::warn!("wiki trending: refresh failed: {e}");
+            }
             for _ in 0..20 {
                 if shutdown.load(Ordering::Relaxed) || wake.load(Ordering::Relaxed) {
                     break;
@@ -492,8 +502,222 @@ async fn run_worker<E>(
             emitter.wiki_topics_changed();
         }
 
+        // Spec §6.4 trending refresh tail-call: classify ingest is the only
+        // thing that bumps `wiki_evidence.id`, so this is the natural place
+        // to check whether a window has gone dirty. Cheap when nothing is
+        // overdue (one MAX(id) + 3 watermark reads).
+        if let Err(e) = maybe_refresh_trending(&store, &llm, &emitter).await {
+            log::warn!("wiki trending: refresh failed: {e}");
+        }
+
         emit_progress_v2(&emitter, &store);
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Pick the most-overdue dirty + gap-eligible window, if any. Returns
+/// `(window, max_evidence_id)` snapshotted once. `None` means nothing to do.
+fn pick_dirty_window(
+    store: &Store,
+    now: i64,
+) -> Result<Option<(TrendingWindow, i64)>, sqlite::Error> {
+    let max_id = store.current_max_evidence_id()?;
+    if max_id == 0 {
+        return Ok(None);
+    }
+    let mut best: Option<(TrendingWindow, i64)> = None;
+    let mut best_overdue: i64 = i64::MIN;
+    for w in TrendingWindow::all() {
+        let (last_id, last_ts) = store.read_trending_watermark(w)?;
+        // Strict `>` per spec §6.4: clean iff watermark caught up.
+        if max_id <= last_id {
+            continue;
+        }
+        let gap = w.min_refresh_gap_secs();
+        // Never-computed watermark (last_ts = 0) is most-overdue by far.
+        let overdue = if last_ts == 0 {
+            i64::MAX / 2
+        } else {
+            now - last_ts - gap
+        };
+        if overdue < 0 {
+            continue;
+        }
+        if overdue > best_overdue {
+            best_overdue = overdue;
+            best = Some((w, max_id));
+        }
+    }
+    Ok(best)
+}
+
+/// Run one trending refresh tick if a dirty + gap-eligible window exists.
+/// Builds shortlist + per-page metrics + sparkline, calls codex rerank,
+/// validates, applies (or fallback to shortlist top-10 with empty hooks).
+async fn maybe_refresh_trending<E: EventEmitter>(
+    store: &Arc<Mutex<Store>>,
+    llm: &LlmClient,
+    emitter: &Arc<E>,
+) -> Result<(), sqlite::Error> {
+    let now = crate::wiki::norm::unix_now();
+    let pick = {
+        let s = lock(store);
+        pick_dirty_window(&s, now)?
+    };
+    let Some((window, max_id)) = pick else {
+        return Ok(());
+    };
+    let snap = TrendingSnapshot {
+        window,
+        window_start: now - window.span_secs(),
+        prior_start: now - 2 * window.span_secs(),
+        now,
+        max_evidence_id: max_id,
+    };
+
+    // Shortlist + per-candidate enrichment under a single lock.
+    struct Enriched {
+        cand: TrendingCandidate,
+        reason_code: String,
+        reason_metrics: String,
+        sparkline: String,
+        samples: Vec<String>,
+    }
+    let enriched: Vec<Enriched> = {
+        let s = lock(store);
+        let cands = s.shortlist_trending(&snap, 30)?;
+        let mut out = Vec::with_capacity(cands.len());
+        for c in cands {
+            let (code, metrics) = derive_reason_code(&c, snap.now);
+            let buckets = s.compute_sparkline(c.page_id, &snap)?;
+            let sparkline =
+                serde_json::to_string(&buckets.to_vec()).unwrap_or_else(|_| "[]".to_string());
+            let samples = s.trending_sample_excerpts(c.page_id, &snap, 3)?;
+            out.push(Enriched {
+                cand: c,
+                reason_code: code,
+                reason_metrics: metrics,
+                sparkline,
+                samples,
+            });
+        }
+        out
+    };
+
+    if enriched.is_empty() {
+        // Empty window: still bump watermark so we don't recompute the
+        // same emptiness every tick.
+        let s = lock(store);
+        s.conn().execute("BEGIN IMMEDIATE")?;
+        let res = s.apply_trending(&snap, &[]);
+        match res {
+            Ok(()) => {
+                s.conn().execute("COMMIT")?;
+            }
+            Err(e) => {
+                let _ = s.conn().execute("ROLLBACK");
+                return Err(e);
+            }
+        }
+        return Ok(());
+    }
+
+    // Build codex input.
+    let candidate_ids: std::collections::HashSet<i64> =
+        enriched.iter().map(|e| e.cand.page_id).collect();
+    let metric_values: Vec<serde_json::Value> = enriched
+        .iter()
+        .map(|e| {
+            serde_json::from_str::<serde_json::Value>(&e.reason_metrics)
+                .unwrap_or(serde_json::Value::Null)
+        })
+        .collect();
+    let candidates_in: Vec<V2TrendingCandidateIn<'_>> = enriched
+        .iter()
+        .zip(metric_values.iter())
+        .map(|(e, m)| V2TrendingCandidateIn {
+            page_id: e.cand.page_id,
+            title: e.cand.title.as_str(),
+            kind: e.cand.kind.as_str(),
+            reason_code: e.reason_code.as_str(),
+            metrics: m,
+            samples: &e.samples,
+        })
+        .collect();
+    let input = V2TrendingInput {
+        window: window.label(),
+        candidates: &candidates_in,
+    };
+
+    // Call codex; on any failure (exec or validator) we still write the
+    // shortlist top-10 with empty hooks and bump the watermark — spec §6.4
+    // line 849. Hot-loop guard.
+    let validated = match llm.rerank_trending(&input).await {
+        Ok(out) => match validate_trending(&out, &candidate_ids) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                log::warn!(
+                    "wiki trending: validator fallback ({}): {e}",
+                    window.label()
+                );
+                None
+            }
+        },
+        Err(e) => {
+            log::warn!("wiki trending: rerank failed ({}): {e}", window.label());
+            emitter.wiki_error(&e.to_string(), true);
+            None
+        }
+    };
+
+    let rows: Vec<TrendingApplyRow> = if let Some(ranked) = validated {
+        // Map ranked → enriched by page_id so reason_code/metrics/sparkline
+        // come from local computation, never the LLM.
+        ranked
+            .into_iter()
+            .filter_map(|r| {
+                enriched
+                    .iter()
+                    .find(|e| e.cand.page_id == r.page_id)
+                    .map(|e| TrendingApplyRow {
+                        page_id: r.page_id,
+                        rank: r.rank,
+                        hook: r.hook,
+                        reason_code: e.reason_code.clone(),
+                        reason_metrics: e.reason_metrics.clone(),
+                        sparkline: e.sparkline.clone(),
+                    })
+            })
+            .collect()
+    } else {
+        enriched
+            .iter()
+            .take(10)
+            .enumerate()
+            .map(|(i, e)| TrendingApplyRow {
+                page_id: e.cand.page_id,
+                rank: (i as i64) + 1,
+                hook: String::new(),
+                reason_code: e.reason_code.clone(),
+                reason_metrics: e.reason_metrics.clone(),
+                sparkline: e.sparkline.clone(),
+            })
+            .collect()
+    };
+
+    // Atomic apply + watermark bump.
+    let s = lock(store);
+    s.conn().execute("BEGIN IMMEDIATE")?;
+    match s.apply_trending(&snap, &rows) {
+        Ok(()) => {
+            s.conn().execute("COMMIT")?;
+            emitter.wiki_topics_changed();
+            Ok(())
+        }
+        Err(e) => {
+            let _ = s.conn().execute("ROLLBACK");
+            Err(e)
+        }
     }
 }
 
@@ -937,5 +1161,116 @@ mod tests {
         let stats = s.get_classify_v2_stats().unwrap();
         assert_eq!(stats.pending + stats.failed, 1);
         assert_eq!(stats.done, 0);
+    }
+
+    // ---- Phase 8 trending dirty-window picker -----------------------------
+
+    fn make_trending_store_with_evidence() -> Store {
+        let s = Store::open_in_memory().unwrap();
+        s.conn()
+            .execute("INSERT INTO chats (chat_id, title, chat_type) VALUES (1, 'C', 'channel')")
+            .unwrap();
+        s.conn().execute("BEGIN").unwrap();
+        let p = s.dedup_or_insert_page_v2("topic", "T", &[]).unwrap();
+        s.insert_evidence_v2(&NewEvidenceV2 {
+            page_id: p.id,
+            msg_id: 1,
+            chat_id: 1,
+            sender_id: 0,
+            ts: crate::wiki::norm::unix_now() - 100,
+            excerpt: "x",
+            salience: 0.5,
+        })
+        .unwrap();
+        s.conn().execute("COMMIT").unwrap();
+        s
+    }
+
+    #[test]
+    fn pick_dirty_returns_none_for_empty_evidence() {
+        let s = Store::open_in_memory().unwrap();
+        let pick = pick_dirty_window(&s, crate::wiki::norm::unix_now()).unwrap();
+        assert!(pick.is_none());
+    }
+
+    #[test]
+    fn pick_dirty_picks_never_computed_window() {
+        let s = make_trending_store_with_evidence();
+        let now = crate::wiki::norm::unix_now();
+        let pick = pick_dirty_window(&s, now).unwrap();
+        assert!(pick.is_some());
+        let (_w, max_id) = pick.unwrap();
+        assert!(max_id > 0);
+    }
+
+    #[test]
+    fn pick_dirty_skips_when_caught_up() {
+        let s = make_trending_store_with_evidence();
+        let now = crate::wiki::norm::unix_now();
+        let max_id = s.current_max_evidence_id().unwrap();
+        // Pretend every window has caught up to max_id.
+        let snap_h1 = TrendingSnapshot {
+            window: TrendingWindow::H1,
+            window_start: now - 3600,
+            prior_start: now - 7200,
+            now,
+            max_evidence_id: max_id,
+        };
+        let snap_h24 = TrendingSnapshot {
+            window: TrendingWindow::H24,
+            window_start: now - 86400,
+            prior_start: now - 2 * 86400,
+            now,
+            max_evidence_id: max_id,
+        };
+        let snap_d7 = TrendingSnapshot {
+            window: TrendingWindow::D7,
+            window_start: now - 7 * 86400,
+            prior_start: now - 14 * 86400,
+            now,
+            max_evidence_id: max_id,
+        };
+        for snap in [&snap_h1, &snap_h24, &snap_d7] {
+            s.conn().execute("BEGIN IMMEDIATE").unwrap();
+            s.apply_trending(snap, &[]).unwrap();
+            s.conn().execute("COMMIT").unwrap();
+        }
+        // No new evidence → all clean.
+        let pick = pick_dirty_window(&s, now + 100_000).unwrap();
+        assert!(pick.is_none(), "all windows caught up should yield None");
+    }
+
+    #[test]
+    fn pick_dirty_respects_gap_eligibility() {
+        let s = make_trending_store_with_evidence();
+        let now = 100_000_i64;
+        // Compute 1h watermark just now with old max_id, but leave 24h alone.
+        let snap_h1 = TrendingSnapshot {
+            window: TrendingWindow::H1,
+            window_start: now - 3600,
+            prior_start: now - 7200,
+            now,
+            max_evidence_id: 0,
+        };
+        s.conn().execute("BEGIN IMMEDIATE").unwrap();
+        s.apply_trending(&snap_h1, &[]).unwrap();
+        s.conn().execute("COMMIT").unwrap();
+        // Insert another evidence so max_id > all watermarks again.
+        s.conn().execute("BEGIN").unwrap();
+        s.insert_evidence_v2(&NewEvidenceV2 {
+            page_id: 1,
+            msg_id: 99,
+            chat_id: 1,
+            sender_id: 0,
+            ts: now - 50,
+            excerpt: "y",
+            salience: 0.5,
+        })
+        .unwrap();
+        s.conn().execute("COMMIT").unwrap();
+        // 1h gap = 300s; only 1s elapsed → 1h ineligible. 24h+7d eligible.
+        let pick = pick_dirty_window(&s, now + 1).unwrap();
+        let (w, _) = pick.unwrap();
+        assert_ne!(w, TrendingWindow::H1, "1h should be gap-blocked");
     }
 }
