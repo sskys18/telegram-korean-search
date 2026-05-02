@@ -210,6 +210,30 @@ pub struct CandidatePage {
 }
 
 #[derive(Debug, Clone)]
+pub struct EvidenceForRewrite {
+    pub id: i64,
+    pub msg_id: i64,
+    pub chat_id: i64,
+    pub ts: i64,
+    pub excerpt: String,
+    pub salience: f64,
+    pub cited: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PageForRewrite {
+    pub id: i64,
+    pub kind: String,
+    pub title: String,
+    pub state: String,
+    pub summary_md: String,
+    pub facts: Option<String>,
+    pub evidence_count: i64,
+    pub last_rewrite_at: Option<i64>,
+    pub last_rewrite_evidence_count: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct NewEvidenceV2<'a> {
     pub page_id: i64,
     pub msg_id: i64,
@@ -562,6 +586,283 @@ impl Store {
     }
 }
 
+/// Validated rewrite payload to apply in a single txn.
+pub struct RewriteApply<'a> {
+    pub page_id: i64,
+    pub summary_md: &'a str,
+    pub facts_json: &'a str,
+    pub state: &'a str,
+    pub new_aliases: &'a [String],
+    pub retention_cap: i64,
+}
+
+impl Store {
+    /// Spec §6.3 trigger:
+    ///   evidence_count - last_rewrite_evidence_count >= 20
+    ///   OR (last_rewrite_at IS NULL AND evidence_count > 0)
+    ///   OR (now - last_rewrite_at >= 86400 AND evidence_count > last_rewrite_evidence_count)
+    pub fn maybe_enqueue_rewrite(&self, page_id: i64) -> Result<bool, sqlite::Error> {
+        let mut s = self.conn().prepare(
+            "SELECT evidence_count, last_rewrite_evidence_count, last_rewrite_at
+               FROM wiki_pages_v2 WHERE id = ?",
+        )?;
+        s.bind((1, page_id))?;
+        if let sqlite::State::Row = s.next()? {
+            let ec: i64 = s.read::<i64, _>(0)?;
+            let lec: i64 = s.read::<i64, _>(1)?;
+            let lra: Option<i64> = s.read::<Option<i64>, _>(2)?;
+            let now = crate::wiki::norm::unix_now();
+            let delta = ec - lec;
+            let trigger = delta >= 20
+                || (lra.is_none() && ec > 0)
+                || (lra.is_some_and(|t| now - t >= 86_400) && delta > 0);
+            if trigger {
+                self.enqueue_rewrite(page_id)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn get_page_for_rewrite(
+        &self,
+        page_id: i64,
+    ) -> Result<Option<PageForRewrite>, sqlite::Error> {
+        let mut s = self.conn().prepare(
+            "SELECT id, kind, title, state, summary_md, facts,
+                    evidence_count, last_rewrite_at, last_rewrite_evidence_count
+               FROM wiki_pages_v2 WHERE id = ?",
+        )?;
+        s.bind((1, page_id))?;
+        if let sqlite::State::Row = s.next()? {
+            Ok(Some(PageForRewrite {
+                id: s.read::<i64, _>(0)?,
+                kind: s.read::<String, _>(1)?,
+                title: s.read::<String, _>(2)?,
+                state: s.read::<String, _>(3)?,
+                summary_md: s.read::<String, _>(4)?,
+                facts: s.read::<Option<String>, _>(5)?,
+                evidence_count: s.read::<i64, _>(6)?,
+                last_rewrite_at: s.read::<Option<i64>, _>(7)?,
+                last_rewrite_evidence_count: s.read::<i64, _>(8)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Pick ≤50 evidence rows: delta since `last_rewrite_at` (≤30) +
+    /// top-K by salience from the remainder (≤20) + always-keep
+    /// `cited > 0` rows. De-dup by id, cap at 50 total.
+    pub fn select_rewrite_evidence(
+        &self,
+        page_id: i64,
+        last_rewrite_at: Option<i64>,
+    ) -> Result<Vec<EvidenceForRewrite>, sqlite::Error> {
+        let mut out: Vec<EvidenceForRewrite> = Vec::new();
+        let mut seen = std::collections::HashSet::<i64>::new();
+
+        let push_row = |stmt: &mut sqlite::Statement<'_>,
+                        seen: &mut std::collections::HashSet<i64>,
+                        out: &mut Vec<EvidenceForRewrite>|
+         -> Result<(), sqlite::Error> {
+            let id: i64 = stmt.read::<i64, _>("id")?;
+            if !seen.insert(id) {
+                return Ok(());
+            }
+            out.push(EvidenceForRewrite {
+                id,
+                msg_id: stmt.read::<i64, _>("msg_id")?,
+                chat_id: stmt.read::<i64, _>("chat_id")?,
+                ts: stmt.read::<i64, _>("ts")?,
+                excerpt: stmt.read::<String, _>("excerpt")?,
+                salience: stmt.read::<f64, _>("salience")?,
+                cited: stmt.read::<i64, _>("cited")?,
+            });
+            Ok(())
+        };
+
+        let cutoff = last_rewrite_at.unwrap_or(0);
+
+        // 1. delta since last rewrite, ≤30 newest first
+        {
+            let mut s = self.conn().prepare(
+                "SELECT id, msg_id, chat_id, ts, excerpt, salience, cited
+                   FROM wiki_evidence
+                  WHERE page_id = ? AND ts > ?
+                  ORDER BY ts DESC
+                  LIMIT 30",
+            )?;
+            s.bind((1, page_id))?;
+            s.bind((2, cutoff))?;
+            while let sqlite::State::Row = s.next()? {
+                push_row(&mut s, &mut seen, &mut out)?;
+                if out.len() >= 50 {
+                    return Ok(out);
+                }
+            }
+        }
+
+        // 2. top-K by salience from the rest, ≤20
+        {
+            let mut s = self.conn().prepare(
+                "SELECT id, msg_id, chat_id, ts, excerpt, salience, cited
+                   FROM wiki_evidence
+                  WHERE page_id = ? AND ts <= ?
+                  ORDER BY salience DESC, ts DESC
+                  LIMIT 20",
+            )?;
+            s.bind((1, page_id))?;
+            s.bind((2, cutoff))?;
+            while let sqlite::State::Row = s.next()? {
+                push_row(&mut s, &mut seen, &mut out)?;
+                if out.len() >= 50 {
+                    return Ok(out);
+                }
+            }
+        }
+
+        // 3. always-keep cited rows (only those that fit)
+        if out.len() < 50 {
+            let mut s = self.conn().prepare(
+                "SELECT id, msg_id, chat_id, ts, excerpt, salience, cited
+                   FROM wiki_evidence
+                  WHERE page_id = ? AND cited > 0
+                  ORDER BY cited DESC, ts DESC",
+            )?;
+            s.bind((1, page_id))?;
+            while let sqlite::State::Row = s.next()? {
+                push_row(&mut s, &mut seen, &mut out)?;
+                if out.len() >= 50 {
+                    break;
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Apply a rewrite per spec §6.3 in a single txn.
+    /// Returns true on success. Caller wraps with BEGIN IMMEDIATE / COMMIT.
+    pub fn apply_rewrite_v2(&self, r: &RewriteApply<'_>) -> Result<(), sqlite::Error> {
+        use crate::wiki::norm::{nfc, title_norm, unix_now};
+        let now = unix_now();
+
+        // 1. Update page row.
+        let mut s = self.conn().prepare(
+            "UPDATE wiki_pages_v2
+                SET summary_md = ?,
+                    summary_rev = summary_rev + 1,
+                    facts = ?,
+                    state = ?,
+                    last_rewrite_at = ?,
+                    last_rewrite_evidence_count = evidence_count,
+                    updated_at = ?
+              WHERE id = ?",
+        )?;
+        s.bind((1, r.summary_md))?;
+        s.bind((2, r.facts_json))?;
+        s.bind((3, r.state))?;
+        s.bind((4, now))?;
+        s.bind((5, now))?;
+        s.bind((6, r.page_id))?;
+        s.next()?;
+
+        // 2. Insert new aliases.
+        let mut alias = self.conn().prepare(
+            "INSERT OR IGNORE INTO wiki_page_aliases (page_id, alias_norm, alias_raw)
+             VALUES (?, ?, ?)",
+        )?;
+        for a in r.new_aliases {
+            let n = title_norm(a);
+            if n.is_empty() {
+                continue;
+            }
+            alias.bind((1, r.page_id))?;
+            alias.bind((2, n.as_str()))?;
+            alias.bind((3, nfc(a).as_str()))?;
+            alias.next()?;
+            alias.reset()?;
+        }
+
+        // 3. Refresh wiki_pages_index + pages_fts for this page.
+        self.refresh_pages_index(r.page_id)?;
+
+        // 4. Retention sweep — copy spec §6.3 CTE.
+        // Keep: cited>0, last 24h, top-2 per chat by (ts DESC, salience DESC).
+        // Then drop lowest-salience among the remainder until total ≤ cap.
+        let drop_q = "
+            WITH keep AS (
+                SELECT id FROM wiki_evidence
+                 WHERE page_id = ?1
+                   AND ( cited > 0
+                         OR ts >= (strftime('%s','now') - 86400)
+                         OR id IN (
+                             SELECT id FROM (
+                                 SELECT id,
+                                     row_number() OVER (
+                                         PARTITION BY chat_id
+                                         ORDER BY ts DESC, salience DESC
+                                     ) AS rn
+                                   FROM wiki_evidence WHERE page_id = ?1
+                             ) WHERE rn <= 2
+                         )
+                       )
+            ), candidates AS (
+                SELECT id FROM wiki_evidence
+                 WHERE page_id = ?1 AND id NOT IN (SELECT id FROM keep)
+                 ORDER BY salience ASC, ts ASC
+                 LIMIT MAX(0, (SELECT COUNT(*) FROM wiki_evidence WHERE page_id = ?1) - ?2)
+            )
+            SELECT id FROM candidates";
+        let drop_ids: Vec<i64> = {
+            let mut q = self.conn().prepare(drop_q)?;
+            q.bind((1, r.page_id))?;
+            q.bind((2, r.retention_cap))?;
+            let mut out = Vec::new();
+            while let sqlite::State::Row = q.next()? {
+                out.push(q.read::<i64, _>(0)?);
+            }
+            out
+        };
+        if !drop_ids.is_empty() {
+            let mut del_fts = self
+                .conn()
+                .prepare("DELETE FROM evidence_fts WHERE rowid = ?")?;
+            let mut del_evi = self
+                .conn()
+                .prepare("DELETE FROM wiki_evidence WHERE id = ?")?;
+            for id in &drop_ids {
+                del_fts.bind((1, *id))?;
+                del_fts.next()?;
+                del_fts.reset()?;
+                del_evi.bind((1, *id))?;
+                del_evi.next()?;
+                del_evi.reset()?;
+            }
+        }
+
+        // 5. Recompute evidence_count + LREC. Spec §6.3 step 1 sets LREC =
+        // evidence_count *before* the sweep; we use the post-sweep count
+        // instead. With pre-sweep LREC, a page that hits retention (e.g.
+        // 200 → 50 rows) ends up with `delta = 50 - 200 < 0`, and the 24h
+        // fallback also requires `evidence_count > LREC`, so the trigger
+        // can never fire again until 170+ new rows arrive. Anchoring LREC
+        // to the post-sweep count keeps the trigger reachable.
+        self.conn().execute(format!(
+            "UPDATE wiki_pages_v2
+                SET evidence_count = (SELECT COUNT(*) FROM wiki_evidence WHERE page_id = {pid}),
+                    last_rewrite_evidence_count = (SELECT COUNT(*) FROM wiki_evidence WHERE page_id = {pid})
+              WHERE id = {pid}",
+            pid = r.page_id
+        ))?;
+
+        // 6. Mark queue done.
+        self.mark_rewrite_done(r.page_id)?;
+        Ok(())
+    }
+}
+
 pub fn compute_source_hash(sources: &[(i64, i64)]) -> String {
     let mut hasher = Sha256::new();
     for &(chat_id, message_id) in sources {
@@ -573,7 +874,7 @@ pub fn compute_source_hash(sources: &[(i64, i64)]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::NewEvidenceV2;
+    use super::{NewEvidenceV2, RewriteApply};
     use crate::store::message::MessageRow;
     use crate::store::Store;
 
@@ -758,5 +1059,172 @@ mod tests {
             .classify_candidates_v2(&["btc etf".to_string()], "ethereum", 30)
             .unwrap();
         assert!(cands.iter().any(|c| c.id == p1.id));
+    }
+
+    fn add_evidence(store: &Store, page_id: i64, msg_id: i64, ts: i64, salience: f64) {
+        store.conn().execute("BEGIN").unwrap();
+        let n = NewEvidenceV2 {
+            page_id,
+            msg_id,
+            chat_id: 1,
+            sender_id: 0,
+            ts,
+            excerpt: "x",
+            salience,
+        };
+        store.insert_evidence_v2(&n).unwrap();
+        store.conn().execute("COMMIT").unwrap();
+    }
+
+    fn make_page(store: &Store, title: &str) -> i64 {
+        store.conn().execute("BEGIN").unwrap();
+        let p = store.dedup_or_insert_page_v2("topic", title, &[]).unwrap();
+        store.conn().execute("COMMIT").unwrap();
+        p.id
+    }
+
+    #[test]
+    fn maybe_enqueue_rewrite_first_evidence_triggers() {
+        let store = setup();
+        let pid = make_page(&store, "Bitcoin");
+        // No evidence yet: no trigger.
+        assert!(!store.maybe_enqueue_rewrite(pid).unwrap());
+        add_evidence(&store, pid, 100, 1_000, 0.5);
+        // first evidence with NULL last_rewrite_at → trigger.
+        assert!(store.maybe_enqueue_rewrite(pid).unwrap());
+        let stats = store.get_rewrite_stats().unwrap();
+        assert_eq!(stats.pending, 1);
+    }
+
+    #[test]
+    fn maybe_enqueue_rewrite_delta_threshold() {
+        let store = setup();
+        let pid = make_page(&store, "ETH");
+        // Pretend a rewrite already happened.
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE wiki_pages_v2
+                    SET last_rewrite_at = strftime('%s','now'),
+                        last_rewrite_evidence_count = 0
+                  WHERE id = {pid}"
+            ))
+            .unwrap();
+        for i in 0..19 {
+            add_evidence(&store, pid, 100 + i, 2_000 + i, 0.5);
+        }
+        assert!(!store.maybe_enqueue_rewrite(pid).unwrap());
+        add_evidence(&store, pid, 200, 3_000, 0.5);
+        assert!(store.maybe_enqueue_rewrite(pid).unwrap());
+    }
+
+    #[test]
+    fn select_rewrite_evidence_caps_at_50_and_keeps_cited() {
+        let store = setup();
+        let pid = make_page(&store, "Topic");
+        // 60 rows, ascending ts; last 5 marked cited.
+        for i in 0..60_i64 {
+            add_evidence(&store, pid, 1_000 + i, 10_000 + i, 0.1 + (i as f64) * 0.005);
+        }
+        store
+            .conn()
+            .execute(
+                "UPDATE wiki_evidence SET cited = 1 WHERE msg_id IN (1000, 1001, 1002, 1003, 1004)",
+            )
+            .unwrap();
+
+        let rows = store.select_rewrite_evidence(pid, Some(0)).unwrap();
+        assert!(rows.len() <= 50);
+        // delta cutoff 0 → all rows are "newer", so first 30 newest pulled by ts DESC.
+        // cited rows (oldest ts) are also present via category 3.
+        let cited_present = rows.iter().any(|r| r.cited > 0);
+        assert!(cited_present);
+    }
+
+    #[test]
+    fn apply_rewrite_v2_updates_summary_and_drops_excess() {
+        let store = setup();
+        let pid = make_page(&store, "Retain");
+        for i in 0..20_i64 {
+            add_evidence(&store, pid, 500 + i, 100 + i, 0.1);
+        }
+        store.enqueue_rewrite(pid).unwrap();
+        let _ = store.claim_rewrite_batch(1).unwrap();
+        store.conn().execute("BEGIN IMMEDIATE").unwrap();
+        store
+            .apply_rewrite_v2(&RewriteApply {
+                page_id: pid,
+                summary_md: "Updated summary",
+                facts_json: "{\"facts_version\":1}",
+                state: "active",
+                new_aliases: &["Alias One".to_string()],
+                retention_cap: 5,
+            })
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+
+        let p = store.get_page_for_rewrite(pid).unwrap().unwrap();
+        assert_eq!(p.summary_md, "Updated summary");
+        assert!(p.last_rewrite_at.is_some());
+        // Retention cap = 5 but spec retention also keeps last 24h + top-2/chat;
+        // all 20 evidence rows are recent (ts ≈ 100s ago in test wall-clock?
+        // No — strftime('%s','now') - 86400 → far future relative to ts=100..119;
+        // so "last 24h" check fails and rows are NOT auto-kept by recency).
+        // top-2/chat keeps 2 (only chat_id=1). cited=0 throughout. So drop down
+        // to retention_cap=5 worth of rows. Final ≥ 2 (top-per-chat) and ≤ 5
+        // depending on overlap.
+        let mut s = store
+            .conn()
+            .prepare(format!(
+                "SELECT COUNT(*) FROM wiki_evidence WHERE page_id = {pid}"
+            ))
+            .unwrap();
+        s.next().unwrap();
+        let n: i64 = s.read(0).unwrap();
+        assert!(
+            n <= 5,
+            "expected ≤5 evidence after retention sweep, got {n}"
+        );
+        assert!(n >= 1);
+        assert_eq!(p.evidence_count, n);
+
+        let stats = store.get_rewrite_stats().unwrap();
+        assert_eq!(stats.done, 1);
+    }
+
+    #[test]
+    fn apply_rewrite_v2_retention_keeps_cited_rows() {
+        let store = setup();
+        let pid = make_page(&store, "Cited");
+        for i in 0..15_i64 {
+            add_evidence(&store, pid, 700 + i, 100 + i, 0.1);
+        }
+        // Mark one low-salience, mid-ts row as cited; retention must keep it.
+        store
+            .conn()
+            .execute("UPDATE wiki_evidence SET cited = 3 WHERE msg_id = 705")
+            .unwrap();
+
+        store.enqueue_rewrite(pid).unwrap();
+        let _ = store.claim_rewrite_batch(1).unwrap();
+        store.conn().execute("BEGIN IMMEDIATE").unwrap();
+        store
+            .apply_rewrite_v2(&RewriteApply {
+                page_id: pid,
+                summary_md: "S",
+                facts_json: "{\"facts_version\":1}",
+                state: "active",
+                new_aliases: &[],
+                retention_cap: 1,
+            })
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+
+        let mut s = store
+            .conn()
+            .prepare("SELECT 1 FROM wiki_evidence WHERE page_id = ? AND msg_id = 705")
+            .unwrap();
+        s.bind((1, pid)).unwrap();
+        assert!(matches!(s.next().unwrap(), sqlite::State::Row));
     }
 }
