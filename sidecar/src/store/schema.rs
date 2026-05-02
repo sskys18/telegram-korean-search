@@ -82,12 +82,54 @@ pub fn run_migrations(conn: &Connection) -> Result<(), sqlite::Error> {
 }
 
 fn migrate_to_v9(conn: &Connection) -> Result<(), sqlite::Error> {
-    if get_schema_version(conn) >= 9 {
-        return Ok(());
-    }
-
+    // Fully idempotent: all statements use IF NOT EXISTS / column_exists
+    // guards. Re-running is a no-op. This lets us extend v9 in place
+    // (cloud-spec additions per docs/specs/2026-04-27-cloud-wiki-architecture.md
+    // §Schema) without bumping schema_version.
     conn.execute("BEGIN")?;
     let result = (|| -> Result<(), sqlite::Error> {
+        // Cloud-spec additions to messages: msg_version, deleted_at,
+        // cloud_acked_version, sender_id. Land in the v9 banner per cloud
+        // spec line 114. Behavior (msg_version bumps, soft-delete reads,
+        // tombstone sweep) is deferred to the cloud worker phase.
+        if !column_exists(conn, "messages", "msg_version")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN msg_version INTEGER NOT NULL DEFAULT 1")?;
+        }
+        if !column_exists(conn, "messages", "deleted_at")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN deleted_at INTEGER")?;
+        }
+        if !column_exists(conn, "messages", "cloud_acked_version")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN cloud_acked_version INTEGER")?;
+        }
+        if !column_exists(conn, "messages", "sender_id")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN sender_id INTEGER")?;
+        }
+
+        conn.execute(
+            "
+            CREATE TABLE IF NOT EXISTS cloud_outbox (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_op_id TEXT NOT NULL UNIQUE,
+                op           TEXT NOT NULL CHECK (op IN
+                                 ('msg_upsert','msg_delete','chat_meta','chat_purge')),
+                chat_id      INTEGER NOT NULL,
+                message_id   INTEGER,
+                msg_version  INTEGER,
+                payload      BLOB NOT NULL,
+                created_at   INTEGER NOT NULL,
+                attempts     INTEGER NOT NULL DEFAULT 0,
+                last_error   TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ix_outbox_chat ON cloud_outbox (chat_id);
+
+            CREATE TABLE IF NOT EXISTS postbox_recon_watermark (
+                chat_id        INTEGER PRIMARY KEY,
+                max_msg_id     INTEGER NOT NULL,
+                last_full_diff INTEGER NOT NULL DEFAULT 0
+            );
+            ",
+        )?;
+
         conn.execute(
             "
             CREATE TABLE IF NOT EXISTS wiki_pages_v2 (
@@ -961,6 +1003,42 @@ mod tests {
         count_stmt.next().unwrap();
         let count: i64 = count_stmt.read(0).unwrap();
         assert_eq!(count, 21);
+    }
+
+    #[test]
+    fn test_v9_message_columns_added() {
+        let store = Store::open_in_memory().unwrap();
+        for col in [
+            "msg_version",
+            "deleted_at",
+            "cloud_acked_version",
+            "sender_id",
+        ] {
+            let mut stmt = store
+                .conn()
+                .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?")
+                .unwrap();
+            stmt.bind((1, col)).unwrap();
+            assert!(
+                matches!(stmt.next(), Ok(sqlite::State::Row)),
+                "column missing: {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v9_cloud_tables_created() {
+        let store = Store::open_in_memory().unwrap();
+        let mut tables = Vec::new();
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap();
+        while let Ok(sqlite::State::Row) = stmt.next() {
+            tables.push(stmt.read::<String, _>("name").unwrap());
+        }
+        assert!(tables.contains(&"cloud_outbox".to_string()));
+        assert!(tables.contains(&"postbox_recon_watermark".to_string()));
     }
 
     #[test]
