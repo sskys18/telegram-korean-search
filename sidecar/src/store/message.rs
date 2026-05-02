@@ -102,13 +102,12 @@ fn enqueue_wiki_classify(
     q.bind((2, message_id))?;
     q.next()?;
 
-    // v2 queue: spec §6.1 ingest. blake3-16 over raw text_plain bytes;
-    // NFC normalization is a phase-6 follow-up (no unicode-normalization
-    // dep yet). Match logic: existing row with same hash = noop;
+    // v2 queue: spec §6.1 ingest. NFC-normalized blake3-16 over text_plain.
+    // Match logic: existing row with same hash = noop;
     // existing row with different hash = reset to pending and bump hash;
     // missing row = insert pending.
-    let text_hash = blake3_16(text_plain);
-    let now = unix_now();
+    let text_hash = crate::wiki::norm::blake3_16_nfc(text_plain);
+    let now = crate::wiki::norm::unix_now();
 
     let existing: Option<(String, Vec<u8>)> = {
         let mut stmt = conn.prepare(
@@ -175,18 +174,6 @@ fn enqueue_wiki_classify(
         }
     }
     Ok(())
-}
-
-fn blake3_16(text: &str) -> Vec<u8> {
-    blake3::hash(text.as_bytes()).as_bytes()[..16].to_vec()
-}
-
-fn unix_now() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 fn like_variants(term: &str) -> [String; 3] {
