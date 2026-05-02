@@ -611,7 +611,7 @@ async fn maybe_refresh_trending<E: EventEmitter>(
         s.conn().execute("BEGIN IMMEDIATE")?;
         let res = s.apply_trending(&snap, &[]);
         match res {
-            Ok(()) => {
+            Ok(_) => {
                 s.conn().execute("COMMIT")?;
             }
             Err(e) => {
@@ -705,13 +705,22 @@ async fn maybe_refresh_trending<E: EventEmitter>(
             .collect()
     };
 
-    // Atomic apply + watermark bump.
+    // Atomic apply + watermark bump. `Ok(false)` = stale-snapshot guard
+    // fired (a newer concurrent tick already wrote); skip the
+    // topics_changed event since cache is unchanged.
     let s = lock(store);
     s.conn().execute("BEGIN IMMEDIATE")?;
     match s.apply_trending(&snap, &rows) {
-        Ok(()) => {
+        Ok(applied) => {
             s.conn().execute("COMMIT")?;
-            emitter.wiki_topics_changed();
+            if applied {
+                emitter.wiki_topics_changed();
+            } else {
+                log::info!(
+                    "wiki trending: stale snapshot for {}, newer tick already applied",
+                    window.label()
+                );
+            }
             Ok(())
         }
         Err(e) => {

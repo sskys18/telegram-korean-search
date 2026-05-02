@@ -1221,11 +1221,27 @@ impl Store {
     /// Atomic spec §6.4 apply: replace cache rows for the window + UPSERT
     /// watermark. Caller wraps with BEGIN IMMEDIATE / COMMIT so a crash
     /// mid-write never half-publishes.
+    ///
+    /// Returns `Ok(false)` and writes nothing if a concurrent (newer)
+    /// apply already advanced the watermark past `snap.max_evidence_id`.
+    /// Without this guard a slow tick can stomp a newer tick's cache:
+    /// tick B (snap=200) finishes first → cache+watermark = 200. Tick A
+    /// (snap=100) lands later → DELETE wipes B's cache, INSERT writes A's
+    /// stale rows. The `MAX(...)` watermark UPSERT keeps last_evidence_id
+    /// at 200, so the dirty test sees "clean" forever and the stale cache
+    /// is never reconciled. The pre-check below makes A bail.
     pub fn apply_trending(
         &self,
         snap: &TrendingSnapshot,
         rows: &[TrendingApplyRow],
-    ) -> Result<(), sqlite::Error> {
+    ) -> Result<bool, sqlite::Error> {
+        // 0. Stale-snapshot guard. Read the current watermark inside the
+        // txn; if a newer snapshot already wrote, abort silently.
+        let (current_last_id, _) = self.read_trending_watermark(snap.window)?;
+        if current_last_id > snap.max_evidence_id {
+            return Ok(false);
+        }
+
         // 1. Wipe prior cache for this window.
         let mut del = self
             .conn()
@@ -1255,20 +1271,20 @@ impl Store {
             }
         }
 
-        // 3. Watermark UPSERT — `last_evidence_id` strictly monotonic so a
-        // late retry (e.g. crash recovery) never rewinds it.
+        // 3. Watermark UPSERT — both fields strictly monotonic so a late
+        // retry (crash recovery, reordered txns) never rewinds either.
         let mut wm = self.conn().prepare(
             "INSERT INTO trending_watermark (window, last_evidence_id, last_computed_at)
                  VALUES (?, ?, ?)
                  ON CONFLICT(window) DO UPDATE SET
                      last_evidence_id = MAX(last_evidence_id, excluded.last_evidence_id),
-                     last_computed_at = excluded.last_computed_at",
+                     last_computed_at = MAX(last_computed_at, excluded.last_computed_at)",
         )?;
         wm.bind((1, snap.window.label()))?;
         wm.bind((2, snap.max_evidence_id))?;
         wm.bind((3, snap.now))?;
         wm.next()?;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -2040,14 +2056,75 @@ mod tests {
         let s_low = snap(TrendingWindow::H1, now, 5);
         let s_high = snap(TrendingWindow::H1, now + 10, 12);
         store.conn().execute("BEGIN IMMEDIATE").unwrap();
-        store.apply_trending(&s_high, &[]).unwrap();
+        let applied_high = store.apply_trending(&s_high, &[]).unwrap();
         store.conn().execute("COMMIT").unwrap();
-        // A late retry with a smaller max_evidence_id must not rewind.
+        assert!(applied_high);
+        // Late retry with smaller max_evidence_id: stale guard returns
+        // false → no DELETE, no INSERT, no watermark mutation.
         store.conn().execute("BEGIN IMMEDIATE").unwrap();
-        store.apply_trending(&s_low, &[]).unwrap();
+        let applied_low = store.apply_trending(&s_low, &[]).unwrap();
         store.conn().execute("COMMIT").unwrap();
+        assert!(!applied_low, "stale snapshot must skip apply");
         let (last_id, _) = store.read_trending_watermark(TrendingWindow::H1).unwrap();
         assert_eq!(last_id, 12, "watermark must not regress");
+    }
+
+    #[test]
+    fn apply_trending_stale_snapshot_preserves_newer_cache() {
+        // Race: tick B (snap=200) commits first, cache=B. Tick A (snap=100)
+        // commits second. Without the stale guard, A's DELETE wipes B's
+        // rows and INSERT writes A's stale rows; the watermark MAX() pin
+        // would then say "clean" forever and lock in stale cache. The
+        // pre-check makes A bail.
+        let store = setup();
+        let pid_a = make_page(&store, "A");
+        let pid_b = make_page(&store, "B");
+        let now = 10_000;
+        let snap_b_high = snap(TrendingWindow::H24, now, 200);
+        let snap_a_low = snap(TrendingWindow::H24, now, 100);
+
+        store.conn().execute("BEGIN IMMEDIATE").unwrap();
+        store
+            .apply_trending(
+                &snap_b_high,
+                &[TrendingApplyRow {
+                    page_id: pid_b,
+                    rank: 1,
+                    hook: "newer".into(),
+                    reason_code: "default".into(),
+                    reason_metrics: "{}".into(),
+                    sparkline: "[]".into(),
+                }],
+            )
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+
+        // Stale tick A arrives.
+        store.conn().execute("BEGIN IMMEDIATE").unwrap();
+        let applied = store
+            .apply_trending(
+                &snap_a_low,
+                &[TrendingApplyRow {
+                    page_id: pid_a,
+                    rank: 1,
+                    hook: "stale".into(),
+                    reason_code: "default".into(),
+                    reason_metrics: "{}".into(),
+                    sparkline: "[]".into(),
+                }],
+            )
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+        assert!(!applied, "stale apply must report not-applied");
+
+        // Cache must still be B's row, untouched.
+        let mut q = store
+            .conn()
+            .prepare("SELECT page_id, hook FROM trending_cache WHERE window = '24h'")
+            .unwrap();
+        q.next().unwrap();
+        assert_eq!(q.read::<i64, _>(0).unwrap(), pid_b);
+        assert_eq!(q.read::<String, _>(1).unwrap(), "newer");
     }
 
     use super::derive_reason_code;

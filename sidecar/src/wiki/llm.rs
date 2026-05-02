@@ -960,6 +960,8 @@ pub struct V2RankedItem {
 
 #[derive(Debug, thiserror::Error)]
 pub enum V2TrendingValidateError {
+    #[error("ranked is empty")]
+    Empty,
     #[error("ranked size {0} > 10")]
     TooMany(usize),
     #[error("page_id {0} not in input candidates")]
@@ -980,11 +982,17 @@ pub enum V2TrendingValidateError {
 
 /// Spec §6.4 reranker validator. On error, caller writes shortlist top-10
 /// with `hook=""` fallback and bumps watermark anyway (avoids hot-loop on
-/// repeatedly bad LLM output).
+/// repeatedly bad LLM output). An empty `ranked` array is a validator
+/// failure: the worker only invokes the LLM when shortlist is non-empty,
+/// so an empty response means the model produced nothing useful and the
+/// shortlist itself should be served as fallback.
 pub fn validate_trending(
     out: &V2TrendingOutput,
     candidate_ids: &std::collections::HashSet<i64>,
 ) -> Result<Vec<V2RankedItem>, V2TrendingValidateError> {
+    if out.ranked.is_empty() {
+        return Err(V2TrendingValidateError::Empty);
+    }
     if out.ranked.len() > 10 {
         return Err(V2TrendingValidateError::TooMany(out.ranked.len()));
     }
@@ -1376,6 +1384,19 @@ mod tests {
         let v = validate_trending(&out, &cset(&[1, 2, 3])).unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].rank, 1);
+    }
+
+    #[test]
+    fn trending_validator_rejects_empty_ranked() {
+        // Worker only invokes LLM when shortlist is non-empty, so empty
+        // `ranked` = LLM produced nothing useful. Caller must fall back
+        // to the SQL shortlist with empty hooks, not silently publish
+        // an empty cache.
+        let out = ranked(vec![]);
+        assert!(matches!(
+            validate_trending(&out, &cset(&[1])),
+            Err(V2TrendingValidateError::Empty)
+        ));
     }
 
     #[test]
