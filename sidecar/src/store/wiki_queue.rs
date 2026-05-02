@@ -411,6 +411,190 @@ impl Store {
     }
 }
 
+/// Row claimed for a v2 wiki page rewrite.
+#[derive(Debug, Clone)]
+pub struct RewriteQueueItem {
+    pub page_id: i64,
+    pub attempts: i64,
+}
+
+impl Store {
+    /// Enqueue (or re-arm) a rewrite for `page_id`. Preserves an in-flight
+    /// `processing` claim so a concurrent classify cannot wipe a worker's
+    /// lease (and trick the worker into committing against stale rows).
+    pub fn enqueue_rewrite(&self, page_id: i64) -> Result<(), sqlite::Error> {
+        let now = crate::wiki::norm::unix_now();
+        let mut s = self.conn().prepare(
+            "INSERT INTO wiki_rewrite_queue
+                (page_id, status, attempts, enqueued_at, next_attempt_at)
+             VALUES (?, 'pending', 0, ?, ?)
+             ON CONFLICT(page_id) DO UPDATE SET
+                status = CASE
+                    WHEN wiki_rewrite_queue.status = 'processing' THEN 'processing'
+                    ELSE 'pending'
+                END,
+                enqueued_at = ?,
+                next_attempt_at = CASE
+                    WHEN wiki_rewrite_queue.status = 'processing' THEN wiki_rewrite_queue.next_attempt_at
+                    ELSE ?
+                END,
+                attempts = CASE
+                    WHEN wiki_rewrite_queue.status = 'done' THEN 0
+                    WHEN wiki_rewrite_queue.status = 'failed' THEN 0
+                    ELSE wiki_rewrite_queue.attempts
+                END,
+                last_error = CASE
+                    WHEN wiki_rewrite_queue.status IN ('done','failed') THEN NULL
+                    ELSE wiki_rewrite_queue.last_error
+                END",
+        )?;
+        s.bind((1, page_id))?;
+        s.bind((2, now))?;
+        s.bind((3, now))?;
+        s.bind((4, now))?;
+        s.bind((5, now))?;
+        s.next()?;
+        Ok(())
+    }
+
+    /// Atomically claim up to `limit` rewrite rows.
+    pub fn claim_rewrite_batch(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RewriteQueueItem>, sqlite::Error> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = crate::wiki::norm::unix_now();
+        self.conn().execute("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<Vec<RewriteQueueItem>, sqlite::Error> {
+            let mut sel = self.conn().prepare(format!(
+                "SELECT page_id, attempts
+                   FROM wiki_rewrite_queue
+                  WHERE status = 'pending'
+                    AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                  ORDER BY enqueued_at
+                  LIMIT {}",
+                limit
+            ))?;
+            sel.bind((1, now))?;
+            let mut rows = Vec::new();
+            while let sqlite::State::Row = sel.next()? {
+                rows.push(RewriteQueueItem {
+                    page_id: sel.read::<i64, _>("page_id")?,
+                    attempts: sel.read::<i64, _>("attempts")?,
+                });
+            }
+            if rows.is_empty() {
+                return Ok(rows);
+            }
+            let mut upd = self.conn().prepare(
+                "UPDATE wiki_rewrite_queue
+                    SET status = 'processing', claimed_at = ?
+                  WHERE page_id = ?",
+            )?;
+            for r in &rows {
+                upd.bind((1, now))?;
+                upd.bind((2, r.page_id))?;
+                upd.next()?;
+                upd.reset()?;
+            }
+            Ok(rows)
+        })();
+        match result {
+            Ok(rows) => {
+                self.conn().execute("COMMIT")?;
+                Ok(rows)
+            }
+            Err(e) => {
+                let _ = self.conn().execute("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    pub fn mark_rewrite_done(&self, page_id: i64) -> Result<(), sqlite::Error> {
+        let mut s = self.conn().prepare(
+            "UPDATE wiki_rewrite_queue
+                SET status = 'done', attempts = attempts + 1,
+                    claimed_at = NULL, last_error = NULL
+              WHERE page_id = ?",
+        )?;
+        s.bind((1, page_id))?;
+        s.next()?;
+        Ok(())
+    }
+
+    pub fn mark_rewrite_retry(
+        &self,
+        page_id: i64,
+        err: &str,
+        max_attempts: i64,
+    ) -> Result<(), sqlite::Error> {
+        let now = crate::wiki::norm::unix_now();
+        let mut s = self.conn().prepare(
+            "UPDATE wiki_rewrite_queue
+                SET attempts = attempts + 1,
+                    last_error = ?,
+                    claimed_at = NULL,
+                    status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE 'pending' END,
+                    next_attempt_at = CASE
+                        WHEN attempts + 1 >= ? THEN ?
+                        ELSE ? + (60 * (1 << MIN(attempts + 1, 6)))
+                    END
+              WHERE page_id = ?",
+        )?;
+        s.bind((1, err))?;
+        s.bind((2, max_attempts))?;
+        s.bind((3, max_attempts))?;
+        s.bind((4, now))?;
+        s.bind((5, now))?;
+        s.bind((6, page_id))?;
+        s.next()?;
+        Ok(())
+    }
+
+    pub fn recover_stale_rewrite_claims(&self) -> Result<usize, sqlite::Error> {
+        let cutoff = crate::wiki::norm::unix_now() - 600;
+        let mut s = self.conn().prepare(
+            "UPDATE wiki_rewrite_queue
+                SET status = 'pending', claimed_at = NULL
+              WHERE status = 'processing' AND claimed_at < ?",
+        )?;
+        s.bind((1, cutoff))?;
+        s.next()?;
+        Ok(self.conn().change_count())
+    }
+
+    pub fn get_rewrite_stats(&self) -> Result<QueueStats, sqlite::Error> {
+        let mut stmt = self.conn().prepare(
+            "SELECT
+                SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) AS processing,
+                SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed
+             FROM wiki_rewrite_queue",
+        )?;
+        if let sqlite::State::Row = stmt.next()? {
+            Ok(QueueStats {
+                pending: stmt.read::<Option<i64>, _>("pending")?.unwrap_or(0),
+                processing: stmt.read::<Option<i64>, _>("processing")?.unwrap_or(0),
+                done: stmt.read::<Option<i64>, _>("done")?.unwrap_or(0),
+                failed: stmt.read::<Option<i64>, _>("failed")?.unwrap_or(0),
+                skipped: 0,
+            })
+        } else {
+            Ok(QueueStats {
+                pending: 0,
+                processing: 0,
+                done: 0,
+                failed: 0,
+                skipped: 0,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::store::message::MessageRow;
@@ -578,6 +762,88 @@ mod tests {
         let n = store.recover_stale_v2_claims().unwrap();
         assert_eq!(n, 1);
         let stats = store.get_classify_v2_stats().unwrap();
+        assert_eq!(stats.pending, 1);
+    }
+
+    fn make_page(store: &Store, title: &str) -> i64 {
+        store.conn().execute("BEGIN").unwrap();
+        let p = store.dedup_or_insert_page_v2("topic", title, &[]).unwrap();
+        store.conn().execute("COMMIT").unwrap();
+        p.id
+    }
+
+    #[test]
+    fn rewrite_enqueue_claim_done() {
+        let store = setup_store_with_messages();
+        let pid = make_page(&store, "Bitcoin ETF");
+        store.enqueue_rewrite(pid).unwrap();
+
+        let claimed = store.claim_rewrite_batch(10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].page_id, pid);
+        let stats = store.get_rewrite_stats().unwrap();
+        assert_eq!(stats.processing, 1);
+
+        store.mark_rewrite_done(pid).unwrap();
+        let stats = store.get_rewrite_stats().unwrap();
+        assert_eq!(stats.done, 1);
+        assert_eq!(stats.processing, 0);
+    }
+
+    #[test]
+    fn rewrite_enqueue_preserves_processing_lease() {
+        // Spec / advisor flag: a re-enqueue while a worker holds a
+        // processing claim must not flip the row back to 'pending,
+        // attempts=0' under the worker's feet.
+        let store = setup_store_with_messages();
+        let pid = make_page(&store, "ETH L2");
+        store.enqueue_rewrite(pid).unwrap();
+        let _ = store.claim_rewrite_batch(1).unwrap();
+
+        // Concurrent classify path re-enqueues.
+        store.enqueue_rewrite(pid).unwrap();
+
+        let stats = store.get_rewrite_stats().unwrap();
+        assert_eq!(stats.processing, 1);
+        assert_eq!(stats.pending, 0);
+    }
+
+    #[test]
+    fn rewrite_retry_then_failed() {
+        let store = setup_store_with_messages();
+        let pid = make_page(&store, "DeFi");
+        store.enqueue_rewrite(pid).unwrap();
+        let _ = store.claim_rewrite_batch(1).unwrap();
+
+        store.mark_rewrite_retry(pid, "err1", 3).unwrap();
+        store.mark_rewrite_retry(pid, "err2", 3).unwrap();
+        store.mark_rewrite_retry(pid, "err3", 3).unwrap();
+        let stats = store.get_rewrite_stats().unwrap();
+        assert_eq!(stats.failed, 1);
+    }
+
+    #[test]
+    fn rewrite_recover_stale() {
+        let store = setup_store_with_messages();
+        let pid = make_page(&store, "Memecoin");
+        let now = crate::wiki::norm::unix_now();
+        let mut s = store
+            .conn()
+            .prepare(
+                "INSERT INTO wiki_rewrite_queue
+              (page_id, status, attempts, enqueued_at, claimed_at, next_attempt_at)
+             VALUES (?, 'processing', 1, ?, ?, ?)",
+            )
+            .unwrap();
+        s.bind((1, pid)).unwrap();
+        s.bind((2, now - 1000)).unwrap();
+        s.bind((3, now - 1000)).unwrap();
+        s.bind((4, now - 1000)).unwrap();
+        s.next().unwrap();
+
+        let n = store.recover_stale_rewrite_claims().unwrap();
+        assert_eq!(n, 1);
+        let stats = store.get_rewrite_stats().unwrap();
         assert_eq!(stats.pending, 1);
     }
 }
