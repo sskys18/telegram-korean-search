@@ -594,6 +594,10 @@ pub struct RewriteApply<'a> {
     pub state: &'a str,
     pub new_aliases: &'a [String],
     pub retention_cap: i64,
+    /// Watermark captured at the start of `select_rewrite_evidence`.
+    /// Stored as `last_rewrite_at` so the next delta picks up rows
+    /// inserted between select and apply (e.g. during the LLM call).
+    pub snapshot_at: i64,
 }
 
 impl Store {
@@ -654,11 +658,18 @@ impl Store {
     /// Pick ≤50 evidence rows: delta since `last_rewrite_at` (≤30) +
     /// top-K by salience from the remainder (≤20) + always-keep
     /// `cited > 0` rows. De-dup by id, cap at 50 total.
+    ///
+    /// Returns `(rows, snapshot_at)`. The snapshot is captured here and
+    /// MUST be passed to `apply_rewrite_v2` as the new `last_rewrite_at`
+    /// — using `now()` at apply time would lose anything inserted during
+    /// the LLM round-trip, since the watermark would advance past their
+    /// `created_at`.
     pub fn select_rewrite_evidence(
         &self,
         page_id: i64,
         last_rewrite_at: Option<i64>,
-    ) -> Result<Vec<EvidenceForRewrite>, sqlite::Error> {
+    ) -> Result<(Vec<EvidenceForRewrite>, i64), sqlite::Error> {
+        let snapshot_at = crate::wiki::norm::unix_now();
         let mut out: Vec<EvidenceForRewrite> = Vec::new();
         let mut seen = std::collections::HashSet::<i64>::new();
 
@@ -690,21 +701,25 @@ impl Store {
         // for the same reason.
         let cutoff = last_rewrite_at.unwrap_or(0);
 
-        // 1. delta since last rewrite, ≤30 newest first
+        // 1. delta since last rewrite, ≤30 newest first.
+        // Upper-bound by `snapshot_at` so the apply step can persist the
+        // same watermark and the next delta picks up any row inserted
+        // after we read.
         {
             let mut s = self.conn().prepare(
                 "SELECT id, msg_id, chat_id, ts, excerpt, salience, cited
                    FROM wiki_evidence
-                  WHERE page_id = ? AND created_at > ?
+                  WHERE page_id = ? AND created_at > ? AND created_at <= ?
                   ORDER BY created_at DESC
                   LIMIT 30",
             )?;
             s.bind((1, page_id))?;
             s.bind((2, cutoff))?;
+            s.bind((3, snapshot_at))?;
             while let sqlite::State::Row = s.next()? {
                 push_row(&mut s, &mut seen, &mut out)?;
                 if out.len() >= 50 {
-                    return Ok(out);
+                    return Ok((out, snapshot_at));
                 }
             }
         }
@@ -723,7 +738,7 @@ impl Store {
             while let sqlite::State::Row = s.next()? {
                 push_row(&mut s, &mut seen, &mut out)?;
                 if out.len() >= 50 {
-                    return Ok(out);
+                    return Ok((out, snapshot_at));
                 }
             }
         }
@@ -745,7 +760,7 @@ impl Store {
             }
         }
 
-        Ok(out)
+        Ok((out, snapshot_at))
     }
 
     /// Apply a rewrite per spec §6.3 in a single txn.
@@ -769,7 +784,7 @@ impl Store {
         s.bind((1, r.summary_md))?;
         s.bind((2, r.facts_json))?;
         s.bind((3, r.state))?;
-        s.bind((4, now))?;
+        s.bind((4, r.snapshot_at))?;
         s.bind((5, now))?;
         s.bind((6, r.page_id))?;
         s.next()?;
@@ -1139,7 +1154,8 @@ mod tests {
             )
             .unwrap();
 
-        let rows = store.select_rewrite_evidence(pid, Some(0)).unwrap();
+        let (rows, snap) = store.select_rewrite_evidence(pid, Some(0)).unwrap();
+        assert!(snap > 0);
         assert!(rows.len() <= 50);
         // delta cutoff 0 → all rows are "newer", so first 30 newest pulled by ts DESC.
         // cited rows (oldest ts) are also present via category 3.
@@ -1165,6 +1181,7 @@ mod tests {
                 state: "active",
                 new_aliases: &["Alias One".to_string()],
                 retention_cap: 5,
+                snapshot_at: crate::wiki::norm::unix_now(),
             })
             .unwrap();
         store.conn().execute("COMMIT").unwrap();
@@ -1222,6 +1239,7 @@ mod tests {
                 state: "active",
                 new_aliases: &[],
                 retention_cap: 1,
+                snapshot_at: crate::wiki::norm::unix_now(),
             })
             .unwrap();
         store.conn().execute("COMMIT").unwrap();
@@ -1232,5 +1250,46 @@ mod tests {
             .unwrap();
         s.bind((1, pid)).unwrap();
         assert!(matches!(s.next().unwrap(), sqlite::State::Row));
+    }
+
+    #[test]
+    fn select_then_apply_uses_select_snapshot_for_watermark() {
+        // Spec compliance: last_rewrite_at must equal the snapshot taken
+        // at select time, NOT now() at apply time. Otherwise rows
+        // inserted between select and apply (e.g. during the LLM call)
+        // are permanently skipped from the next delta.
+        let store = setup();
+        let pid = make_page(&store, "Snap");
+        for i in 0..5_i64 {
+            add_evidence(&store, pid, 800 + i, 100 + i, 0.5);
+        }
+        let (_rows, snap) = store.select_rewrite_evidence(pid, Some(0)).unwrap();
+
+        // Simulate "LLM took some time" — sleep one second so wall clock
+        // advances past snap.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        store.enqueue_rewrite(pid).unwrap();
+        let _ = store.claim_rewrite_batch(1).unwrap();
+        store.conn().execute("BEGIN IMMEDIATE").unwrap();
+        store
+            .apply_rewrite_v2(&RewriteApply {
+                page_id: pid,
+                summary_md: "ok",
+                facts_json: "{\"facts_version\":1}",
+                state: "active",
+                new_aliases: &[],
+                retention_cap: 200,
+                snapshot_at: snap,
+            })
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+
+        let p = store.get_page_for_rewrite(pid).unwrap().unwrap();
+        assert_eq!(
+            p.last_rewrite_at,
+            Some(snap),
+            "watermark must equal select-time snapshot, not apply-time now()"
+        );
     }
 }

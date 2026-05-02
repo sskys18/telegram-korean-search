@@ -757,13 +757,16 @@ pub fn validate_v2_rewrite(
                 .or_insert(serde_json::Value::Null);
             obj.entry("severity".to_string())
                 .or_insert(serde_json::Value::Null);
-            if !obj["started_at"].is_number() && !obj["started_at"].is_null() {
+            // Strict int check: serde_json's `is_number()` accepts floats
+            // (`1.5`), but ts fields are unix-second integers.
+            let int_or_null = |v: &serde_json::Value| v.is_null() || v.as_i64().is_some();
+            if !int_or_null(&obj["started_at"]) {
                 return Err(V2RewriteValidateError::BadFacts(
                     kind.into(),
                     "started_at must be int|null".into(),
                 ));
             }
-            if !obj["resolved_at"].is_number() && !obj["resolved_at"].is_null() {
+            if !int_or_null(&obj["resolved_at"]) {
                 return Err(V2RewriteValidateError::BadFacts(
                     kind.into(),
                     "resolved_at must be int|null".into(),
@@ -850,7 +853,7 @@ pub fn validate_v2_rewrite(
             let last_seen = obj.get("last_seen").ok_or_else(|| {
                 V2RewriteValidateError::BadFacts(kind.into(), "last_seen required".into())
             })?;
-            if !last_seen.is_number() {
+            if last_seen.as_i64().is_none() {
                 return Err(V2RewriteValidateError::BadFacts(
                     kind.into(),
                     "last_seen must be int".into(),
@@ -1162,6 +1165,31 @@ mod tests {
         });
         let v = validate_v2_rewrite(&out, "active", "entity").unwrap();
         assert!(v.facts_json.contains("Vitalik"));
+    }
+
+    #[test]
+    fn rewrite_validator_event_started_at_rejects_float() {
+        let mut out = make_rewrite_out("active", "ok");
+        out.facts = serde_json::json!({"facts_version": 1, "started_at": 1.5});
+        assert!(matches!(
+            validate_v2_rewrite(&out, "active", "event"),
+            Err(V2RewriteValidateError::BadFacts(_, _))
+        ));
+    }
+
+    #[test]
+    fn rewrite_validator_entity_last_seen_rejects_float() {
+        let mut out = make_rewrite_out("active", "ok");
+        out.facts = serde_json::json!({
+            "facts_version": 1,
+            "canonical_name": "X",
+            "relations": [],
+            "last_seen": 1700000000.5
+        });
+        assert!(matches!(
+            validate_v2_rewrite(&out, "active", "entity"),
+            Err(V2RewriteValidateError::BadFacts(_, _))
+        ));
     }
 
     #[test]

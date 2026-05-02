@@ -630,7 +630,7 @@ fn apply_classify_v2(store: &Store, input: ApplyClassifyV2<'_>) -> Result<bool, 
         store.mark_classify_v2_done(input.item.msg_id, input.item.chat_id)?;
         // Spec §6.3: trigger lives inside classify txn, idempotent via PK.
         for pid in &touched_pages {
-            let _ = store.maybe_enqueue_rewrite(*pid);
+            store.maybe_enqueue_rewrite(*pid)?;
         }
         Ok(true)
     })();
@@ -678,7 +678,7 @@ async fn process_rewrite_one<E: EventEmitter>(
         let s = lock(store);
         s.select_rewrite_evidence(item.page_id, page.last_rewrite_at)
     };
-    let evidence = match evidence_result {
+    let (evidence, snapshot_at) = match evidence_result {
         Ok(v) => v,
         Err(e) => {
             // DB error reading evidence — retry, do NOT mark done (was
@@ -754,6 +754,7 @@ async fn process_rewrite_one<E: EventEmitter>(
         state: &validated.state,
         new_aliases: &validated.new_aliases,
         retention_cap,
+        snapshot_at,
     });
     match apply {
         Ok(()) => {
