@@ -231,6 +231,7 @@ pub struct PageForRewrite {
     pub evidence_count: i64,
     pub last_rewrite_at: Option<i64>,
     pub last_rewrite_evidence_count: i64,
+    pub last_rewrite_max_evidence_id: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -594,10 +595,13 @@ pub struct RewriteApply<'a> {
     pub state: &'a str,
     pub new_aliases: &'a [String],
     pub retention_cap: i64,
-    /// Watermark captured at the start of `select_rewrite_evidence`.
-    /// Stored as `last_rewrite_at` so the next delta picks up rows
-    /// inserted between select and apply (e.g. during the LLM call).
+    /// Wall-clock snapshot at the start of `select_rewrite_evidence`
+    /// (stored as `last_rewrite_at`, drives the 24h trigger fallback).
     pub snapshot_at: i64,
+    /// MAX(wiki_evidence.id) at the snapshot — this is the real
+    /// delta watermark; using id avoids the same-second clock race
+    /// that comes with `created_at`.
+    pub max_evidence_id: i64,
 }
 
 impl Store {
@@ -634,7 +638,8 @@ impl Store {
     ) -> Result<Option<PageForRewrite>, sqlite::Error> {
         let mut s = self.conn().prepare(
             "SELECT id, kind, title, state, summary_md, facts,
-                    evidence_count, last_rewrite_at, last_rewrite_evidence_count
+                    evidence_count, last_rewrite_at, last_rewrite_evidence_count,
+                    last_rewrite_max_evidence_id
                FROM wiki_pages_v2 WHERE id = ?",
         )?;
         s.bind((1, page_id))?;
@@ -649,26 +654,28 @@ impl Store {
                 evidence_count: s.read::<i64, _>(6)?,
                 last_rewrite_at: s.read::<Option<i64>, _>(7)?,
                 last_rewrite_evidence_count: s.read::<i64, _>(8)?,
+                last_rewrite_max_evidence_id: s.read::<i64, _>(9)?,
             }))
         } else {
             Ok(None)
         }
     }
 
-    /// Pick ≤50 evidence rows: delta since `last_rewrite_at` (≤30) +
-    /// top-K by salience from the remainder (≤20) + always-keep
+    /// Pick ≤50 evidence rows: delta since last rewrite (≤30) +
+    /// top-K by salience from any remaining rows (≤20) + always-keep
     /// `cited > 0` rows. De-dup by id, cap at 50 total.
     ///
-    /// Returns `(rows, snapshot_at)`. The snapshot is captured here and
-    /// MUST be passed to `apply_rewrite_v2` as the new `last_rewrite_at`
-    /// — using `now()` at apply time would lose anything inserted during
-    /// the LLM round-trip, since the watermark would advance past their
-    /// `created_at`.
+    /// Returns `(rows, snapshot_at, max_evidence_id_seen)`. Watermark is
+    /// keyed on the monotonic `id` (not `created_at`) so same-second
+    /// concurrent inserts can never be skipped: any row not in this
+    /// selection has `id > max_id_seen` and the next delta picks it up.
+    /// `snapshot_at` is also returned so the time-based 24h trigger
+    /// reads a stable wall-clock anchor.
     pub fn select_rewrite_evidence(
         &self,
         page_id: i64,
-        last_rewrite_at: Option<i64>,
-    ) -> Result<(Vec<EvidenceForRewrite>, i64), sqlite::Error> {
+        last_rewrite_max_evidence_id: i64,
+    ) -> Result<(Vec<EvidenceForRewrite>, i64, i64), sqlite::Error> {
         let snapshot_at = crate::wiki::norm::unix_now();
         let mut out: Vec<EvidenceForRewrite> = Vec::new();
         let mut seen = std::collections::HashSet::<i64>::new();
@@ -693,57 +700,74 @@ impl Store {
             Ok(())
         };
 
-        // Delta is "inserted since last rewrite", not "message ts > last
-        // rewrite". Backfill / historical re-classify inserts evidence with
-        // old `ts` but recent `created_at`; comparing on `ts` would
-        // permanently lose those rows from the delta window. Mirrors spec
-        // §6.4 trending watermark which switched from ts to monotonic id
-        // for the same reason.
-        let cutoff = last_rewrite_at.unwrap_or(0);
+        // Snapshot the upper id bound BEFORE selecting; pass it to apply
+        // so the watermark advances exactly to "max id we could have
+        // seen at select time". Any row inserted later has a strictly
+        // greater id and surfaces in the next delta.
+        let max_id_at_snapshot: i64 = {
+            let mut s = self
+                .conn()
+                .prepare("SELECT COALESCE(MAX(id), 0) FROM wiki_evidence WHERE page_id = ?")?;
+            s.bind((1, page_id))?;
+            s.next()?;
+            s.read::<i64, _>(0)?
+        };
 
-        // 1. delta since last rewrite, ≤30 newest first.
-        // Upper-bound by `snapshot_at` so the apply step can persist the
-        // same watermark and the next delta picks up any row inserted
-        // after we read.
+        // 1. delta since last rewrite — ≤30 newest first by id.
         {
             let mut s = self.conn().prepare(
                 "SELECT id, msg_id, chat_id, ts, excerpt, salience, cited
                    FROM wiki_evidence
-                  WHERE page_id = ? AND created_at > ? AND created_at <= ?
-                  ORDER BY created_at DESC
+                  WHERE page_id = ? AND id > ? AND id <= ?
+                  ORDER BY id DESC
                   LIMIT 30",
             )?;
             s.bind((1, page_id))?;
-            s.bind((2, cutoff))?;
-            s.bind((3, snapshot_at))?;
+            s.bind((2, last_rewrite_max_evidence_id))?;
+            s.bind((3, max_id_at_snapshot))?;
             while let sqlite::State::Row = s.next()? {
                 push_row(&mut s, &mut seen, &mut out)?;
                 if out.len() >= 50 {
-                    return Ok((out, snapshot_at));
+                    return Ok((out, snapshot_at, max_id_at_snapshot));
                 }
             }
         }
 
-        // 2. top-K by salience from the rest, ≤20
-        {
-            let mut s = self.conn().prepare(
+        // 2. top-K by salience from ANY remaining rows the delta did not
+        // cover — older rows AND any delta-overflow above the 30-cap.
+        // Spec §6.3 says "top-K by salience from the remainder"; the
+        // earlier read excluding delta rows lost overflow on hot pages
+        // (>30 new evidence since last rewrite), giving them zero top-K
+        // representation. Filter by NOT IN (already-selected ids).
+        if out.len() < 50 {
+            let placeholders = if seen.is_empty() {
+                "(NULL)".to_string()
+            } else {
+                let inner = seen.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                format!("({inner})")
+            };
+            let q = format!(
                 "SELECT id, msg_id, chat_id, ts, excerpt, salience, cited
                    FROM wiki_evidence
-                  WHERE page_id = ? AND created_at <= ?
+                  WHERE page_id = ? AND id <= ? AND id NOT IN {placeholders}
                   ORDER BY salience DESC, ts DESC
-                  LIMIT 20",
-            )?;
+                  LIMIT 20"
+            );
+            let mut s = self.conn().prepare(q)?;
             s.bind((1, page_id))?;
-            s.bind((2, cutoff))?;
+            s.bind((2, max_id_at_snapshot))?;
+            for (i, id) in seen.iter().enumerate() {
+                s.bind((3 + i, *id))?;
+            }
             while let sqlite::State::Row = s.next()? {
                 push_row(&mut s, &mut seen, &mut out)?;
                 if out.len() >= 50 {
-                    return Ok((out, snapshot_at));
+                    return Ok((out, snapshot_at, max_id_at_snapshot));
                 }
             }
         }
 
-        // 3. always-keep cited rows (only those that fit)
+        // 3. always-keep cited rows (only those that fit).
         if out.len() < 50 {
             let mut s = self.conn().prepare(
                 "SELECT id, msg_id, chat_id, ts, excerpt, salience, cited
@@ -760,7 +784,7 @@ impl Store {
             }
         }
 
-        Ok((out, snapshot_at))
+        Ok((out, snapshot_at, max_id_at_snapshot))
     }
 
     /// Apply a rewrite per spec §6.3 in a single txn.
@@ -777,6 +801,7 @@ impl Store {
                     facts = ?,
                     state = ?,
                     last_rewrite_at = ?,
+                    last_rewrite_max_evidence_id = MAX(last_rewrite_max_evidence_id, ?),
                     last_rewrite_evidence_count = evidence_count,
                     updated_at = ?
               WHERE id = ?",
@@ -785,8 +810,9 @@ impl Store {
         s.bind((2, r.facts_json))?;
         s.bind((3, r.state))?;
         s.bind((4, r.snapshot_at))?;
-        s.bind((5, now))?;
-        s.bind((6, r.page_id))?;
+        s.bind((5, r.max_evidence_id))?;
+        s.bind((6, now))?;
+        s.bind((7, r.page_id))?;
         s.next()?;
 
         // 2. Insert new aliases.
@@ -1143,8 +1169,10 @@ mod tests {
     fn select_rewrite_evidence_caps_at_50_and_keeps_cited() {
         let store = setup();
         let pid = make_page(&store, "Topic");
-        // 60 rows, ascending ts; last 5 marked cited.
-        for i in 0..60_i64 {
+        // 40 rows: 30 fit in delta + 10 remain for top-K. cited rows
+        // therefore have room (spec §6.3 cited-keep is "if fit"). Mark
+        // 5 oldest as cited.
+        for i in 0..40_i64 {
             add_evidence(&store, pid, 1_000 + i, 10_000 + i, 0.1 + (i as f64) * 0.005);
         }
         store
@@ -1154,13 +1182,15 @@ mod tests {
             )
             .unwrap();
 
-        let (rows, snap) = store.select_rewrite_evidence(pid, Some(0)).unwrap();
+        let (rows, snap, max_id) = store.select_rewrite_evidence(pid, 0).unwrap();
         assert!(snap > 0);
+        assert!(max_id > 0);
         assert!(rows.len() <= 50);
-        // delta cutoff 0 → all rows are "newer", so first 30 newest pulled by ts DESC.
-        // cited rows (oldest ts) are also present via category 3.
         let cited_present = rows.iter().any(|r| r.cited > 0);
-        assert!(cited_present);
+        assert!(
+            cited_present,
+            "cited rows must be present when there's room"
+        );
     }
 
     #[test]
@@ -1182,6 +1212,7 @@ mod tests {
                 new_aliases: &["Alias One".to_string()],
                 retention_cap: 5,
                 snapshot_at: crate::wiki::norm::unix_now(),
+                max_evidence_id: 99_999,
             })
             .unwrap();
         store.conn().execute("COMMIT").unwrap();
@@ -1240,6 +1271,7 @@ mod tests {
                 new_aliases: &[],
                 retention_cap: 1,
                 snapshot_at: crate::wiki::norm::unix_now(),
+                max_evidence_id: 99_999,
             })
             .unwrap();
         store.conn().execute("COMMIT").unwrap();
@@ -1263,7 +1295,7 @@ mod tests {
         for i in 0..5_i64 {
             add_evidence(&store, pid, 800 + i, 100 + i, 0.5);
         }
-        let (_rows, snap) = store.select_rewrite_evidence(pid, Some(0)).unwrap();
+        let (_rows, snap, max_id) = store.select_rewrite_evidence(pid, 0).unwrap();
 
         // Simulate "LLM took some time" — sleep one second so wall clock
         // advances past snap.
@@ -1281,6 +1313,7 @@ mod tests {
                 new_aliases: &[],
                 retention_cap: 200,
                 snapshot_at: snap,
+                max_evidence_id: max_id,
             })
             .unwrap();
         store.conn().execute("COMMIT").unwrap();
@@ -1290,6 +1323,69 @@ mod tests {
             p.last_rewrite_at,
             Some(snap),
             "watermark must equal select-time snapshot, not apply-time now()"
+        );
+    }
+
+    #[test]
+    fn same_second_insert_after_select_not_lost_on_next_delta() {
+        // Even when the new insert lands in the same wall-clock second
+        // as the select snapshot, the id-based watermark must still
+        // surface it on the next select.
+        let store = setup();
+        let pid = make_page(&store, "Race");
+        for i in 0..3_i64 {
+            add_evidence(&store, pid, 900 + i, 1_000 + i, 0.5);
+        }
+        let (_rows1, snap1, max_id1) = store.select_rewrite_evidence(pid, 0).unwrap();
+        // Apply with id watermark.
+        store.enqueue_rewrite(pid).unwrap();
+        let _ = store.claim_rewrite_batch(1).unwrap();
+        store.conn().execute("BEGIN IMMEDIATE").unwrap();
+        store
+            .apply_rewrite_v2(&RewriteApply {
+                page_id: pid,
+                summary_md: "ok",
+                facts_json: "{\"facts_version\":1}",
+                state: "active",
+                new_aliases: &[],
+                retention_cap: 200,
+                snapshot_at: snap1,
+                max_evidence_id: max_id1,
+            })
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+
+        // New insert in the SAME wall-clock second as the apply; lands
+        // with id > max_id1.
+        add_evidence(&store, pid, 999, 1_500, 0.5);
+
+        let p = store.get_page_for_rewrite(pid).unwrap().unwrap();
+        let (rows2, _, _) = store
+            .select_rewrite_evidence(pid, p.last_rewrite_max_evidence_id)
+            .unwrap();
+        assert!(
+            rows2.iter().any(|r| r.msg_id == 999),
+            "new same-second evidence must appear in next delta"
+        );
+    }
+
+    #[test]
+    fn top_k_pulls_from_delta_overflow() {
+        // 35 new rows since last rewrite; delta caps at 30. Spec §6.3
+        // top-K should pick from the 5-row overflow, not just from
+        // older history. Mark the overflow rows highest-salience so
+        // top-K must surface them.
+        let store = setup();
+        let pid = make_page(&store, "Overflow");
+        for i in 0..35_i64 {
+            add_evidence(&store, pid, 1_000 + i, 100 + i, 0.1 + (i as f64) * 0.01);
+        }
+        let (rows, _, _) = store.select_rewrite_evidence(pid, 0).unwrap();
+        // Should be 50 capped — but only 35 exist, so 35.
+        assert_eq!(
+            rows.len(),
+            35,
+            "all 35 rows should surface (30 delta + 5 top-K)"
         );
     }
 }

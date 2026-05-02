@@ -676,9 +676,9 @@ async fn process_rewrite_one<E: EventEmitter>(
 
     let evidence_result = {
         let s = lock(store);
-        s.select_rewrite_evidence(item.page_id, page.last_rewrite_at)
+        s.select_rewrite_evidence(item.page_id, page.last_rewrite_max_evidence_id)
     };
-    let (evidence, snapshot_at) = match evidence_result {
+    let (evidence, snapshot_at, max_evidence_id) = match evidence_result {
         Ok(v) => v,
         Err(e) => {
             // DB error reading evidence — retry, do NOT mark done (was
@@ -755,6 +755,7 @@ async fn process_rewrite_one<E: EventEmitter>(
         new_aliases: &validated.new_aliases,
         retention_cap,
         snapshot_at,
+        max_evidence_id,
     });
     match apply {
         Ok(()) => {

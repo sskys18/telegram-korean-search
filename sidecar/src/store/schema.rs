@@ -147,6 +147,7 @@ fn migrate_to_v9(conn: &Connection) -> Result<(), sqlite::Error> {
                 facts_version               INTEGER NOT NULL DEFAULT 1,
                 evidence_count              INTEGER NOT NULL DEFAULT 0,
                 last_rewrite_evidence_count INTEGER NOT NULL DEFAULT 0,
+                last_rewrite_max_evidence_id INTEGER NOT NULL DEFAULT 0,
                 last_evidence_at            INTEGER,
                 last_rewrite_at             INTEGER,
                 created_at                  INTEGER NOT NULL,
@@ -304,6 +305,17 @@ fn migrate_to_v9(conn: &Connection) -> Result<(), sqlite::Error> {
                 tokenize='trigram case_sensitive 0'
             )",
         )?;
+
+        // Phase 7 add: monotonic id watermark for rewrite delta
+        // selection. Time-based watermark loses same-second insertions
+        // when classify lands new evidence after the rewrite's select
+        // snapshot but before its apply. Idempotent for existing v9 DBs.
+        if !column_exists(conn, "wiki_pages_v2", "last_rewrite_max_evidence_id")? {
+            conn.execute(
+                "ALTER TABLE wiki_pages_v2
+                    ADD COLUMN last_rewrite_max_evidence_id INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
 
         seed_wiki_settings(conn)?;
 
