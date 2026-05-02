@@ -150,6 +150,19 @@ pub struct WikiDigest {
     pub hot_topics: Vec<WikiTopicSummary>,
 }
 
+/// Phase 9 digest row (spec §6.5). One per (chat, page) pair where
+/// the post-`wiki_last_open` evidence count crossed the threshold.
+#[derive(uniffi::Record, Clone)]
+pub struct WikiDigestRow {
+    pub chat_id: i64,
+    pub page_id: i64,
+    pub kind: String,
+    pub state: String,
+    pub title: String,
+    pub n: i64,
+    pub last_ts: i64,
+}
+
 #[derive(uniffi::Record, Clone)]
 pub struct WikiCategory {
     pub id: i64,
@@ -328,6 +341,37 @@ impl Seoyu {
             article_md: page.as_ref().map(|p| p.content_en.clone()),
             article_md_ko: page.as_ref().map(|p| p.content_ko.clone()),
         }))
+    }
+
+    /// Phase 9 digest (spec §6.5). Per-chat list of pages with ≥3 new
+    /// evidence rows since `wiki_last_open[chat_id]`. Hidden + resolved
+    /// pages are filtered out. Sorted by chat then by count then by
+    /// recency. Pure SQL, no LLM call.
+    pub fn wiki_digest_rows(&self, limit: u32) -> Result<Vec<WikiDigestRow>, SeoyuError> {
+        let store = self.lock_store();
+        let limit = if limit == 0 { 200 } else { limit as i64 };
+        let rows = store.list_digest_rows(limit)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| WikiDigestRow {
+                chat_id: r.chat_id,
+                page_id: r.page_id,
+                kind: r.kind,
+                state: r.state,
+                title: r.title,
+                n: r.n,
+                last_ts: r.last_ts,
+            })
+            .collect())
+    }
+
+    /// Advance the per-chat digest cursor. Spec §6.5: called only on
+    /// explicit "mark read" or chat-open, not on panel-open. The store
+    /// upsert is MAX-monotonic so an older `at` value never rewinds.
+    pub fn wiki_mark_chat_read(&self, chat_id: i64, at: i64) -> Result<(), SeoyuError> {
+        let store = self.lock_store();
+        store.mark_chat_read(chat_id, at)?;
+        Ok(())
     }
 
     /// Search the wiki FTS5 index (Korean + English article text).
