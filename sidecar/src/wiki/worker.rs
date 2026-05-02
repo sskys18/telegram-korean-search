@@ -1,25 +1,21 @@
 //! Wiki classification worker.
 //!
-//! Spawns a background thread that pulls items off the classify
-//! queue, asks the LLM to place each message on a topic, and writes
-//! the results back into the wiki tables. Progress is surfaced over
-//! an [`EventEmitter`] so the IPC layer can forward it to the Swift
-//! shell.
-//!
-//! The worker replaces the archived Tauri-coupled implementation
-//! (see `archive/tauri-v0`). The shape is preserved so the
-//! classification logic is unchanged; only the progress plumbing and
-//! state handle differ.
+//! Spawns a background thread that pulls items off the v2 classify
+//! queue, asks the LLM to assign messages to v2 wiki pages, and writes
+//! evidence back into the v2 wiki tables.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::store::wiki_queue::QueueStats;
-use crate::store::wiki_topic::{normalize_topic_title, NewTopic, TopicMessageLink};
+use crate::store::wiki_page::{CandidatePage, NewEvidenceV2, PageRefV2};
+use crate::store::wiki_queue::{ClassifyV2Item, QueueStats};
 use crate::store::Store;
-use crate::wiki::llm::{classify_batch_size, ClassifiedTopic, LlmClient, MessageForClassify};
-use crate::wiki::trending::calculate_trending_score;
+use crate::wiki::llm::{
+    validate_v2_assignment, LlmClient, V2Assignment, V2ExistingPage, V2Input, V2InputMessage,
+    V2PageRef, V2Policies,
+};
+use crate::wiki::norm::title_norm;
 
 /// Pluggable progress channel. The sidecar's IPC server implements
 /// this on top of its `ServerEvent` enum. Tests can use the built-in
@@ -50,15 +46,15 @@ impl EventEmitter for LogEmitter {
     fn wiki_progress(&self, processed: u64, pending: u64, total: u64) {
         log::info!("wiki progress: processed={processed} pending={pending} total={total}");
     }
+
     fn wiki_error(&self, message: &str, recoverable: bool) {
         log::warn!("wiki error (recoverable={recoverable}): {message}");
     }
+
     fn wiki_stopped(&self, reason: &str) {
         log::info!("wiki stopped: {reason}");
     }
 }
-
-use std::sync::atomic::AtomicI64;
 
 /// Emitter that forwards events to a foreign (Swift) observer. Falls
 /// back to log output when no observer is set. Debounces
@@ -111,6 +107,7 @@ impl EventEmitter for ForeignEmitter {
             log::info!("wiki progress: processed={processed} pending={pending} total={total}");
         }
     }
+
     fn wiki_error(&self, message: &str, recoverable: bool) {
         if let Some(o) = self.observer() {
             o.on_error(message.to_string(), recoverable);
@@ -118,9 +115,11 @@ impl EventEmitter for ForeignEmitter {
             log::warn!("wiki error (recoverable={recoverable}): {message}");
         }
     }
+
     fn wiki_stopped(&self, reason: &str) {
         log::info!("wiki stopped: {reason}");
     }
+
     fn wiki_topics_changed(&self) {
         self.topics_changed();
     }
@@ -189,37 +188,32 @@ async fn run_worker<E>(
     E: EventEmitter,
 {
     let llm = LlmClient::new();
-    let batch_size = classify_batch_size();
-    let mut processed_count: usize = 0;
+    let (batch_size, max_attempts) = {
+        let s = lock(&store);
+        (
+            s.get_wiki_setting_i64("classify_batch_size", 20).max(1) as usize,
+            s.get_wiki_setting_i64("max_classify_attempts", 3),
+        )
+    };
 
-    // Recover any items a previous crash left marked as
-    // 'processing' so nothing is stranded.
     {
-        let store = lock(&store);
-        match store.recover_stale_claims() {
-            Ok(n) if n > 0 => {
-                log::info!("wiki worker: recovered {n} stale queue items");
-            }
-            Err(e) => log::warn!("wiki worker: recover_stale_claims failed: {e}"),
+        let s = lock(&store);
+        match s.recover_stale_v2_claims() {
+            Ok(n) if n > 0 => log::info!("wiki worker(v2): recovered {n} stale claims"),
+            Err(e) => log::warn!("wiki worker(v2): recover_stale_v2_claims failed: {e}"),
             _ => {}
         }
     }
 
-    let mut total_channels = {
-        let store = lock(&store);
-        store.get_total_active_channels().unwrap_or(1)
-    };
-
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            log::info!("wiki worker: shutdown requested");
             emitter.wiki_stopped("shutdown");
             break;
         }
 
-        let items = {
-            let store = lock(&store);
-            store.dequeue_classify_batch(batch_size).unwrap_or_default()
+        let items: Vec<ClassifyV2Item> = {
+            let s = lock(&store);
+            s.claim_classify_v2_batch(batch_size).unwrap_or_default()
         };
 
         if items.is_empty() {
@@ -230,162 +224,326 @@ async fn run_worker<E>(
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             wake.store(false, Ordering::Relaxed);
-            emit_progress(&emitter, &store);
+            emit_progress_v2(&emitter, &store);
             continue;
         }
 
-        // Read message text + chat titles for each queue item,
-        // filtering out empty messages.
-        let mut batch_messages: Vec<MessageForClassify> = Vec::new();
-        let mut item_map: Vec<(i64, i64, i64)> = Vec::new();
-
-        for (i, item) in items.iter().enumerate() {
-            let (msg_data, chat_title) = {
-                let store = lock(&store);
-                let msg = store
-                    .get_message(item.chat_id, item.message_id)
-                    .ok()
-                    .flatten();
-                let title = store
-                    .get_chat(item.chat_id)
-                    .ok()
-                    .flatten()
-                    .map(|c| c.title)
-                    .unwrap_or_else(|| "Unknown".to_string());
-                (msg, title)
-            };
-
-            let msg = match msg_data {
-                Some(m) if !m.text_plain.trim().is_empty() => m,
-                _ => {
-                    let store = lock(&store);
-                    let _ = store.mark_queue_skipped(item.chat_id, item.message_id);
-                    continue;
-                }
-            };
-
-            batch_messages.push(MessageForClassify {
-                index: i,
-                chat_title,
-                timestamp: msg.timestamp,
-                text: msg.text_plain.clone(),
-            });
-            item_map.push((item.chat_id, item.message_id, msg.timestamp));
+        struct Loaded {
+            item: ClassifyV2Item,
+            chat_title: String,
+            text: String,
+            ts: i64,
+            sender_id: i64,
         }
 
-        if batch_messages.is_empty() {
-            emit_progress(&emitter, &store);
-            continue;
-        }
-
-        log::info!(
-            "wiki worker: classifying batch of {} messages",
-            batch_messages.len()
-        );
-
-        let (existing_categories, existing_topics) = {
-            let store = lock(&store);
-            let cats: Vec<String> = store
-                .get_all_categories()
-                .unwrap_or_default()
+        let loaded: Vec<Loaded> = {
+            let s = lock(&store);
+            items
                 .into_iter()
-                .map(|c| c.name)
-                .collect();
-            let topics: Vec<String> = store
-                .get_trending_topics(80, 0, None)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| t.title)
-                .collect();
-            (cats, topics)
+                .filter_map(|item| {
+                    let Some(m) = s.get_message(item.chat_id, item.msg_id).ok().flatten() else {
+                        let _ = s.mark_classify_v2_done(item.msg_id, item.chat_id);
+                        return None;
+                    };
+                    if m.text_plain.trim().is_empty() {
+                        let _ = s.mark_classify_v2_done(item.msg_id, item.chat_id);
+                        return None;
+                    }
+                    let chat_title = s
+                        .get_chat(item.chat_id)
+                        .ok()
+                        .flatten()
+                        .map(|c| c.title)
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    Some(Loaded {
+                        item,
+                        chat_title,
+                        text: m.text_plain,
+                        ts: m.timestamp,
+                        sender_id: m.sender_id,
+                    })
+                })
+                .collect()
         };
 
-        let batch_result = llm
-            .classify_batch(&batch_messages, &existing_categories, &existing_topics)
-            .await;
+        if loaded.is_empty() {
+            emit_progress_v2(&emitter, &store);
+            continue;
+        }
 
-        match batch_result {
-            Ok(results) => {
-                for (index, response) in &results {
-                    if *index >= item_map.len() {
-                        continue;
-                    }
-                    let (chat_id, message_id, timestamp) = item_map[*index];
-                    let store = lock(&store);
-                    if response.skip || response.topics.is_empty() {
-                        let _ = store.mark_queue_skipped(chat_id, message_id);
-                    } else {
-                        for classified in &response.topics {
-                            if let Err(e) = process_classified_topic(
-                                &store, classified, chat_id, message_id, timestamp,
-                            ) {
-                                log::warn!(
-                                    "wiki worker: failed to process topic '{}': {e}",
-                                    classified.topic
-                                );
-                            }
-                        }
-                        let _ = store.mark_queue_done(chat_id, message_id);
-                    }
+        let mut tokens = Vec::new();
+        let mut fts_terms = Vec::new();
+        for l in &loaded {
+            tokens.extend(candidate_tokens_from_text(&l.text));
+            for word in l.text.split_whitespace().take(8) {
+                if let Some(term) = fts_term(word) {
+                    fts_terms.push(term);
                 }
-
-                // Anything the LLM didn't return for goes back to the
-                // queue as failed so it gets retried next round.
-                let returned: std::collections::HashSet<usize> =
-                    results.iter().map(|(idx, _)| *idx).collect();
-                {
-                    let store = lock(&store);
-                    for (i, &(chat_id, message_id, _)) in item_map.iter().enumerate() {
-                        if !returned.contains(&i) {
-                            let _ = store.mark_queue_failed(
-                                chat_id,
-                                message_id,
-                                "missing from batch response",
-                            );
-                        }
-                    }
-                }
-
-                processed_count += results.len();
-                emitter.wiki_topics_changed();
             }
+        }
+        tokens.sort();
+        tokens.dedup();
+        fts_terms.sort();
+        fts_terms.dedup();
+        let fts_query = fts_terms.join(" OR ");
+
+        let candidates: Vec<CandidatePage> = {
+            let s = lock(&store);
+            s.classify_candidates_v2(&tokens, &fts_query, 30)
+                .unwrap_or_default()
+        };
+
+        let existing: Vec<V2ExistingPage> = candidates
+            .iter()
+            .map(|c| V2ExistingPage {
+                id: c.id,
+                kind: c.kind.as_str(),
+                title: c.title.as_str(),
+                aliases: c.aliases.as_slice(),
+            })
+            .collect();
+        let candidate_ids: std::collections::HashSet<i64> =
+            candidates.iter().map(|c| c.id).collect();
+
+        let messages_in: Vec<V2InputMessage> = loaded
+            .iter()
+            .map(|l| V2InputMessage {
+                msg_id: l.item.msg_id,
+                chat_id: l.item.chat_id,
+                chat_title: l.chat_title.as_str(),
+                sender: "",
+                ts: l.ts,
+                text: l.text.as_str(),
+                hint_successor_for: l.item.hint_page_id,
+            })
+            .collect();
+
+        let policies = V2Policies {
+            max_pages_per_message: 3,
+            skip_if_salience_below: 0.2,
+            may_propose_new: true,
+        };
+        let input = V2Input {
+            existing_pages: &existing,
+            messages: &messages_in,
+            policies: &policies,
+        };
+
+        let v2_out = match llm.classify_batch_v2(&input).await {
+            Ok(o) => o,
             Err(e) => {
-                log::warn!("wiki worker: batch classification failed: {e}");
-                {
-                    let store = lock(&store);
-                    for &(chat_id, message_id, _) in &item_map {
-                        let _ = store.mark_queue_failed(chat_id, message_id, &e.to_string());
-                    }
+                log::warn!("wiki worker(v2): batch failed: {e}");
+                let s = lock(&store);
+                for l in &loaded {
+                    let _ = s.mark_classify_v2_retry(
+                        l.item.msg_id,
+                        l.item.chat_id,
+                        &e.to_string(),
+                        max_attempts,
+                    );
                 }
                 emitter.wiki_error(&e.to_string(), true);
+                emit_progress_v2(&emitter, &store);
+                continue;
+            }
+        };
+
+        let mut by_msg: std::collections::HashMap<i64, Vec<V2Assignment>> =
+            std::collections::HashMap::new();
+        for ma in v2_out.assignments {
+            by_msg.entry(ma.msg_id).or_default().extend(ma.assignments);
+        }
+
+        let mut applied = 0usize;
+        for l in &loaded {
+            let assignments = by_msg.remove(&l.item.msg_id).unwrap_or_default();
+            let s = lock(&store);
+            match apply_classify_v2(
+                &s,
+                ApplyClassifyV2 {
+                    item: &l.item,
+                    msg_text: &l.text,
+                    ts: l.ts,
+                    sender_id: l.sender_id,
+                    assignments: &assignments,
+                    candidate_ids: &candidate_ids,
+                    max_attempts,
+                },
+            ) {
+                Ok(true) => applied += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    log::warn!(
+                        "wiki worker(v2): apply failed msg={} chat={}: {e}",
+                        l.item.msg_id,
+                        l.item.chat_id
+                    );
+                    let _ = s.mark_classify_v2_retry(
+                        l.item.msg_id,
+                        l.item.chat_id,
+                        &e.to_string(),
+                        max_attempts,
+                    );
+                }
             }
         }
 
-        if processed_count.is_multiple_of(100) {
-            let store = lock(&store);
-            total_channels = store.get_total_active_channels().unwrap_or(1);
-            let recovered = store.recover_stale_claims().unwrap_or(0);
-            if recovered > 0 {
-                log::info!("wiki worker: recovered {recovered} stale claims");
-            }
+        if applied > 0 {
+            emitter.wiki_topics_changed();
         }
-
-        if processed_count.is_multiple_of(50) {
-            recalculate_trending(&store, total_channels);
-        }
-
-        emit_progress(&emitter, &store);
-
+        emit_progress_v2(&emitter, &store);
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-
-    recalculate_trending(&store, total_channels);
 }
 
-fn emit_progress<E: EventEmitter>(emitter: &Arc<E>, store: &Arc<Mutex<Store>>) {
-    let stats: QueueStats = {
-        let store = lock(store);
-        store.get_queue_stats().unwrap_or(QueueStats {
+fn candidate_tokens_from_text(text: &str) -> Vec<String> {
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(title_norm)
+        .filter(|w| {
+            let n = w.chars().count();
+            (2..=40).contains(&n)
+        })
+        .collect();
+    let mut out = Vec::new();
+    for width in 1..=4 {
+        for window in words.windows(width) {
+            let token = window.join(" ");
+            let n = token.chars().count();
+            if (2..=80).contains(&n) {
+                out.push(token);
+            }
+        }
+    }
+    out
+}
+
+fn fts_term(word: &str) -> Option<String> {
+    let cleaned: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
+    if cleaned.chars().count() < 3 {
+        return None;
+    }
+    Some(format!("\"{}\"", cleaned.replace('"', "\"\"")))
+}
+
+struct ApplyClassifyV2<'a> {
+    item: &'a ClassifyV2Item,
+    msg_text: &'a str,
+    ts: i64,
+    sender_id: i64,
+    assignments: &'a [V2Assignment],
+    candidate_ids: &'a std::collections::HashSet<i64>,
+    max_attempts: i64,
+}
+
+/// Apply per-message classify result inside one transaction. Returns
+/// `Ok(false)` when validation failed and the row was retried.
+fn apply_classify_v2(store: &Store, input: ApplyClassifyV2<'_>) -> Result<bool, sqlite::Error> {
+    if input.assignments.is_empty() {
+        store.mark_classify_v2_done(input.item.msg_id, input.item.chat_id)?;
+        return Ok(true);
+    }
+
+    let mut validated = Vec::with_capacity(input.assignments.len());
+    for a in input.assignments {
+        let cleaned = match validate_v2_assignment(a, input.msg_text, input.candidate_ids) {
+            Ok(s) => s,
+            Err(e) => {
+                store.mark_classify_v2_retry(
+                    input.item.msg_id,
+                    input.item.chat_id,
+                    &e.to_string(),
+                    input.max_attempts,
+                )?;
+                return Ok(false);
+            }
+        };
+        validated.push((a, cleaned));
+    }
+
+    store.conn().execute("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<bool, sqlite::Error> {
+        let mut needs_successor = None;
+        let mut any_succeeded = false;
+
+        for (a, excerpt) in &validated {
+            let page_ref: PageRefV2 = match &a.page_ref {
+                V2PageRef::Existing { existing_id } => {
+                    let mut st = store
+                        .conn()
+                        .prepare("SELECT state, kind FROM wiki_pages_v2 WHERE id = ?")?;
+                    st.bind((1, *existing_id))?;
+                    if let sqlite::State::Row = st.next()? {
+                        PageRefV2 {
+                            id: *existing_id,
+                            state: st.read::<String, _>(0)?,
+                            kind: st.read::<String, _>(1)?,
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                V2PageRef::New { new } => {
+                    store.dedup_or_insert_page_v2(&new.kind, &new.title, &new.aliases)?
+                }
+            };
+
+            match page_ref.state.as_str() {
+                "frozen" | "hidden" => continue,
+                "resolved" => {
+                    needs_successor.get_or_insert(page_ref.id);
+                    continue;
+                }
+                _ => {}
+            }
+
+            let salience = a.salience.clamp(0.0, 1.0);
+            if store
+                .insert_evidence_v2(&NewEvidenceV2 {
+                    page_id: page_ref.id,
+                    msg_id: input.item.msg_id,
+                    chat_id: input.item.chat_id,
+                    sender_id: input.sender_id,
+                    ts: input.ts,
+                    excerpt,
+                    salience,
+                })?
+                .is_some()
+            {
+                any_succeeded = true;
+            }
+        }
+
+        if let Some(hint) = needs_successor {
+            if !any_succeeded {
+                store.mark_classify_v2_successor_needed(
+                    input.item.msg_id,
+                    input.item.chat_id,
+                    hint,
+                )?;
+                return Ok(true);
+            }
+        }
+        store.mark_classify_v2_done(input.item.msg_id, input.item.chat_id)?;
+        Ok(true)
+    })();
+
+    match result {
+        Ok(v) => {
+            store.conn().execute("COMMIT")?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = store.conn().execute("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+fn emit_progress_v2<E: EventEmitter>(emitter: &Arc<E>, store: &Arc<Mutex<Store>>) {
+    let stats = {
+        let s = lock(store);
+        s.get_classify_v2_stats().unwrap_or(QueueStats {
             pending: 0,
             processing: 0,
             done: 0,
@@ -394,105 +552,160 @@ fn emit_progress<E: EventEmitter>(emitter: &Arc<E>, store: &Arc<Mutex<Store>>) {
         })
     };
     let nn = |n: i64| n.max(0) as u64;
-    emitter.wiki_progress(
-        nn(stats.done + stats.skipped),
-        nn(stats.pending),
-        nn(stats.done + stats.skipped + stats.pending + stats.failed),
-    );
+    let total = stats.done + stats.pending + stats.failed + stats.processing;
+    emitter.wiki_progress(nn(stats.done), nn(stats.pending), nn(total));
 }
 
 fn lock(store: &Arc<Mutex<Store>>) -> std::sync::MutexGuard<'_, Store> {
     store.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Apply one LLM topic assignment to the store. Extracted so it can
-/// be called both by the worker and by potential replay tools.
-pub fn process_classified_topic(
-    store: &Store,
-    classified: &ClassifiedTopic,
-    chat_id: i64,
-    message_id: i64,
-    message_timestamp: i64,
-) -> Result<(), sqlite::Error> {
-    let (category_id, canonical_category) = store
-        .resolve_category_with_name(&classified.category, classified.category_ko.as_deref())?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::message::MessageRow;
+    use crate::wiki::llm::{V2NewPage, V2PageRef};
 
-    let topic_id = match store.find_topic_by_alias(&classified.topic)? {
-        Some(id) => {
-            if let Some(ref ko) = classified.topic_ko {
-                store.set_title_ko_if_absent(id, ko)?;
-            }
-            let alias = normalize_topic_title(&classified.topic);
-            store.add_topic_alias(id, &alias)?;
-            id
-        }
-        None => {
-            if let Some(fuzzy_id) = store.find_topic_fuzzy(&classified.topic)? {
-                if let Some(ref ko) = classified.topic_ko {
-                    store.set_title_ko_if_absent(fuzzy_id, ko)?;
-                }
-                let alias = normalize_topic_title(&classified.topic);
-                store.add_topic_alias(fuzzy_id, &alias)?;
-                fuzzy_id
-            } else {
-                let new_topic = NewTopic {
-                    title: classified.topic.clone(),
-                    title_ko: classified.topic_ko.clone(),
-                    category_id,
-                };
-                store.create_topic(&new_topic)?
-            }
-        }
-    };
-
-    let link = TopicMessageLink {
-        topic_id,
-        chat_id,
-        message_id,
-        relevance: classified.relevance,
-        assigned_category: canonical_category,
-    };
-    store.link_message_to_topic(&link)?;
-    store.record_topic_stat(topic_id, message_timestamp, chat_id)?;
-
-    if let Some(new_cat_id) = store.check_category_reconciliation(topic_id)? {
-        store.update_topic_category(topic_id, new_cat_id)?;
+    fn store_with_one_msg() -> Store {
+        let s = Store::open_in_memory().unwrap();
+        s.conn()
+            .execute(
+                "INSERT INTO chats (chat_id, title, chat_type) VALUES (1, 'Crypto', 'channel')",
+            )
+            .unwrap();
+        s.insert_messages_batch(&[MessageRow {
+            message_id: 100,
+            chat_id: 1,
+            timestamp: 1_700_000_000,
+            text_plain: "Bitcoin ETF approved by SEC today".into(),
+            text_stripped: "BitcoinETFapprovedbySECtoday".into(),
+            link: None,
+            sender_id: 42,
+        }])
+        .unwrap();
+        s.conn()
+            .execute("DELETE FROM wiki_classify_queue_v2")
+            .unwrap();
+        s
     }
 
-    Ok(())
-}
+    fn fake_item() -> ClassifyV2Item {
+        ClassifyV2Item {
+            msg_id: 100,
+            chat_id: 1,
+            attempts: 0,
+            hint: None,
+            hint_page_id: None,
+            text_hash: vec![0; 16],
+        }
+    }
 
-fn recalculate_trending(store: &Arc<Mutex<Store>>, total_channels: i64) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    fn insert_processing_row(s: &Store) {
+        s.conn()
+            .execute(
+                "INSERT INTO wiki_classify_queue_v2
+              (msg_id, chat_id, status, attempts, text_hash, enqueued_at, next_attempt_at)
+             VALUES (100, 1, 'processing', 1, X'00', 0, 0)",
+            )
+            .unwrap();
+    }
 
-    let topic_ids = {
-        let store = lock(store);
-        store.get_active_topic_ids(30).unwrap_or_default()
-    };
+    #[test]
+    fn apply_v2_empty_assignments_marks_done() {
+        let s = store_with_one_msg();
+        insert_processing_row(&s);
+        let cset = std::collections::HashSet::new();
+        let item = fake_item();
+        apply_classify_v2(
+            &s,
+            ApplyClassifyV2 {
+                item: &item,
+                msg_text: "Bitcoin ETF approved by SEC today",
+                ts: 0,
+                sender_id: 42,
+                assignments: &[],
+                candidate_ids: &cset,
+                max_attempts: 3,
+            },
+        )
+        .unwrap();
+        let stats = s.get_classify_v2_stats().unwrap();
+        assert_eq!(stats.done, 1);
+    }
 
-    for topic_id in topic_ids {
-        let store = lock(store);
-        let topic = match store.get_topic(topic_id) {
-            Ok(Some(t)) => t,
-            _ => continue,
+    #[test]
+    fn apply_v2_new_page_creates_evidence() {
+        let s = store_with_one_msg();
+        insert_processing_row(&s);
+        let cset = std::collections::HashSet::new();
+        let a = V2Assignment {
+            page_ref: V2PageRef::New {
+                new: V2NewPage {
+                    kind: "topic".into(),
+                    title: "Bitcoin ETF".into(),
+                    aliases: vec!["BTC ETF".into()],
+                },
+            },
+            excerpt: "Bitcoin ETF approved".into(),
+            salience: 0.9,
         };
-        let msgs_24h = store.get_topic_msg_count_days(topic_id, 1).unwrap_or(0);
-        let msgs_7d = store.get_topic_msg_count_days(topic_id, 7).unwrap_or(0);
-        let channels_7d = store.get_topic_channel_count_days(topic_id, 7).unwrap_or(0);
+        let item = fake_item();
+        apply_classify_v2(
+            &s,
+            ApplyClassifyV2 {
+                item: &item,
+                msg_text: "Bitcoin ETF approved by SEC today",
+                ts: 1_700_000_000,
+                sender_id: 42,
+                assignments: std::slice::from_ref(&a),
+                candidate_ids: &cset,
+                max_attempts: 3,
+            },
+        )
+        .unwrap();
 
-        let score = calculate_trending_score(
-            topic.message_count,
-            topic.last_seen_at.unwrap_or(0),
-            msgs_24h,
-            msgs_7d,
-            channels_7d,
-            total_channels,
-            now,
-        );
+        let mut q = s
+            .conn()
+            .prepare("SELECT COUNT(*) FROM wiki_evidence")
+            .unwrap();
+        q.next().unwrap();
+        assert_eq!(q.read::<i64, _>(0).unwrap(), 1);
+        let stats = s.get_classify_v2_stats().unwrap();
+        assert_eq!(stats.done, 1);
+    }
 
-        let _ = store.update_trending_score(topic_id, score);
+    #[test]
+    fn apply_v2_excerpt_not_in_text_retries() {
+        let s = store_with_one_msg();
+        insert_processing_row(&s);
+        let cset = std::collections::HashSet::new();
+        let a = V2Assignment {
+            page_ref: V2PageRef::New {
+                new: V2NewPage {
+                    kind: "topic".into(),
+                    title: "X".into(),
+                    aliases: vec![],
+                },
+            },
+            excerpt: "TOTALLY HALLUCINATED".into(),
+            salience: 0.5,
+        };
+        let item = fake_item();
+        apply_classify_v2(
+            &s,
+            ApplyClassifyV2 {
+                item: &item,
+                msg_text: "Bitcoin ETF approved by SEC today",
+                ts: 0,
+                sender_id: 42,
+                assignments: std::slice::from_ref(&a),
+                candidate_ids: &cset,
+                max_attempts: 3,
+            },
+        )
+        .unwrap();
+        let stats = s.get_classify_v2_stats().unwrap();
+        assert_eq!(stats.pending + stats.failed, 1);
+        assert_eq!(stats.done, 0);
     }
 }
