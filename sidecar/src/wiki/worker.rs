@@ -188,7 +188,7 @@ async fn run_worker<E>(
     E: EventEmitter,
 {
     let llm = LlmClient::new();
-    let (batch_size, max_attempts, max_rewrite_attempts, retention_cap) = {
+    let (batch_size, max_attempts, max_rewrite_attempts, retention_cap, rewrite_hour_cap) = {
         let s = lock(&store);
         (
             s.get_wiki_setting_i64("classify_batch_size", 20).max(1) as usize,
@@ -196,7 +196,31 @@ async fn run_worker<E>(
             s.get_wiki_setting_i64("max_rewrite_attempts", 3),
             s.get_wiki_setting_i64("retention_evidence_per_page", 200)
                 .max(1),
+            s.get_wiki_setting_i64("rewrite_per_hour_cap", 30).max(0),
         )
+    };
+    // Sliding window of recent successful-or-attempted rewrite timestamps
+    // (unix secs). Spec §5.2 caps codex calls; we count anything we'd have
+    // sent to the LLM, including retries. Pre-classify-batch and idle-loop
+    // sites both consult this before claiming.
+    let mut rewrite_window: std::collections::VecDeque<i64> = std::collections::VecDeque::new();
+    let rewrite_allowed = |window: &mut std::collections::VecDeque<i64>| -> bool {
+        if rewrite_hour_cap == 0 {
+            return false;
+        }
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+            - 3600;
+        while let Some(&t) = window.front() {
+            if t < cutoff {
+                window.pop_front();
+            } else {
+                break;
+            }
+        }
+        (window.len() as i64) < rewrite_hour_cap
     };
 
     {
@@ -225,14 +249,18 @@ async fn run_worker<E>(
         };
 
         if items.is_empty() {
-            // Idle classify queue → drain rewrites instead of sleeping.
-            let rewrites: Vec<RewriteQueueItem> = {
+            // Idle classify queue → drain rewrites instead of sleeping,
+            // gated by `rewrite_per_hour_cap` (spec §5.2).
+            let rewrites: Vec<RewriteQueueItem> = if rewrite_allowed(&mut rewrite_window) {
                 let s = lock(&store);
                 s.claim_rewrite_batch(1).unwrap_or_default()
+            } else {
+                Vec::new()
             };
             if !rewrites.is_empty() {
                 let mut applied = 0usize;
                 for item in &rewrites {
+                    rewrite_window.push_back(crate::wiki::norm::unix_now());
                     match process_rewrite_one(
                         &store,
                         &llm,
@@ -432,13 +460,17 @@ async fn run_worker<E>(
         }
 
         // Spec §9 weighted fair share: piggyback one rewrite per classify
-        // batch so rewrites can't starve when ingest is hot.
-        let rewrites: Vec<RewriteQueueItem> = {
+        // batch so rewrites can't starve when ingest is hot. Hourly cap
+        // (spec §5.2 `rewrite_per_hour_cap`) gates the claim.
+        let rewrites: Vec<RewriteQueueItem> = if rewrite_allowed(&mut rewrite_window) {
             let s = lock(&store);
             s.claim_rewrite_batch(1).unwrap_or_default()
+        } else {
+            Vec::new()
         };
         let mut rewrite_applied = 0usize;
         for item in &rewrites {
+            rewrite_window.push_back(crate::wiki::norm::unix_now());
             match process_rewrite_one(
                 &store,
                 &llm,
@@ -642,10 +674,23 @@ async fn process_rewrite_one<E: EventEmitter>(
         return Ok(false);
     }
 
-    let evidence = {
+    let evidence_result = {
         let s = lock(store);
         s.select_rewrite_evidence(item.page_id, page.last_rewrite_at)
-            .unwrap_or_default()
+    };
+    let evidence = match evidence_result {
+        Ok(v) => v,
+        Err(e) => {
+            // DB error reading evidence — retry, do NOT mark done (was
+            // silently dropping the page on transient SQL errors).
+            log::warn!(
+                "wiki rewrite: page={} select_rewrite_evidence failed: {e}",
+                item.page_id
+            );
+            let s = lock(store);
+            s.mark_rewrite_retry(item.page_id, &e.to_string(), max_attempts)?;
+            return Ok(false);
+        }
     };
     if evidence.is_empty() {
         // Nothing to summarize; close the queue row without pinging codex.

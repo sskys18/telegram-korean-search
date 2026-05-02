@@ -514,13 +514,31 @@ impl Store {
     }
 
     pub fn mark_rewrite_done(&self, page_id: i64) -> Result<(), sqlite::Error> {
+        // If a re-enqueue arrived while this row was processing,
+        // `enqueue_rewrite` left status='processing' (preserving the lease)
+        // but advanced enqueued_at. Detect that here so the new evidence
+        // doesn't get silently dropped: re-arm pending instead of done.
+        let now = crate::wiki::norm::unix_now();
         let mut s = self.conn().prepare(
             "UPDATE wiki_rewrite_queue
-                SET status = 'done', attempts = attempts + 1,
-                    claimed_at = NULL, last_error = NULL
+                SET claimed_at = NULL,
+                    last_error = NULL,
+                    status = CASE
+                        WHEN claimed_at IS NOT NULL AND enqueued_at > claimed_at THEN 'pending'
+                        ELSE 'done'
+                    END,
+                    next_attempt_at = CASE
+                        WHEN claimed_at IS NOT NULL AND enqueued_at > claimed_at THEN ?
+                        ELSE next_attempt_at
+                    END,
+                    attempts = CASE
+                        WHEN claimed_at IS NOT NULL AND enqueued_at > claimed_at THEN 0
+                        ELSE attempts + 1
+                    END
               WHERE page_id = ?",
         )?;
-        s.bind((1, page_id))?;
+        s.bind((1, now))?;
+        s.bind((2, page_id))?;
         s.next()?;
         Ok(())
     }
@@ -805,6 +823,51 @@ mod tests {
 
         let stats = store.get_rewrite_stats().unwrap();
         assert_eq!(stats.processing, 1);
+        assert_eq!(stats.pending, 0);
+    }
+
+    #[test]
+    fn rewrite_done_reenqueues_when_concurrent_enqueue_arrived() {
+        // Worker claims a row, classify path then re-enqueues during
+        // processing (preserving the lease), worker calls mark_rewrite_done.
+        // The new evidence MUST NOT be dropped — row should re-arm pending.
+        let store = setup_store_with_messages();
+        let pid = make_page(&store, "Reentrant");
+        store.enqueue_rewrite(pid).unwrap();
+        let claimed = store.claim_rewrite_batch(1).unwrap();
+        assert_eq!(claimed.len(), 1);
+
+        // claim sets claimed_at = now. Force enqueued_at > claimed_at to
+        // simulate a re-enqueue that landed *after* the claim. (In wall
+        // time the live path also bumps enqueued_at via the upsert; the
+        // ordering matters more than the magnitude.)
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE wiki_rewrite_queue
+                    SET enqueued_at = claimed_at + 5
+                  WHERE page_id = {pid}"
+            ))
+            .unwrap();
+
+        store.mark_rewrite_done(pid).unwrap();
+        let stats = store.get_rewrite_stats().unwrap();
+        assert_eq!(
+            stats.pending, 1,
+            "concurrent re-enqueue must re-arm pending"
+        );
+        assert_eq!(stats.done, 0);
+    }
+
+    #[test]
+    fn rewrite_done_marks_done_when_no_concurrent_enqueue() {
+        let store = setup_store_with_messages();
+        let pid = make_page(&store, "Plain");
+        store.enqueue_rewrite(pid).unwrap();
+        let _ = store.claim_rewrite_batch(1).unwrap();
+        store.mark_rewrite_done(pid).unwrap();
+        let stats = store.get_rewrite_stats().unwrap();
+        assert_eq!(stats.done, 1);
         assert_eq!(stats.pending, 0);
     }
 
