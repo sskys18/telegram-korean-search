@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::store::wiki_page::{CandidatePage, NewEvidenceV2, PageRefV2};
-use crate::store::wiki_queue::{ClassifyV2Item, QueueStats};
+use crate::store::wiki_page::{CandidatePage, NewEvidenceV2, PageRefV2, RewriteApply};
+use crate::store::wiki_queue::{ClassifyV2Item, QueueStats, RewriteQueueItem};
 use crate::store::Store;
 use crate::wiki::llm::{
-    validate_v2_assignment, LlmClient, V2Assignment, V2ExistingPage, V2Input, V2InputMessage,
-    V2PageRef, V2Policies,
+    validate_v2_assignment, validate_v2_rewrite, LlmClient, V2Assignment, V2ExistingPage, V2Input,
+    V2InputMessage, V2PageRef, V2Policies, V2RewriteEvidenceIn, V2RewriteInput,
 };
 use crate::wiki::norm::title_norm;
 
@@ -188,11 +188,14 @@ async fn run_worker<E>(
     E: EventEmitter,
 {
     let llm = LlmClient::new();
-    let (batch_size, max_attempts) = {
+    let (batch_size, max_attempts, max_rewrite_attempts, retention_cap) = {
         let s = lock(&store);
         (
             s.get_wiki_setting_i64("classify_batch_size", 20).max(1) as usize,
             s.get_wiki_setting_i64("max_classify_attempts", 3),
+            s.get_wiki_setting_i64("max_rewrite_attempts", 3),
+            s.get_wiki_setting_i64("retention_evidence_per_page", 200)
+                .max(1),
         )
     };
 
@@ -201,6 +204,11 @@ async fn run_worker<E>(
         match s.recover_stale_v2_claims() {
             Ok(n) if n > 0 => log::info!("wiki worker(v2): recovered {n} stale claims"),
             Err(e) => log::warn!("wiki worker(v2): recover_stale_v2_claims failed: {e}"),
+            _ => {}
+        }
+        match s.recover_stale_rewrite_claims() {
+            Ok(n) if n > 0 => log::info!("wiki rewrite: recovered {n} stale rewrite claims"),
+            Err(e) => log::warn!("wiki rewrite: recover_stale_rewrite_claims failed: {e}"),
             _ => {}
         }
     }
@@ -217,6 +225,37 @@ async fn run_worker<E>(
         };
 
         if items.is_empty() {
+            // Idle classify queue → drain rewrites instead of sleeping.
+            let rewrites: Vec<RewriteQueueItem> = {
+                let s = lock(&store);
+                s.claim_rewrite_batch(1).unwrap_or_default()
+            };
+            if !rewrites.is_empty() {
+                let mut applied = 0usize;
+                for item in &rewrites {
+                    match process_rewrite_one(
+                        &store,
+                        &llm,
+                        &emitter,
+                        item,
+                        max_rewrite_attempts,
+                        retention_cap,
+                    )
+                    .await
+                    {
+                        Ok(true) => applied += 1,
+                        Ok(false) => {}
+                        Err(e) => {
+                            log::warn!("wiki rewrite: page={} apply error: {e}", item.page_id);
+                        }
+                    }
+                }
+                if applied > 0 {
+                    emitter.wiki_topics_changed();
+                }
+                emit_progress_v2(&emitter, &store);
+                continue;
+            }
             for _ in 0..20 {
                 if shutdown.load(Ordering::Relaxed) || wake.load(Ordering::Relaxed) {
                     break;
@@ -391,6 +430,36 @@ async fn run_worker<E>(
         if applied > 0 {
             emitter.wiki_topics_changed();
         }
+
+        // Spec §9 weighted fair share: piggyback one rewrite per classify
+        // batch so rewrites can't starve when ingest is hot.
+        let rewrites: Vec<RewriteQueueItem> = {
+            let s = lock(&store);
+            s.claim_rewrite_batch(1).unwrap_or_default()
+        };
+        let mut rewrite_applied = 0usize;
+        for item in &rewrites {
+            match process_rewrite_one(
+                &store,
+                &llm,
+                &emitter,
+                item,
+                max_rewrite_attempts,
+                retention_cap,
+            )
+            .await
+            {
+                Ok(true) => rewrite_applied += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    log::warn!("wiki rewrite: page={} apply error: {e}", item.page_id);
+                }
+            }
+        }
+        if rewrite_applied > 0 {
+            emitter.wiki_topics_changed();
+        }
+
         emit_progress_v2(&emitter, &store);
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -465,6 +534,7 @@ fn apply_classify_v2(store: &Store, input: ApplyClassifyV2<'_>) -> Result<bool, 
     let result = (|| -> Result<bool, sqlite::Error> {
         let mut needs_successor = None;
         let mut any_succeeded = false;
+        let mut touched_pages = std::collections::HashSet::<i64>::new();
 
         for (a, excerpt) in &validated {
             let page_ref: PageRefV2 = match &a.page_ref {
@@ -511,6 +581,7 @@ fn apply_classify_v2(store: &Store, input: ApplyClassifyV2<'_>) -> Result<bool, 
                 .is_some()
             {
                 any_succeeded = true;
+                touched_pages.insert(page_ref.id);
             }
         }
 
@@ -525,6 +596,10 @@ fn apply_classify_v2(store: &Store, input: ApplyClassifyV2<'_>) -> Result<bool, 
             }
         }
         store.mark_classify_v2_done(input.item.msg_id, input.item.chat_id)?;
+        // Spec §6.3: trigger lives inside classify txn, idempotent via PK.
+        for pid in &touched_pages {
+            let _ = store.maybe_enqueue_rewrite(*pid);
+        }
         Ok(true)
     })();
 
@@ -535,6 +610,114 @@ fn apply_classify_v2(store: &Store, input: ApplyClassifyV2<'_>) -> Result<bool, 
         }
         Err(e) => {
             let _ = store.conn().execute("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// Drive one rewrite job end-to-end: load page + evidence, run codex,
+/// validate, apply in a single transaction. Returns `Ok(true)` on apply,
+/// `Ok(false)` when the page disappeared (no work done; queue marked done),
+/// `Err` propagates DB issues.
+async fn process_rewrite_one<E: EventEmitter>(
+    store: &Arc<Mutex<Store>>,
+    llm: &LlmClient,
+    emitter: &Arc<E>,
+    item: &RewriteQueueItem,
+    max_attempts: i64,
+    retention_cap: i64,
+) -> Result<bool, sqlite::Error> {
+    let page = {
+        let s = lock(store);
+        s.get_page_for_rewrite(item.page_id)?
+    };
+    let Some(page) = page else {
+        let s = lock(store);
+        s.mark_rewrite_done(item.page_id)?;
+        return Ok(false);
+    };
+    if matches!(page.state.as_str(), "frozen" | "hidden") {
+        let s = lock(store);
+        s.mark_rewrite_done(item.page_id)?;
+        return Ok(false);
+    }
+
+    let evidence = {
+        let s = lock(store);
+        s.select_rewrite_evidence(item.page_id, page.last_rewrite_at)
+            .unwrap_or_default()
+    };
+    if evidence.is_empty() {
+        // Nothing to summarize; close the queue row without pinging codex.
+        let s = lock(store);
+        s.mark_rewrite_done(item.page_id)?;
+        return Ok(false);
+    }
+
+    let prior_facts: Option<serde_json::Value> = page
+        .facts
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    let evidence_in: Vec<V2RewriteEvidenceIn<'_>> = evidence
+        .iter()
+        .map(|e| V2RewriteEvidenceIn {
+            id: e.id,
+            ts: e.ts,
+            excerpt: e.excerpt.as_str(),
+            salience: e.salience,
+            cited: e.cited,
+        })
+        .collect();
+    let input = V2RewriteInput {
+        page_id: page.id,
+        kind: page.kind.as_str(),
+        title: page.title.as_str(),
+        state: page.state.as_str(),
+        prior_summary_md: page.summary_md.as_str(),
+        prior_facts: prior_facts.as_ref(),
+        evidence: &evidence_in,
+    };
+
+    let raw_out = match llm.rewrite_page(&input).await {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!("wiki rewrite: page={} llm failed: {e}", item.page_id);
+            let s = lock(store);
+            s.mark_rewrite_retry(item.page_id, &e.to_string(), max_attempts)?;
+            emitter.wiki_error(&e.to_string(), true);
+            return Ok(false);
+        }
+    };
+
+    let validated = match validate_v2_rewrite(&raw_out, &page.state, &page.kind) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("wiki rewrite: page={} validation failed: {e}", item.page_id);
+            let s = lock(store);
+            s.mark_rewrite_retry(item.page_id, &e.to_string(), max_attempts)?;
+            return Ok(false);
+        }
+    };
+
+    let s = lock(store);
+    s.conn().execute("BEGIN IMMEDIATE")?;
+    let apply = s.apply_rewrite_v2(&RewriteApply {
+        page_id: page.id,
+        summary_md: &validated.summary_md,
+        facts_json: &validated.facts_json,
+        state: &validated.state,
+        new_aliases: &validated.new_aliases,
+        retention_cap,
+    });
+    match apply {
+        Ok(()) => {
+            s.conn().execute("COMMIT")?;
+            Ok(true)
+        }
+        Err(e) => {
+            let _ = s.conn().execute("ROLLBACK");
+            let _ = s.mark_rewrite_retry(item.page_id, &e.to_string(), max_attempts);
             Err(e)
         }
     }
