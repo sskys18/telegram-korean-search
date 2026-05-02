@@ -1334,6 +1334,11 @@ pub struct PinnedTrendingRow {
 impl Store {
     /// Read the cached trending rows for a window in rank order. Pure
     /// SQL; the worker populates the cache atomically (spec §6.4 apply).
+    /// Live-state filter: a row admitted to the cache when the page was
+    /// `state='active' AND pinned=0` can survive a later state/pinned
+    /// flip (resolved, hidden, or pinned) until the next refresh tick.
+    /// Filtering on read keeps the UI from rendering pages that no
+    /// longer satisfy the shortlist eligibility criteria.
     pub fn list_trending_cache(
         &self,
         window: TrendingWindow,
@@ -1345,6 +1350,8 @@ impl Store {
               FROM trending_cache t
               JOIN wiki_pages_v2 p ON p.id = t.page_id
              WHERE t.window = ?
+               AND p.state = 'active'
+               AND p.pinned = 0
              ORDER BY t.rank ASC";
         let mut s = self.conn().prepare(q)?;
         s.bind((1, window.label()))?;
@@ -2477,6 +2484,71 @@ mod tests {
         assert_eq!((rows[1].rank, rows[1].page_id), (2, p2));
         assert_eq!(rows[0].title, "P1");
         assert_eq!(rows[0].reason_code, "surge");
+    }
+
+    #[test]
+    fn list_trending_cache_filters_state_and_pinned_at_read_time() {
+        // Cache row written while page was eligible. Page later flips
+        // state or pinned. Reader must not surface the stale row.
+        use super::TrendingApplyRow;
+        let store = setup();
+        let p_active = make_page(&store, "Active");
+        let p_resolved = make_page(&store, "Later Resolved");
+        let p_pinned = make_page(&store, "Later Pinned");
+        let s = snap(TrendingWindow::H24, 10_000, 0);
+        store.conn().execute("BEGIN IMMEDIATE").unwrap();
+        store
+            .apply_trending(
+                &s,
+                &[
+                    TrendingApplyRow {
+                        page_id: p_active,
+                        rank: 1,
+                        hook: "ok".into(),
+                        reason_code: "default".into(),
+                        reason_metrics: "{}".into(),
+                        sparkline: "[]".into(),
+                    },
+                    TrendingApplyRow {
+                        page_id: p_resolved,
+                        rank: 2,
+                        hook: "ok".into(),
+                        reason_code: "default".into(),
+                        reason_metrics: "{}".into(),
+                        sparkline: "[]".into(),
+                    },
+                    TrendingApplyRow {
+                        page_id: p_pinned,
+                        rank: 3,
+                        hook: "ok".into(),
+                        reason_code: "default".into(),
+                        reason_metrics: "{}".into(),
+                        sparkline: "[]".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+        // Flip state/pinned post-cache.
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE wiki_pages_v2 SET state = 'resolved' WHERE id = {p_resolved}"
+            ))
+            .unwrap();
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE wiki_pages_v2 SET pinned = 1 WHERE id = {p_pinned}"
+            ))
+            .unwrap();
+        let rows = store.list_trending_cache(TrendingWindow::H24).unwrap();
+        let ids: Vec<i64> = rows.iter().map(|r| r.page_id).collect();
+        assert_eq!(
+            ids,
+            vec![p_active],
+            "stale ineligible rows must not surface"
+        );
     }
 
     #[test]
