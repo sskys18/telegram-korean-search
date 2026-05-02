@@ -466,7 +466,7 @@ impl Store {
     ) -> Result<Option<MessageRow>, sqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT message_id, chat_id, timestamp, text_plain, text_stripped, link, sender_id
-             FROM messages WHERE chat_id = ? AND message_id = ?",
+             FROM messages WHERE chat_id = ? AND message_id = ? AND deleted_at IS NULL",
         )?;
         stmt.bind((1, chat_id))?;
         stmt.bind((2, message_id))?;
@@ -513,13 +513,13 @@ impl Store {
                           - (m.timestamp / 86400.0) * 0.05 AS rank
                  FROM messages_fts f
                  JOIN messages m ON m.rowid = f.rowid
-                 WHERE messages_fts MATCH ?
+                 WHERE messages_fts MATCH ? AND m.deleted_at IS NULL
              )
              SELECT m.message_id, m.chat_id, m.timestamp, m.text_plain, m.link, c.title, r.rank
              FROM ranked r
              JOIN messages m ON m.rowid = r.rowid
              JOIN chats c ON m.chat_id = c.chat_id
-             WHERE c.is_excluded = 0
+             WHERE c.is_excluded = 0 AND m.deleted_at IS NULL
              {chat_clause}
              {cursor_clause}
              ORDER BY r.rank ASC, m.timestamp DESC, m.chat_id ASC, m.message_id ASC
@@ -593,7 +593,7 @@ impl Store {
              FROM messages m
              JOIN chats c ON m.chat_id = c.chat_id
              WHERE m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)
-             AND c.is_excluded = 0
+             AND c.is_excluded = 0 AND m.deleted_at IS NULL
              {}
              ORDER BY m.timestamp DESC, m.chat_id ASC, m.message_id ASC
              LIMIT ?",
@@ -655,7 +655,7 @@ impl Store {
              FROM messages m
              JOIN chats c ON m.chat_id = c.chat_id
              WHERE m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)
-             AND m.chat_id = ? AND c.is_excluded = 0
+             AND m.chat_id = ? AND c.is_excluded = 0 AND m.deleted_at IS NULL
              {}
              ORDER BY m.timestamp DESC, m.message_id ASC
              LIMIT ?",
@@ -729,7 +729,7 @@ impl Store {
             "SELECT m.message_id, m.chat_id, m.timestamp, m.text_plain, m.link, c.title
              FROM messages m
              JOIN chats c ON m.chat_id = c.chat_id
-             WHERE {} AND c.is_excluded = 0
+             WHERE {} AND c.is_excluded = 0 AND m.deleted_at IS NULL
              {}
              ORDER BY m.timestamp DESC, m.chat_id ASC, m.message_id ASC
              LIMIT ?",
@@ -809,7 +809,7 @@ impl Store {
             "SELECT m.message_id, m.chat_id, m.timestamp, m.text_plain, m.link, c.title
              FROM messages m
              JOIN chats c ON m.chat_id = c.chat_id
-             WHERE {} AND m.chat_id = ? AND c.is_excluded = 0
+             WHERE {} AND m.chat_id = ? AND c.is_excluded = 0 AND m.deleted_at IS NULL
              {}
              ORDER BY m.timestamp DESC, m.message_id ASC
              LIMIT ?",
@@ -853,7 +853,9 @@ impl Store {
     }
 
     pub fn message_count(&self) -> Result<i64, sqlite::Error> {
-        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM messages")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM messages WHERE deleted_at IS NULL")?;
         stmt.next()?;
         stmt.read::<i64, _>(0)
     }
@@ -1146,5 +1148,80 @@ mod tests {
         store.insert_messages_batch(&msgs).unwrap();
         let stats = store.get_queue_stats().unwrap();
         assert_eq!(stats.pending, 0);
+    }
+
+    fn mark_deleted(store: &Store, chat_id: i64, message_id: i64) {
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE messages SET deleted_at = 1 WHERE chat_id = {chat_id} AND message_id = {message_id}"
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn soft_deleted_hidden_from_get_message() {
+        let store = test_store();
+        setup_chat(&store, 1);
+        store
+            .insert_messages_batch(&[make_message(1, 100, 1_000, "hello")])
+            .unwrap();
+        assert!(store.get_message(1, 100).unwrap().is_some());
+        mark_deleted(&store, 1, 100);
+        assert!(
+            store.get_message(1, 100).unwrap().is_none(),
+            "soft-deleted row must not surface from get_message"
+        );
+    }
+
+    #[test]
+    fn soft_deleted_hidden_from_fts_search() {
+        let store = test_store();
+        setup_chat(&store, 1);
+        store
+            .insert_messages_batch(&[
+                make_message(1, 100, 1_000, "hello world"),
+                make_message(1, 101, 1_001, "hello korea"),
+            ])
+            .unwrap();
+        let pre = store.search_messages_fts("hello", None, 30).unwrap();
+        assert_eq!(pre.len(), 2);
+        mark_deleted(&store, 1, 100);
+        let post = store.search_messages_fts("hello", None, 30).unwrap();
+        let ids: Vec<i64> = post.iter().map(|h| h.message_id).collect();
+        assert_eq!(ids, vec![101]);
+    }
+
+    #[test]
+    fn soft_deleted_hidden_from_fts_chat_search() {
+        let store = test_store();
+        setup_chat(&store, 1);
+        store
+            .insert_messages_batch(&[
+                make_message(1, 100, 1_000, "hello world"),
+                make_message(1, 101, 1_001, "hello korea"),
+            ])
+            .unwrap();
+        mark_deleted(&store, 1, 101);
+        let res = store
+            .search_messages_fts_in_chat("hello", 1, None, 30)
+            .unwrap();
+        let ids: Vec<i64> = res.iter().map(|h| h.message_id).collect();
+        assert_eq!(ids, vec![100]);
+    }
+
+    #[test]
+    fn soft_deleted_hidden_from_message_count() {
+        let store = test_store();
+        setup_chat(&store, 1);
+        store
+            .insert_messages_batch(&[
+                make_message(1, 100, 1_000, "a"),
+                make_message(1, 101, 1_001, "b"),
+            ])
+            .unwrap();
+        assert_eq!(store.message_count().unwrap(), 2);
+        mark_deleted(&store, 1, 100);
+        assert_eq!(store.message_count().unwrap(), 1);
     }
 }
