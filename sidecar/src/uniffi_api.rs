@@ -365,12 +365,17 @@ impl Seoyu {
             .collect())
     }
 
-    /// Advance the per-chat digest cursor. Spec §6.5: called only on
-    /// explicit "mark read" or chat-open, not on panel-open. The store
-    /// upsert is MAX-monotonic so an older `at` value never rewinds.
-    pub fn wiki_mark_chat_read(&self, chat_id: i64, at: i64) -> Result<(), SeoyuError> {
+    /// Advance the per-chat digest cursor to "now". Spec §6.5: called
+    /// only on explicit "mark read" or chat-open, not on panel-open.
+    /// The cursor timestamp is always the current wall clock — exposing
+    /// a caller-supplied `at` would let Swift bury the cursor in the
+    /// far future and silently suppress every future digest row for
+    /// that chat. The store upsert is MAX-monotonic so even within the
+    /// trusted timestamp space, a clock skew can't rewind.
+    pub fn wiki_mark_chat_read(&self, chat_id: i64) -> Result<(), SeoyuError> {
         let store = self.lock_store();
-        store.mark_chat_read(chat_id, at)?;
+        let now = crate::wiki::norm::unix_now();
+        store.mark_chat_read(chat_id, now)?;
         Ok(())
     }
 
