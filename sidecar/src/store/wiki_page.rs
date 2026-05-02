@@ -1301,6 +1301,124 @@ impl Store {
     }
 }
 
+// ---- Phase 8 trending readers (UI surface) --------------------------------
+
+/// One row from `trending_cache` joined to its page metadata. Returned
+/// to Swift for rendering the trending panel.
+#[derive(Debug, Clone)]
+pub struct TrendingCacheRow {
+    pub page_id: i64,
+    pub rank: i64,
+    pub kind: String,
+    pub title: String,
+    pub hook: String,
+    pub reason_code: String,
+    pub reason_metrics: String,
+    pub sparkline: String,
+    pub computed_at: i64,
+}
+
+/// Pinned page with at least one evidence row inside a window. Spec
+/// §6.4 surfaces pinned items in a separate UI slot above the ranked
+/// list, with hook + sparkline computed on the fly.
+#[derive(Debug, Clone)]
+pub struct PinnedTrendingRow {
+    pub page_id: i64,
+    pub kind: String,
+    pub title: String,
+    pub ec: i64,
+    pub last_ts: i64,
+    pub sparkline: String,
+}
+
+impl Store {
+    /// Read the cached trending rows for a window in rank order. Pure
+    /// SQL; the worker populates the cache atomically (spec §6.4 apply).
+    pub fn list_trending_cache(
+        &self,
+        window: TrendingWindow,
+    ) -> Result<Vec<TrendingCacheRow>, sqlite::Error> {
+        let q = "
+            SELECT t.page_id, t.rank, p.kind, p.title,
+                   t.hook, t.reason_code, t.reason_metrics,
+                   t.sparkline, t.computed_at
+              FROM trending_cache t
+              JOIN wiki_pages_v2 p ON p.id = t.page_id
+             WHERE t.window = ?
+             ORDER BY t.rank ASC";
+        let mut s = self.conn().prepare(q)?;
+        s.bind((1, window.label()))?;
+        let mut out = Vec::new();
+        while let sqlite::State::Row = s.next()? {
+            out.push(TrendingCacheRow {
+                page_id: s.read::<i64, _>("page_id")?,
+                rank: s.read::<i64, _>("rank")?,
+                kind: s.read::<String, _>("kind")?,
+                title: s.read::<String, _>("title")?,
+                hook: s.read::<String, _>("hook")?,
+                reason_code: s.read::<String, _>("reason_code")?,
+                reason_metrics: s.read::<String, _>("reason_metrics")?,
+                sparkline: s.read::<String, _>("sparkline")?,
+                computed_at: s.read::<i64, _>("computed_at")?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Pinned active pages with ≥1 evidence in `[now - span, now)`. Spec
+    /// §6.4: pinned pages are filtered out of the ranked shortlist
+    /// (`pinned = 0`) and surfaced in a separate UI slot. Sparkline
+    /// is computed on the fly using a fresh snapshot — keeps the read
+    /// stateless and side-effect free.
+    pub fn list_trending_pinned(
+        &self,
+        window: TrendingWindow,
+        now: i64,
+    ) -> Result<Vec<PinnedTrendingRow>, sqlite::Error> {
+        let max_id = self.current_max_evidence_id()?;
+        let snap = TrendingSnapshot {
+            window,
+            window_start: now - window.span_secs(),
+            prior_start: now - 2 * window.span_secs(),
+            now,
+            max_evidence_id: max_id,
+        };
+        let q = "
+            SELECT p.id, p.kind, p.title,
+                   COUNT(e.id) AS ec, COALESCE(MAX(e.ts), 0) AS last_ts
+              FROM wiki_pages_v2 p
+              JOIN wiki_evidence e ON e.page_id = p.id
+             WHERE p.pinned = 1
+               AND p.state = 'active'
+               AND e.id <= ?
+               AND e.ts >= ?
+               AND e.ts < ?
+             GROUP BY p.id
+             HAVING ec >= 1
+             ORDER BY ec DESC, last_ts DESC";
+        let mut s = self.conn().prepare(q)?;
+        s.bind((1, snap.max_evidence_id))?;
+        s.bind((2, snap.window_start))?;
+        s.bind((3, snap.now))?;
+        let mut rows = Vec::new();
+        while let sqlite::State::Row = s.next()? {
+            let page_id = s.read::<i64, _>("id")?;
+            let buckets = self.compute_sparkline(page_id, &snap)?;
+            let sparkline =
+                serde_json::to_string(&buckets.to_vec()).unwrap_or_else(|_| "[]".to_string());
+            rows.push(PinnedTrendingRow {
+                page_id,
+                kind: s.read::<String, _>("kind")?,
+                title: s.read::<String, _>("title")?,
+                ec: s.read::<i64, _>("ec")?,
+                last_ts: s.read::<i64, _>("last_ts")?,
+                sparkline,
+            });
+        }
+        Ok(rows)
+    }
+}
+
 // ---- Phase 9 digest (spec §6.5) impls -------------------------------------
 
 impl Store {
@@ -2319,6 +2437,84 @@ mod tests {
             })
             .unwrap();
         store.conn().execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn list_trending_cache_returns_rank_ordered_rows() {
+        use super::TrendingApplyRow;
+        let store = setup();
+        let p1 = make_page(&store, "P1");
+        let p2 = make_page(&store, "P2");
+        let s = snap(TrendingWindow::H24, 10_000, 0);
+        store.conn().execute("BEGIN IMMEDIATE").unwrap();
+        store
+            .apply_trending(
+                &s,
+                &[
+                    TrendingApplyRow {
+                        page_id: p2,
+                        rank: 2,
+                        hook: "h2".into(),
+                        reason_code: "default".into(),
+                        reason_metrics: "{}".into(),
+                        sparkline: "[]".into(),
+                    },
+                    TrendingApplyRow {
+                        page_id: p1,
+                        rank: 1,
+                        hook: "h1".into(),
+                        reason_code: "surge".into(),
+                        reason_metrics: "{}".into(),
+                        sparkline: "[]".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+        let rows = store.list_trending_cache(TrendingWindow::H24).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].rank, rows[0].page_id), (1, p1));
+        assert_eq!((rows[1].rank, rows[1].page_id), (2, p2));
+        assert_eq!(rows[0].title, "P1");
+        assert_eq!(rows[0].reason_code, "surge");
+    }
+
+    #[test]
+    fn list_trending_pinned_only_pinned_with_evidence() {
+        let store = setup();
+        let plain = make_page(&store, "Plain");
+        let pinned = make_page(&store, "Pinned");
+        let pinned_no_ev = make_page(&store, "PinnedNoEv");
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE wiki_pages_v2 SET pinned = 1 WHERE id IN ({pinned}, {pinned_no_ev})"
+            ))
+            .unwrap();
+        let now = 100_000;
+        // Inside-window evidence for plain + pinned.
+        for (pid, msg) in &[(plain, 100), (pinned, 200)] {
+            add_evidence_chat(&store, *pid, *msg, 1, 0, now - 100, 0.5);
+        }
+        let rows = store.list_trending_pinned(TrendingWindow::H1, now).unwrap();
+        let ids: Vec<i64> = rows.iter().map(|r| r.page_id).collect();
+        assert_eq!(ids, vec![pinned], "only pinned with ≥1 evidence");
+    }
+
+    #[test]
+    fn list_trending_pinned_excludes_inactive_state() {
+        let store = setup();
+        let pid = make_page(&store, "P");
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE wiki_pages_v2 SET pinned = 1, state = 'resolved' WHERE id = {pid}"
+            ))
+            .unwrap();
+        let now = 10_000;
+        add_evidence_chat(&store, pid, 1, 1, 0, now - 50, 0.5);
+        let rows = store.list_trending_pinned(TrendingWindow::H1, now).unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]

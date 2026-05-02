@@ -150,6 +150,33 @@ pub struct WikiDigest {
     pub hot_topics: Vec<WikiTopicSummary>,
 }
 
+/// Phase 8 trending row (spec §6.4). Cached per window in
+/// `trending_cache`; populated atomically by the wiki worker.
+#[derive(uniffi::Record, Clone)]
+pub struct WikiTrendingRow {
+    pub page_id: i64,
+    pub rank: i64,
+    pub kind: String,
+    pub title: String,
+    pub hook: String,
+    pub reason_code: String,
+    pub reason_metrics: String,
+    pub sparkline: String,
+    pub computed_at: i64,
+}
+
+/// Phase 8 pinned trending row. Pinned pages live in their own UI
+/// slot above the ranked list; no cached entry — computed on read.
+#[derive(uniffi::Record, Clone)]
+pub struct WikiPinnedTrendingRow {
+    pub page_id: i64,
+    pub kind: String,
+    pub title: String,
+    pub ec: i64,
+    pub last_ts: i64,
+    pub sparkline: String,
+}
+
 /// Phase 9 digest row (spec §6.5). One per (chat, page) pair where
 /// the post-`wiki_last_open` evidence count crossed the threshold.
 #[derive(uniffi::Record, Clone)]
@@ -341,6 +368,54 @@ impl Seoyu {
             article_md: page.as_ref().map(|p| p.content_en.clone()),
             article_md_ko: page.as_ref().map(|p| p.content_ko.clone()),
         }))
+    }
+
+    /// Phase 8 trending readers. `window` must be one of "1h", "24h",
+    /// "7d"; unknown labels return InvalidArgument so the UI can never
+    /// silently render against the wrong window.
+    pub fn wiki_trending_v2(&self, window: String) -> Result<Vec<WikiTrendingRow>, SeoyuError> {
+        let w = crate::store::wiki_page::TrendingWindow::from_label(&window)
+            .ok_or_else(|| SeoyuError::InvalidArgument(format!("unknown window: {window}")))?;
+        let store = self.lock_store();
+        let rows = store.list_trending_cache(w)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| WikiTrendingRow {
+                page_id: r.page_id,
+                rank: r.rank,
+                kind: r.kind,
+                title: r.title,
+                hook: r.hook,
+                reason_code: r.reason_code,
+                reason_metrics: r.reason_metrics,
+                sparkline: r.sparkline,
+                computed_at: r.computed_at,
+            })
+            .collect())
+    }
+
+    /// Pinned active pages with ≥1 evidence in the window. Spec §6.4
+    /// surfaces these in a separate slot above the ranked list.
+    pub fn wiki_trending_pinned(
+        &self,
+        window: String,
+    ) -> Result<Vec<WikiPinnedTrendingRow>, SeoyuError> {
+        let w = crate::store::wiki_page::TrendingWindow::from_label(&window)
+            .ok_or_else(|| SeoyuError::InvalidArgument(format!("unknown window: {window}")))?;
+        let store = self.lock_store();
+        let now = crate::wiki::norm::unix_now();
+        let rows = store.list_trending_pinned(w, now)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| WikiPinnedTrendingRow {
+                page_id: r.page_id,
+                kind: r.kind,
+                title: r.title,
+                ec: r.ec,
+                last_ts: r.last_ts,
+                sparkline: r.sparkline,
+            })
+            .collect())
     }
 
     /// Phase 9 digest (spec §6.5). Per-chat list of pages with ≥3 new
