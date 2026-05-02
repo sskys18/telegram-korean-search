@@ -183,6 +183,7 @@ mod tests {
                 text_plain: text.to_string(),
                 text_stripped: stripped,
                 link: None,
+                sender_id: 0,
             }])
             .unwrap();
     }

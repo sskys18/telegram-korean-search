@@ -68,6 +68,7 @@ pub struct IndexedMessage {
     pub timestamp: i64,
     pub text: String,
     pub link: Option<String>,
+    pub sender_id: i64,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -238,6 +239,7 @@ impl Seoyu {
                 text_plain: m.text.clone(),
                 text_stripped: strip_whitespace(&m.text),
                 link: m.link,
+                sender_id: m.sender_id,
             })
             .collect();
         let store = self.lock_store();

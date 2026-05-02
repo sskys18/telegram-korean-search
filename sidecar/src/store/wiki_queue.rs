@@ -242,6 +242,7 @@ mod tests {
                 text_plain: "hello".to_string(),
                 text_stripped: "hello".to_string(),
                 link: None,
+                sender_id: 0,
             },
             MessageRow {
                 message_id: 2,
@@ -250,6 +251,7 @@ mod tests {
                 text_plain: "world".to_string(),
                 text_stripped: "world".to_string(),
                 link: None,
+                sender_id: 0,
             },
         ];
         store.insert_messages_batch(&msgs).unwrap();

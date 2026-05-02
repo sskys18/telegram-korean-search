@@ -48,6 +48,7 @@ pub struct MessageRow {
     pub text_plain: String,
     pub text_stripped: String,
     pub link: Option<String>,
+    pub sender_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -140,7 +141,7 @@ impl Store {
                 let jamo = crate::search::hangul::decompose_jamo(&msg.text_plain);
                 let prior = {
                     let mut stmt = self.conn.prepare(
-                        "SELECT rowid, timestamp, text_plain, text_stripped, text_jamo, link
+                        "SELECT rowid, timestamp, text_plain, text_stripped, text_jamo, link, sender_id
                          FROM messages WHERE chat_id = ? AND message_id = ?",
                     )?;
                     stmt.bind((1, msg.chat_id))?;
@@ -153,6 +154,7 @@ impl Store {
                             stmt.read::<String, _>(3)?,
                             stmt.read::<String, _>(4)?,
                             stmt.read::<Option<String>, _>(5)?,
+                            stmt.read::<Option<i64>, _>(6)?,
                         ))
                     } else {
                         None
@@ -164,8 +166,8 @@ impl Store {
                         let mut stmt = self.conn.prepare(
                             "INSERT INTO messages
                                 (message_id, chat_id, timestamp, text_plain, text_stripped, link,
-                                 text_jamo)
-                             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                 text_jamo, sender_id)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         )?;
                         stmt.bind((1, msg.message_id))?;
                         stmt.bind((2, msg.chat_id))?;
@@ -177,6 +179,7 @@ impl Store {
                             None => stmt.bind((6, sqlite::Value::Null))?,
                         };
                         stmt.bind((7, jamo.as_str()))?;
+                        stmt.bind((8, msg.sender_id))?;
                         stmt.next()?;
 
                         let mut rowid_stmt = self.conn.prepare("SELECT last_insert_rowid()")?;
@@ -193,12 +196,21 @@ impl Store {
                         enqueue_wiki_classify(&self.conn, msg.chat_id, msg.message_id)?;
                         outcome.inserted += 1;
                     }
-                    Some((rowid, old_ts, old_plain, old_stripped, old_jamo, old_link)) => {
+                    Some((
+                        rowid,
+                        old_ts,
+                        old_plain,
+                        old_stripped,
+                        old_jamo,
+                        old_link,
+                        old_sender,
+                    )) => {
                         if old_ts == msg.timestamp
                             && old_plain == msg.text_plain
                             && old_stripped == msg.text_stripped
                             && old_jamo == jamo
                             && old_link == msg.link
+                            && old_sender == Some(msg.sender_id)
                         {
                             continue;
                         }
@@ -209,7 +221,7 @@ impl Store {
 
                         let mut stmt = self.conn.prepare(
                             "UPDATE messages
-                             SET timestamp = ?, text_plain = ?, text_stripped = ?, link = ?, text_jamo = ?
+                             SET timestamp = ?, text_plain = ?, text_stripped = ?, link = ?, text_jamo = ?, sender_id = ?
                              WHERE rowid = ?",
                         )?;
                         stmt.bind((1, msg.timestamp))?;
@@ -220,7 +232,8 @@ impl Store {
                             None => stmt.bind((4, sqlite::Value::Null))?,
                         };
                         stmt.bind((5, jamo.as_str()))?;
-                        stmt.bind((6, rowid))?;
+                        stmt.bind((6, msg.sender_id))?;
+                        stmt.bind((7, rowid))?;
                         stmt.next()?;
 
                         if text_changed {
@@ -370,7 +383,7 @@ impl Store {
         message_id: i64,
     ) -> Result<Option<MessageRow>, sqlite::Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT message_id, chat_id, timestamp, text_plain, text_stripped, link
+            "SELECT message_id, chat_id, timestamp, text_plain, text_stripped, link, sender_id
              FROM messages WHERE chat_id = ? AND message_id = ?",
         )?;
         stmt.bind((1, chat_id))?;
@@ -383,6 +396,7 @@ impl Store {
                 text_plain: stmt.read::<String, _>(3)?,
                 text_stripped: stmt.read::<String, _>(4)?,
                 link: stmt.read::<Option<String>, _>(5)?,
+                sender_id: stmt.read::<Option<i64>, _>(6)?.unwrap_or(0),
             }))
         } else {
             Ok(None)
@@ -793,6 +807,7 @@ mod tests {
             text_plain: text.to_string(),
             text_stripped: strip_whitespace(text),
             link: None,
+            sender_id: 0,
         }
     }
 
@@ -915,6 +930,7 @@ mod tests {
                 text_plain: "테스트 메시지".into(),
                 text_stripped: "테스트메시지".into(),
                 link: None,
+                sender_id: 0,
             },
             MessageRow {
                 message_id: 11,
@@ -923,6 +939,7 @@ mod tests {
                 text_plain: "another".into(),
                 text_stripped: "another".into(),
                 link: None,
+                sender_id: 0,
             },
         ];
         store.insert_messages_batch(&msgs).unwrap();

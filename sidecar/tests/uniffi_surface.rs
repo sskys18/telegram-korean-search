@@ -51,6 +51,7 @@ fn index_then_korean_search_round_trip() {
                 timestamp: 1_700_000_000,
                 text: "삼성전자 실적 발표".into(),
                 link: None,
+                sender_id: 0,
             },
             IndexedMessage {
                 chat_id: 42,
@@ -58,6 +59,7 @@ fn index_then_korean_search_round_trip() {
                 timestamp: 1_700_000_100,
                 text: "apple unrelated".into(),
                 link: None,
+                sender_id: 0,
             },
         ])
         .expect("index");
@@ -99,6 +101,7 @@ fn index_update_and_delete_round_trip() {
             timestamp: 1_700_000_000,
             text: "old keyword".into(),
             link: None,
+            sender_id: 0,
         }])
         .expect("insert");
     assert_eq!((first.inserted, first.updated), (1, 0));
@@ -110,6 +113,7 @@ fn index_update_and_delete_round_trip() {
             timestamp: 1_700_000_001,
             text: "new keyword".into(),
             link: None,
+            sender_id: 0,
         }])
         .expect("update");
     assert_eq!((second.inserted, second.updated), (0, 1));

@@ -222,6 +222,7 @@ mod tests {
                     text_plain: "test msg 1".to_string(),
                     text_stripped: "testmsg1".to_string(),
                     link: None,
+                    sender_id: 0,
                 },
                 MessageRow {
                     message_id: 2,
@@ -230,6 +231,7 @@ mod tests {
                     text_plain: "test msg 2".to_string(),
                     text_stripped: "testmsg2".to_string(),
                     link: None,
+                    sender_id: 0,
                 },
             ])
             .unwrap();

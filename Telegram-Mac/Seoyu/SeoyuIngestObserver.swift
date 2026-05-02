@@ -33,7 +33,8 @@ public final class SeoyuIngestObserver: StoreOrUpdateMessageAction, DeleteMessag
                 messageId: Int64(messageId.id),
                 timestamp: Int64(message.timestamp),
                 text: text,
-                link: nil
+                link: nil,
+                senderId: message.authorId?.toInt64() ?? 0
             ))
         }
         if !batch.isEmpty {

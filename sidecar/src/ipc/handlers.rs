@@ -155,6 +155,7 @@ fn to_message_row(msg: IndexMessageInput) -> MessageRow {
         text_plain: msg.text,
         text_stripped: stripped,
         link: None,
+        sender_id: msg.sender_id.unwrap_or(0),
     }
 }
 
