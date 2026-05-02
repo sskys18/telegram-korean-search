@@ -1211,6 +1211,69 @@ mod tests {
     }
 
     #[test]
+    fn soft_deleted_hidden_from_engine_search_bm25() {
+        // The active path: engine::search → search_messages_bm25 (≥3 char
+        // tokens). Earlier tests covered search_messages_fts which the
+        // engine never calls — codex caught that gap.
+        use crate::search::engine;
+        use crate::search::engine::SearchScope;
+        let store = test_store();
+        setup_chat(&store, 1);
+        store
+            .insert_messages_batch(&[
+                make_message(1, 100, 1_000, "hello world"),
+                make_message(1, 101, 1_001, "hello korea"),
+            ])
+            .unwrap();
+        let pre = engine::search(&store, "hello", &SearchScope::All, None, None).unwrap();
+        assert_eq!(pre.items.len(), 2);
+        mark_deleted(&store, 1, 100);
+        let post = engine::search(&store, "hello", &SearchScope::All, None, None).unwrap();
+        let ids: Vec<i64> = post.items.iter().map(|h| h.message_id).collect();
+        assert_eq!(ids, vec![101]);
+    }
+
+    #[test]
+    fn soft_deleted_hidden_from_engine_search_like_fallback() {
+        // <3-char query falls through bm25 to LIKE path.
+        use crate::search::engine;
+        use crate::search::engine::SearchScope;
+        let store = test_store();
+        setup_chat(&store, 1);
+        store
+            .insert_messages_batch(&[
+                make_message(1, 100, 1_000, "ab cdef"),
+                make_message(1, 101, 1_001, "ab ghij"),
+            ])
+            .unwrap();
+        // 2-char term forces LIKE branch in engine::search.
+        let pre = engine::search(&store, "ab", &SearchScope::All, None, None).unwrap();
+        assert_eq!(pre.items.len(), 2);
+        mark_deleted(&store, 1, 100);
+        let post = engine::search(&store, "ab", &SearchScope::All, None, None).unwrap();
+        let ids: Vec<i64> = post.items.iter().map(|h| h.message_id).collect();
+        assert_eq!(ids, vec![101]);
+    }
+
+    #[test]
+    fn soft_deleted_hidden_from_engine_search_chat_scope() {
+        use crate::search::engine;
+        use crate::search::engine::SearchScope;
+        let store = test_store();
+        setup_chat(&store, 1);
+        store
+            .insert_messages_batch(&[
+                make_message(1, 100, 1_000, "alpha"),
+                make_message(1, 101, 1_001, "alpha"),
+            ])
+            .unwrap();
+        mark_deleted(&store, 1, 100);
+        let post = engine::search(&store, "alpha", &SearchScope::Chat(1), None, None).unwrap();
+        let ids: Vec<i64> = post.items.iter().map(|h| h.message_id).collect();
+        assert_eq!(ids, vec![101]);
+    }
+
+    #[test]
     fn soft_deleted_hidden_from_message_count() {
         let store = test_store();
         setup_chat(&store, 1);
