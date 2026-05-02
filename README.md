@@ -57,8 +57,14 @@ Query: **`삼성 전재`** (deliberate typo + whitespace). Left: Seoyu. Right: u
 Every message Postbox stores is mirrored into the sidecar's SQLite store
 and indexed by FTS5 with three auxiliary columns:
 `content`, `jamo` (decomposed 자모), `nospace` (whitespace-stripped). Search
-fans out to all three and merges by rank. Nothing leaves the machine
-except the MTProto traffic TelegramSwift already makes.
+fans out to all three and merges by rank.
+
+Search and FTS run entirely on the local machine. The wiki pipeline
+calls out to OpenAI through `codex exec` for classification, rewrite,
+trending, and Ask; an opt-in cloud-worker mode (off by default) can
+also mirror messages to a personal Oracle Free Tier box. See
+`docs/specs/2026-04-27-cloud-wiki-architecture.md` for the cloud
+backend's flag model and trust boundary.
 
 ## Install (use the prebuilt dev build)
 
@@ -161,5 +167,7 @@ Per upstream's fork requirements:
 
 ## Scope
 
-Personal, local-only, macOS-only. Dev builds are unsigned. Signed
-distribution requires an Apple Developer ID we do not yet have.
+Personal, macOS-only. Dev builds are unsigned. Signed distribution
+requires an Apple Developer ID we do not yet have. Search + FTS are
+local; the wiki pipeline uses `codex exec` (OpenAI) and the optional
+cloud-worker backend uploads to a personal Oracle Free Tier box.
