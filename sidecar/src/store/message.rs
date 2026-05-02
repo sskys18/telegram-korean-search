@@ -91,7 +91,9 @@ fn enqueue_wiki_classify(
     conn: &sqlite::Connection,
     chat_id: i64,
     message_id: i64,
+    text_plain: &str,
 ) -> Result<(), sqlite::Error> {
+    // v1 queue: kept until phase-6 worker rewrite consumes v2 instead.
     let mut q = conn.prepare(
         "INSERT OR IGNORE INTO wiki_classify_queue (chat_id, message_id)
          VALUES (?, ?)",
@@ -99,7 +101,92 @@ fn enqueue_wiki_classify(
     q.bind((1, chat_id))?;
     q.bind((2, message_id))?;
     q.next()?;
+
+    // v2 queue: spec §6.1 ingest. blake3-16 over raw text_plain bytes;
+    // NFC normalization is a phase-6 follow-up (no unicode-normalization
+    // dep yet). Match logic: existing row with same hash = noop;
+    // existing row with different hash = reset to pending and bump hash;
+    // missing row = insert pending.
+    let text_hash = blake3_16(text_plain);
+    let now = unix_now();
+
+    let existing: Option<(String, Vec<u8>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT status, text_hash FROM wiki_classify_queue_v2
+             WHERE msg_id = ? AND chat_id = ?",
+        )?;
+        stmt.bind((1, message_id))?;
+        stmt.bind((2, chat_id))?;
+        if let sqlite::State::Row = stmt.next()? {
+            Some((stmt.read::<String, _>(0)?, stmt.read::<Vec<u8>, _>(1)?))
+        } else {
+            None
+        }
+    };
+
+    match existing {
+        None => {
+            let mut stmt = conn.prepare(
+                "INSERT INTO wiki_classify_queue_v2
+                    (msg_id, chat_id, status, attempts, text_hash,
+                     enqueued_at, next_attempt_at)
+                 VALUES (?, ?, 'pending', 0, ?, ?, ?)",
+            )?;
+            stmt.bind((1, message_id))?;
+            stmt.bind((2, chat_id))?;
+            stmt.bind((3, text_hash.as_slice()))?;
+            stmt.bind((4, now))?;
+            stmt.bind((5, now))?;
+            stmt.next()?;
+        }
+        Some((_, prior_hash)) if prior_hash == text_hash => {
+            // Same text — leave attempts/error/status alone.
+        }
+        Some((status, _)) if status == "pending" => {
+            // Edited before pickup: just bump hash + reschedule.
+            let mut stmt = conn.prepare(
+                "UPDATE wiki_classify_queue_v2
+                    SET text_hash = ?, next_attempt_at = ?, enqueued_at = ?
+                  WHERE msg_id = ? AND chat_id = ?",
+            )?;
+            stmt.bind((1, text_hash.as_slice()))?;
+            stmt.bind((2, now))?;
+            stmt.bind((3, now))?;
+            stmt.bind((4, message_id))?;
+            stmt.bind((5, chat_id))?;
+            stmt.next()?;
+        }
+        Some(_) => {
+            // done / processing / failed with different text: full reset.
+            let mut stmt = conn.prepare(
+                "UPDATE wiki_classify_queue_v2
+                    SET status = 'pending', attempts = 0, last_error = NULL,
+                        hint = NULL, hint_page_id = NULL,
+                        text_hash = ?, claimed_at = NULL,
+                        next_attempt_at = ?, enqueued_at = ?
+                  WHERE msg_id = ? AND chat_id = ?",
+            )?;
+            stmt.bind((1, text_hash.as_slice()))?;
+            stmt.bind((2, now))?;
+            stmt.bind((3, now))?;
+            stmt.bind((4, message_id))?;
+            stmt.bind((5, chat_id))?;
+            stmt.next()?;
+        }
+    }
     Ok(())
+}
+
+fn blake3_16(text: &str) -> Vec<u8> {
+    blake3::hash(text.as_bytes()).as_bytes()[..16].to_vec()
+}
+
+fn unix_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn like_variants(term: &str) -> [String; 3] {
@@ -193,7 +280,12 @@ impl Store {
                             &msg.text_stripped,
                             &jamo,
                         )?;
-                        enqueue_wiki_classify(&self.conn, msg.chat_id, msg.message_id)?;
+                        enqueue_wiki_classify(
+                            &self.conn,
+                            msg.chat_id,
+                            msg.message_id,
+                            &msg.text_plain,
+                        )?;
                         outcome.inserted += 1;
                     }
                     Some((
@@ -245,7 +337,12 @@ impl Store {
                                 &msg.text_stripped,
                                 &jamo,
                             )?;
-                            enqueue_wiki_classify(&self.conn, msg.chat_id, msg.message_id)?;
+                            enqueue_wiki_classify(
+                                &self.conn,
+                                msg.chat_id,
+                                msg.message_id,
+                                &msg.text_plain,
+                            )?;
                         }
                         outcome.updated += 1;
                     }
@@ -307,6 +404,13 @@ impl Store {
                 queue_stmt.bind((1, msg.chat_id))?;
                 queue_stmt.bind((2, msg.message_id))?;
                 queue_stmt.next()?;
+
+                let mut v2_queue_stmt = self.conn.prepare(
+                    "DELETE FROM wiki_classify_queue_v2 WHERE chat_id = ? AND msg_id = ?",
+                )?;
+                v2_queue_stmt.bind((1, msg.chat_id))?;
+                v2_queue_stmt.bind((2, msg.message_id))?;
+                v2_queue_stmt.next()?;
 
                 {
                     let mut find_stmt = self.conn.prepare(
@@ -917,6 +1021,102 @@ mod tests {
     fn test_message_count() {
         let store = test_store();
         assert_eq!(store.message_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn insert_messages_batch_enqueues_v2_queue() {
+        let store = Store::open_in_memory().unwrap();
+        let msg = MessageRow {
+            message_id: 42,
+            chat_id: 1,
+            timestamp: 1_700_000_000,
+            text_plain: "first".into(),
+            text_stripped: "first".into(),
+            link: None,
+            sender_id: 0,
+        };
+        store
+            .insert_messages_batch(std::slice::from_ref(&msg))
+            .unwrap();
+
+        let mut stmt = store
+            .conn()
+            .prepare(
+                "SELECT status, attempts, length(text_hash)
+                 FROM wiki_classify_queue_v2 WHERE msg_id = 42 AND chat_id = 1",
+            )
+            .unwrap();
+        assert!(matches!(stmt.next(), Ok(sqlite::State::Row)));
+        assert_eq!(stmt.read::<String, _>(0).unwrap(), "pending");
+        assert_eq!(stmt.read::<i64, _>(1).unwrap(), 0);
+        assert_eq!(stmt.read::<i64, _>(2).unwrap(), 16);
+        drop(stmt);
+
+        // Same text re-ingested → noop, hash unchanged.
+        let prior_hash: Vec<u8> = {
+            let mut s = store
+                .conn()
+                .prepare("SELECT text_hash FROM wiki_classify_queue_v2 WHERE msg_id = 42")
+                .unwrap();
+            s.next().unwrap();
+            s.read(0).unwrap()
+        };
+        store
+            .insert_messages_batch(std::slice::from_ref(&msg))
+            .unwrap();
+        let same_hash: Vec<u8> = {
+            let mut s = store
+                .conn()
+                .prepare("SELECT text_hash FROM wiki_classify_queue_v2 WHERE msg_id = 42")
+                .unwrap();
+            s.next().unwrap();
+            s.read(0).unwrap()
+        };
+        assert_eq!(prior_hash, same_hash);
+
+        // Edited text → hash changes, status stays pending.
+        let edited = MessageRow {
+            text_plain: "second".into(),
+            text_stripped: "second".into(),
+            ..msg
+        };
+        store.insert_messages_batch(&[edited]).unwrap();
+        let new_hash: Vec<u8> = {
+            let mut s = store
+                .conn()
+                .prepare("SELECT text_hash FROM wiki_classify_queue_v2 WHERE msg_id = 42")
+                .unwrap();
+            s.next().unwrap();
+            s.read(0).unwrap()
+        };
+        assert_ne!(prior_hash, new_hash);
+    }
+
+    #[test]
+    fn delete_messages_clears_v2_queue() {
+        let store = Store::open_in_memory().unwrap();
+        let msg = MessageRow {
+            message_id: 7,
+            chat_id: 1,
+            timestamp: 1_700_000_000,
+            text_plain: "foo".into(),
+            text_stripped: "foo".into(),
+            link: None,
+            sender_id: 0,
+        };
+        store.insert_messages_batch(&[msg]).unwrap();
+        store
+            .delete_messages(&[MessageRef {
+                chat_id: 1,
+                message_id: 7,
+            }])
+            .unwrap();
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT COUNT(*) FROM wiki_classify_queue_v2 WHERE msg_id = 7")
+            .unwrap();
+        stmt.next().unwrap();
+        assert_eq!(stmt.read::<i64, _>(0).unwrap(), 0);
     }
 
     #[test]
