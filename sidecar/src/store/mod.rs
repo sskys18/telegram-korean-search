@@ -6,6 +6,7 @@ pub mod sync_state;
 pub mod wiki_category;
 pub mod wiki_page;
 pub mod wiki_queue;
+pub mod wiki_settings;
 pub mod wiki_stats;
 pub mod wiki_topic;
 
