@@ -93,15 +93,6 @@ fn enqueue_wiki_classify(
     message_id: i64,
     text_plain: &str,
 ) -> Result<(), sqlite::Error> {
-    // v1 queue: kept until phase-6 worker rewrite consumes v2 instead.
-    let mut q = conn.prepare(
-        "INSERT OR IGNORE INTO wiki_classify_queue (chat_id, message_id)
-         VALUES (?, ?)",
-    )?;
-    q.bind((1, chat_id))?;
-    q.bind((2, message_id))?;
-    q.next()?;
-
     // v2 queue: spec §6.1 ingest. NFC-normalized blake3-16 over text_plain.
     // Match logic: existing row with same hash = noop;
     // existing row with different hash = reset to pending and bump hash;
@@ -1011,6 +1002,14 @@ mod tests {
     }
 
     #[test]
+    fn text_hash_uses_nfc() {
+        use crate::wiki::norm::blake3_16_nfc;
+        let composed = "café";
+        let decomposed = "cafe\u{0301}";
+        assert_eq!(blake3_16_nfc(composed), blake3_16_nfc(decomposed));
+    }
+
+    #[test]
     fn insert_messages_batch_enqueues_v2_queue() {
         let store = Store::open_in_memory().unwrap();
         let msg = MessageRow {
@@ -1107,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_messages_batch_enqueues_classify() {
+    fn insert_messages_batch_enqueues_only_v2_classify() {
         let store = Store::open_in_memory().unwrap();
         let msgs = vec![
             MessageRow {
@@ -1132,10 +1131,20 @@ mod tests {
         store.insert_messages_batch(&msgs).unwrap();
 
         let stats = store.get_queue_stats().unwrap();
-        assert_eq!(stats.pending, 2);
+        assert_eq!(stats.pending, 0);
+
+        let v2_count = {
+            let mut stmt = store
+                .conn()
+                .prepare("SELECT COUNT(*) FROM wiki_classify_queue_v2")
+                .unwrap();
+            stmt.next().unwrap();
+            stmt.read::<i64, _>(0).unwrap()
+        };
+        assert_eq!(v2_count, 2);
 
         store.insert_messages_batch(&msgs).unwrap();
         let stats = store.get_queue_stats().unwrap();
-        assert_eq!(stats.pending, 2);
+        assert_eq!(stats.pending, 0);
     }
 }
