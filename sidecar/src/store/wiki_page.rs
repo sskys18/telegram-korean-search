@@ -835,13 +835,17 @@ impl Store {
         // 3. Refresh wiki_pages_index + pages_fts for this page.
         self.refresh_pages_index(r.page_id)?;
 
-        // 4. Retention sweep — copy spec §6.3 CTE.
-        // Keep: cited>0, last 24h, top-2 per chat by (ts DESC, salience DESC).
-        // Then drop lowest-salience among the remainder until total ≤ cap.
+        // 4. Retention sweep — spec §6.3 CTE bounded by `max_evidence_id`.
+        // Without the bound, evidence inserted between select snapshot
+        // and apply (id > max_evidence_id) is in the table when retention
+        // runs; if the new row sits low on salience the sweep would
+        // delete evidence the rewrite never even saw. Restrict every
+        // sub-query to id ≤ max_evidence_id so post-snapshot rows stay
+        // untouched and become eligible for the next rewrite cycle.
         let drop_q = "
             WITH keep AS (
                 SELECT id FROM wiki_evidence
-                 WHERE page_id = ?1
+                 WHERE page_id = ?1 AND id <= ?3
                    AND ( cited > 0
                          OR ts >= (strftime('%s','now') - 86400)
                          OR id IN (
@@ -851,21 +855,25 @@ impl Store {
                                          PARTITION BY chat_id
                                          ORDER BY ts DESC, salience DESC
                                      ) AS rn
-                                   FROM wiki_evidence WHERE page_id = ?1
+                                   FROM wiki_evidence
+                                  WHERE page_id = ?1 AND id <= ?3
                              ) WHERE rn <= 2
                          )
                        )
             ), candidates AS (
                 SELECT id FROM wiki_evidence
-                 WHERE page_id = ?1 AND id NOT IN (SELECT id FROM keep)
+                 WHERE page_id = ?1 AND id <= ?3 AND id NOT IN (SELECT id FROM keep)
                  ORDER BY salience ASC, ts ASC
-                 LIMIT MAX(0, (SELECT COUNT(*) FROM wiki_evidence WHERE page_id = ?1) - ?2)
+                 LIMIT MAX(0,
+                     (SELECT COUNT(*) FROM wiki_evidence WHERE page_id = ?1 AND id <= ?3)
+                     - ?2)
             )
             SELECT id FROM candidates";
         let drop_ids: Vec<i64> = {
             let mut q = self.conn().prepare(drop_q)?;
             q.bind((1, r.page_id))?;
             q.bind((2, r.retention_cap))?;
+            q.bind((3, r.max_evidence_id))?;
             let mut out = Vec::new();
             while let sqlite::State::Row = q.next()? {
                 out.push(q.read::<i64, _>(0)?);
@@ -1366,6 +1374,62 @@ mod tests {
         assert!(
             rows2.iter().any(|r| r.msg_id == 999),
             "new same-second evidence must appear in next delta"
+        );
+    }
+
+    #[test]
+    fn retention_sweep_preserves_post_snapshot_inserts() {
+        // The rewrite path:
+        //   1. select snapshots max_id = N
+        //   2. (LLM call — lock released; classify lands new evidence
+        //      with id N+1)
+        //   3. apply retention with retention_cap small
+        // The new id-N+1 row must survive: the rewrite never saw it,
+        // so retention has no business touching it.
+        let store = setup();
+        let pid = make_page(&store, "Bound");
+        for i in 0..10_i64 {
+            add_evidence(&store, pid, 600 + i, 1_000 + i, 0.1);
+        }
+        let (_rows, snap, max_id) = store.select_rewrite_evidence(pid, 0).unwrap();
+
+        // Simulate concurrent classify between select and apply.
+        add_evidence(&store, pid, 700, 9_999, 0.05);
+        let new_id: i64 = {
+            let mut s = store
+                .conn()
+                .prepare("SELECT id FROM wiki_evidence WHERE msg_id = 700")
+                .unwrap();
+            s.next().unwrap();
+            s.read(0).unwrap()
+        };
+        assert!(new_id > max_id, "test invariant: post-snapshot id");
+
+        store.enqueue_rewrite(pid).unwrap();
+        let _ = store.claim_rewrite_batch(1).unwrap();
+        store.conn().execute("BEGIN IMMEDIATE").unwrap();
+        store
+            .apply_rewrite_v2(&RewriteApply {
+                page_id: pid,
+                summary_md: "ok",
+                facts_json: "{\"facts_version\":1}",
+                state: "active",
+                new_aliases: &[],
+                retention_cap: 1,
+                snapshot_at: snap,
+                max_evidence_id: max_id,
+            })
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+
+        let mut s = store
+            .conn()
+            .prepare("SELECT 1 FROM wiki_evidence WHERE id = ?")
+            .unwrap();
+        s.bind((1, new_id)).unwrap();
+        assert!(
+            matches!(s.next().unwrap(), sqlite::State::Row),
+            "post-snapshot evidence must survive retention"
         );
     }
 
