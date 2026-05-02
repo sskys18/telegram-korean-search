@@ -245,6 +245,86 @@ pub struct NewEvidenceV2<'a> {
     pub salience: f64,
 }
 
+// ---- Phase 8 trending (spec §6.4) -----------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrendingWindow {
+    H1,
+    H24,
+    D7,
+}
+
+impl TrendingWindow {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::H1 => "1h",
+            Self::H24 => "24h",
+            Self::D7 => "7d",
+        }
+    }
+    pub fn span_secs(self) -> i64 {
+        match self {
+            Self::H1 => 3_600,
+            Self::H24 => 86_400,
+            Self::D7 => 7 * 86_400,
+        }
+    }
+    /// Spec §6.4 "minimum refresh gap": 5 min for 1h+24h, 1h for 7d.
+    pub fn min_refresh_gap_secs(self) -> i64 {
+        match self {
+            Self::H1 | Self::H24 => 300,
+            Self::D7 => 3_600,
+        }
+    }
+    pub fn all() -> [Self; 3] {
+        [Self::H1, Self::H24, Self::D7]
+    }
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "1h" => Some(Self::H1),
+            "24h" => Some(Self::H24),
+            "7d" => Some(Self::D7),
+            _ => None,
+        }
+    }
+}
+
+/// Captured once per refresh tick; threaded through every store call so
+/// post-snapshot inserts can never silently leak in. Mirrors the same
+/// fix phase 7 applied to rewrite delta selection.
+#[derive(Debug, Clone, Copy)]
+pub struct TrendingSnapshot {
+    pub window: TrendingWindow,
+    pub window_start: i64,
+    pub prior_start: i64,
+    pub now: i64,
+    pub max_evidence_id: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrendingCandidate {
+    pub page_id: i64,
+    pub kind: String,
+    pub title: String,
+    pub created_at: i64,
+    pub ec: i64,
+    pub chats: i64,
+    pub senders: i64,
+    pub last_ts: i64,
+    pub prior_ec: i64,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrendingApplyRow {
+    pub page_id: i64,
+    pub rank: i64,
+    pub hook: String,
+    pub reason_code: String,
+    pub reason_metrics: String,
+    pub sparkline: String,
+}
+
 impl Store {
     /// Dedup by `title_norm`, then alias hits, otherwise insert a v2 page.
     /// Must be called inside the caller's transaction.
@@ -918,6 +998,280 @@ impl Store {
     }
 }
 
+/// Derive `(reason_code, reason_metrics_json)` for a candidate. Pure
+/// function (no DB) so the worker can call this once per shortlisted page.
+/// Spec §6.4 table priority — most specific first:
+///   fresh_event > surge > cross_chat > spread > default.
+/// Deferred:
+///   - sustained: needs cross-refresh history (rolling median across
+///     ≥3 prior refreshes); not in v9 schema. Track in handoff.
+///   - pinned_active: spec puts pinned pages in a separate UI slot, not
+///     part of the ranked top-10. Filter from shortlist (`pinned = 0`)
+///     and surface separately when the UI lands.
+pub fn derive_reason_code(c: &TrendingCandidate, now: i64) -> (String, String) {
+    let velocity_ratio = if c.prior_ec >= 3 {
+        (c.ec as f64) / (c.prior_ec as f64)
+    } else {
+        0.0
+    };
+    let age_secs = (now - c.created_at).max(0);
+    let code = if c.kind == "event" && age_secs <= 7_200 {
+        "fresh_event"
+    } else if c.prior_ec >= 3 && velocity_ratio >= 2.0 {
+        "surge"
+    } else if c.chats >= 3 && c.senders >= 5 {
+        "cross_chat"
+    } else if c.chats >= 4 {
+        "spread"
+    } else {
+        "default"
+    };
+    let metrics = serde_json::json!({
+        "ec": c.ec,
+        "chats": c.chats,
+        "senders": c.senders,
+        "prior_ec": c.prior_ec,
+        "velocity": (velocity_ratio * 100.0).round() / 100.0,
+        "last_ts": c.last_ts,
+        "age_secs": age_secs,
+    });
+    (code.to_string(), metrics.to_string())
+}
+
+// ---- Phase 8 trending (spec §6.4) impls -----------------------------------
+
+impl Store {
+    /// Global `MAX(wiki_evidence.id)`. Snapshotted once per refresh tick;
+    /// passing this through every downstream call keeps post-snapshot
+    /// inserts off the shortlist + sparkline + sample queries (same race
+    /// phase 7 closed for rewrite delta selection).
+    pub fn current_max_evidence_id(&self) -> Result<i64, sqlite::Error> {
+        let mut s = self
+            .conn()
+            .prepare("SELECT COALESCE(MAX(id), 0) FROM wiki_evidence")?;
+        s.next()?;
+        s.read::<i64, _>(0)
+    }
+
+    /// Returns `(last_evidence_id, last_computed_at)`. Missing row → (0, 0)
+    /// so the strict `MAX(id) > last_evidence_id` dirty test fires for any
+    /// non-empty evidence table on first run.
+    pub fn read_trending_watermark(
+        &self,
+        window: TrendingWindow,
+    ) -> Result<(i64, i64), sqlite::Error> {
+        let mut s = self.conn().prepare(
+            "SELECT last_evidence_id, last_computed_at \
+             FROM trending_watermark WHERE window = ?",
+        )?;
+        s.bind((1, window.label()))?;
+        if let sqlite::State::Row = s.next()? {
+            Ok((s.read::<i64, _>(0)?, s.read::<i64, _>(1)?))
+        } else {
+            Ok((0, 0))
+        }
+    }
+
+    /// Spec §6.4 shortlist. Score is computed in Rust because SQLite's
+    /// `LN`/`LEAST` are compile-time-optional; bundled sqlcipher may not
+    /// have math functions. SQL just emits aggregates; ranking happens here.
+    /// Bounded by `snap.max_evidence_id` per the locked rewrite-phase rule.
+    pub fn shortlist_trending(
+        &self,
+        snap: &TrendingSnapshot,
+        limit: i64,
+    ) -> Result<Vec<TrendingCandidate>, sqlite::Error> {
+        let q = "
+            WITH window_e AS (
+                SELECT page_id, chat_id, sender_id, ts
+                  FROM wiki_evidence
+                 WHERE id <= ?1 AND ts >= ?2 AND ts < ?3
+            ),
+            agg AS (
+                SELECT page_id,
+                       COUNT(*) AS ec,
+                       COUNT(DISTINCT chat_id) AS chats,
+                       COUNT(DISTINCT sender_id) AS senders,
+                       MAX(ts) AS last_ts
+                  FROM window_e
+                 GROUP BY page_id
+            ),
+            prior AS (
+                SELECT page_id, COUNT(*) AS ec2
+                  FROM wiki_evidence
+                 WHERE id <= ?1 AND ts >= ?4 AND ts < ?2
+                 GROUP BY page_id
+            )
+            SELECT p.id, p.kind, p.title, p.created_at,
+                   a.ec, a.chats, a.senders, a.last_ts,
+                   COALESCE(pr.ec2, 0) AS prior_ec
+              FROM wiki_pages_v2 p
+              JOIN agg a ON a.page_id = p.id
+              LEFT JOIN prior pr ON pr.page_id = p.id
+             WHERE p.state = 'active' AND p.pinned = 0";
+        let mut s = self.conn().prepare(q)?;
+        s.bind((1, snap.max_evidence_id))?;
+        s.bind((2, snap.window_start))?;
+        s.bind((3, snap.now))?;
+        s.bind((4, snap.prior_start))?;
+        let mut rows: Vec<TrendingCandidate> = Vec::new();
+        while let sqlite::State::Row = s.next()? {
+            let last_ts = s.read::<i64, _>("last_ts")?;
+            let ec = s.read::<i64, _>("ec")?;
+            let chats = s.read::<i64, _>("chats")?;
+            let senders = s.read::<i64, _>("senders")?;
+            let prior_ec = s.read::<i64, _>("prior_ec")?;
+            // Spec §6.4 score:
+            //   ln(1+ec) + 0.5*ln(1+chats) + 0.3*ln(1+senders)
+            //   + (velocity term, capped at 3×, requires prior_ec ≥ 3)
+            //   - 0.1*(now - last_ts)/3600
+            let velocity = if prior_ec >= 3 {
+                ((ec as f64) / (prior_ec as f64)).min(3.0) - 1.0
+            } else {
+                0.0
+            };
+            let recency = -0.1 * ((snap.now - last_ts).max(0) as f64) / 3_600.0;
+            let score = (1.0 + ec as f64).ln()
+                + 0.5 * (1.0 + chats as f64).ln()
+                + 0.3 * (1.0 + senders as f64).ln()
+                + velocity
+                + recency;
+            rows.push(TrendingCandidate {
+                page_id: s.read::<i64, _>("id")?,
+                kind: s.read::<String, _>("kind")?,
+                title: s.read::<String, _>("title")?,
+                created_at: s.read::<i64, _>("created_at")?,
+                ec,
+                chats,
+                senders,
+                last_ts,
+                prior_ec,
+                score,
+            });
+        }
+        // Rank by score DESC, tie-break by last_ts DESC.
+        rows.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.last_ts.cmp(&a.last_ts))
+        });
+        if limit > 0 {
+            rows.truncate(limit as usize);
+        }
+        Ok(rows)
+    }
+
+    /// Top-N highest-salience excerpts in the window for a given page —
+    /// fed to the codex reranker as `samples`.
+    pub fn trending_sample_excerpts(
+        &self,
+        page_id: i64,
+        snap: &TrendingSnapshot,
+        n: i64,
+    ) -> Result<Vec<String>, sqlite::Error> {
+        if n <= 0 {
+            return Ok(Vec::new());
+        }
+        let mut s = self.conn().prepare(
+            "SELECT excerpt FROM wiki_evidence
+              WHERE page_id = ? AND id <= ? AND ts >= ? AND ts < ?
+              ORDER BY salience DESC, ts DESC
+              LIMIT ?",
+        )?;
+        s.bind((1, page_id))?;
+        s.bind((2, snap.max_evidence_id))?;
+        s.bind((3, snap.window_start))?;
+        s.bind((4, snap.now))?;
+        s.bind((5, n))?;
+        let mut out = Vec::new();
+        while let sqlite::State::Row = s.next()? {
+            out.push(s.read::<String, _>(0)?);
+        }
+        Ok(out)
+    }
+
+    /// 24 equal-width buckets across `[window_start, now)`. Counts evidence
+    /// timestamps per bucket, capped at u32::MAX.
+    pub fn compute_sparkline(
+        &self,
+        page_id: i64,
+        snap: &TrendingSnapshot,
+    ) -> Result<[u32; 24], sqlite::Error> {
+        let span = (snap.now - snap.window_start).max(1);
+        let bucket_w = (span as f64) / 24.0;
+        let mut buckets = [0u32; 24];
+        let mut s = self.conn().prepare(
+            "SELECT ts FROM wiki_evidence
+              WHERE page_id = ? AND id <= ? AND ts >= ? AND ts < ?",
+        )?;
+        s.bind((1, page_id))?;
+        s.bind((2, snap.max_evidence_id))?;
+        s.bind((3, snap.window_start))?;
+        s.bind((4, snap.now))?;
+        while let sqlite::State::Row = s.next()? {
+            let ts = s.read::<i64, _>(0)?;
+            let off = ((ts - snap.window_start).max(0) as f64) / bucket_w;
+            let idx = (off as usize).min(23);
+            buckets[idx] = buckets[idx].saturating_add(1);
+        }
+        Ok(buckets)
+    }
+
+    /// Atomic spec §6.4 apply: replace cache rows for the window + UPSERT
+    /// watermark. Caller wraps with BEGIN IMMEDIATE / COMMIT so a crash
+    /// mid-write never half-publishes.
+    pub fn apply_trending(
+        &self,
+        snap: &TrendingSnapshot,
+        rows: &[TrendingApplyRow],
+    ) -> Result<(), sqlite::Error> {
+        // 1. Wipe prior cache for this window.
+        let mut del = self
+            .conn()
+            .prepare("DELETE FROM trending_cache WHERE window = ?")?;
+        del.bind((1, snap.window.label()))?;
+        del.next()?;
+
+        // 2. Insert new rows. UNIQUE(window, rank) guarantees rank dedup.
+        if !rows.is_empty() {
+            let mut ins = self.conn().prepare(
+                "INSERT INTO trending_cache
+                    (window, page_id, rank, hook, reason_code,
+                     reason_metrics, sparkline, computed_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )?;
+            for r in rows {
+                ins.bind((1, snap.window.label()))?;
+                ins.bind((2, r.page_id))?;
+                ins.bind((3, r.rank))?;
+                ins.bind((4, r.hook.as_str()))?;
+                ins.bind((5, r.reason_code.as_str()))?;
+                ins.bind((6, r.reason_metrics.as_str()))?;
+                ins.bind((7, r.sparkline.as_str()))?;
+                ins.bind((8, snap.now))?;
+                ins.next()?;
+                ins.reset()?;
+            }
+        }
+
+        // 3. Watermark UPSERT — `last_evidence_id` strictly monotonic so a
+        // late retry (e.g. crash recovery) never rewinds it.
+        let mut wm = self.conn().prepare(
+            "INSERT INTO trending_watermark (window, last_evidence_id, last_computed_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(window) DO UPDATE SET
+                     last_evidence_id = MAX(last_evidence_id, excluded.last_evidence_id),
+                     last_computed_at = excluded.last_computed_at",
+        )?;
+        wm.bind((1, snap.window.label()))?;
+        wm.bind((2, snap.max_evidence_id))?;
+        wm.bind((3, snap.now))?;
+        wm.next()?;
+        Ok(())
+    }
+}
+
 pub fn compute_source_hash(sources: &[(i64, i64)]) -> String {
     let mut hasher = Sha256::new();
     for &(chat_id, message_id) in sources {
@@ -1451,5 +1805,340 @@ mod tests {
             35,
             "all 35 rows should surface (30 delta + 5 top-K)"
         );
+    }
+
+    // ---- Phase 8 trending tests --------------------------------------------
+
+    use super::{TrendingApplyRow, TrendingSnapshot, TrendingWindow};
+
+    fn add_evidence_chat(
+        store: &Store,
+        page_id: i64,
+        msg_id: i64,
+        chat_id: i64,
+        sender_id: i64,
+        ts: i64,
+        salience: f64,
+    ) {
+        store.conn().execute("BEGIN").unwrap();
+        let n = NewEvidenceV2 {
+            page_id,
+            msg_id,
+            chat_id,
+            sender_id,
+            ts,
+            excerpt: "x",
+            salience,
+        };
+        store.insert_evidence_v2(&n).unwrap();
+        store.conn().execute("COMMIT").unwrap();
+    }
+
+    fn snap(window: TrendingWindow, now: i64, max_id: i64) -> TrendingSnapshot {
+        TrendingSnapshot {
+            window,
+            window_start: now - window.span_secs(),
+            prior_start: now - 2 * window.span_secs(),
+            now,
+            max_evidence_id: max_id,
+        }
+    }
+
+    #[test]
+    fn trending_watermark_default_zero() {
+        let store = setup();
+        let (id, ts) = store.read_trending_watermark(TrendingWindow::H24).unwrap();
+        assert_eq!(id, 0);
+        assert_eq!(ts, 0);
+    }
+
+    #[test]
+    fn shortlist_excludes_pinned_and_inactive() {
+        let store = setup();
+        // Need second chat for pinned page evidence.
+        store
+            .conn()
+            .execute("INSERT INTO chats (chat_id, title, chat_type) VALUES (2, 'B', 'channel')")
+            .unwrap();
+        let active = make_page(&store, "Active");
+        let pinned = make_page(&store, "Pinned");
+        let inactive = make_page(&store, "Inactive");
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE wiki_pages_v2 SET pinned = 1 WHERE id = {pinned}"
+            ))
+            .unwrap();
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE wiki_pages_v2 SET state = 'hidden' WHERE id = {inactive}"
+            ))
+            .unwrap();
+        let now = 10_000;
+        for (pid, m) in &[(active, 10), (pinned, 20), (inactive, 30)] {
+            add_evidence_chat(&store, *pid, *m, 1, 100, now - 100, 0.5);
+        }
+        let max_id = store.current_max_evidence_id().unwrap();
+        let s = snap(TrendingWindow::H1, now, max_id);
+        let rows = store.shortlist_trending(&s, 30).unwrap();
+        let ids: Vec<i64> = rows.iter().map(|c| c.page_id).collect();
+        assert!(ids.contains(&active));
+        assert!(!ids.contains(&pinned));
+        assert!(!ids.contains(&inactive));
+    }
+
+    #[test]
+    fn shortlist_bounded_by_max_evidence_id() {
+        // Snapshot caps shortlist; later inserts must not show up until
+        // a new snapshot covers them.
+        let store = setup();
+        let pid = make_page(&store, "P");
+        let now = 10_000;
+        add_evidence_chat(&store, pid, 1, 1, 0, now - 100, 0.5);
+        let snap1_max = store.current_max_evidence_id().unwrap();
+        // Post-snapshot insert.
+        add_evidence_chat(&store, pid, 2, 1, 0, now - 50, 0.5);
+        let s1 = snap(TrendingWindow::H1, now, snap1_max);
+        let rows = store.shortlist_trending(&s1, 30).unwrap();
+        let row = rows.iter().find(|c| c.page_id == pid).unwrap();
+        assert_eq!(row.ec, 1, "post-snapshot row must not leak in");
+    }
+
+    #[test]
+    fn shortlist_velocity_pushes_surge() {
+        // page_a: low ec, low prior. page_b: 5× prior in window — should outrank.
+        let store = setup();
+        let a = make_page(&store, "Calm");
+        let b = make_page(&store, "Surge");
+        let now = 100_000;
+        let win_start = now - 3_600;
+        let prior_start = now - 7_200;
+        // page_a: 5 in window, 5 prior.
+        for i in 0..5_i64 {
+            add_evidence_chat(&store, a, 100 + i, 1, 0, win_start + 10 + i, 0.5);
+            add_evidence_chat(&store, a, 200 + i, 1, 0, prior_start + 10 + i, 0.5);
+        }
+        // page_b: 15 in window, 3 prior.
+        for i in 0..15_i64 {
+            add_evidence_chat(&store, b, 300 + i, 1, 0, win_start + 10 + i, 0.5);
+        }
+        for i in 0..3_i64 {
+            add_evidence_chat(&store, b, 400 + i, 1, 0, prior_start + 10 + i, 0.5);
+        }
+        let max_id = store.current_max_evidence_id().unwrap();
+        let s = snap(TrendingWindow::H1, now, max_id);
+        let rows = store.shortlist_trending(&s, 30).unwrap();
+        let pos_a = rows.iter().position(|c| c.page_id == a).unwrap();
+        let pos_b = rows.iter().position(|c| c.page_id == b).unwrap();
+        assert!(pos_b < pos_a, "surge page must rank above steady page");
+    }
+
+    #[test]
+    fn sparkline_buckets_correctly() {
+        let store = setup();
+        let pid = make_page(&store, "Spark");
+        let now = 24_000;
+        let span = 24_000_i64;
+        let win_start = now - span;
+        // Place one evidence at the start of every other bucket: bucket 0,2,4,...
+        // bucket width = 1000s.
+        for b in (0..24_i64).step_by(2) {
+            add_evidence_chat(&store, pid, 1_000 + b, 1, 0, win_start + b * 1_000 + 1, 0.5);
+        }
+        let max_id = store.current_max_evidence_id().unwrap();
+        let s = TrendingSnapshot {
+            window: TrendingWindow::H24,
+            window_start: win_start,
+            prior_start: win_start - span,
+            now,
+            max_evidence_id: max_id,
+        };
+        let buckets = store.compute_sparkline(pid, &s).unwrap();
+        let total: u32 = buckets.iter().sum();
+        assert_eq!(total, 12, "12 evidences total");
+        for (i, &count) in buckets.iter().enumerate() {
+            let expected = if i % 2 == 0 { 1 } else { 0 };
+            assert_eq!(count, expected, "bucket {i}");
+        }
+    }
+
+    #[test]
+    fn apply_trending_replaces_window_atomically() {
+        let store = setup();
+        let pid_a = make_page(&store, "A");
+        let pid_b = make_page(&store, "B");
+        let now = 10_000;
+        let s = snap(TrendingWindow::H24, now, 0);
+
+        // First apply: 2 rows.
+        store.conn().execute("BEGIN IMMEDIATE").unwrap();
+        store
+            .apply_trending(
+                &s,
+                &[
+                    TrendingApplyRow {
+                        page_id: pid_a,
+                        rank: 1,
+                        hook: "first".into(),
+                        reason_code: "default".into(),
+                        reason_metrics: "{}".into(),
+                        sparkline: "[]".into(),
+                    },
+                    TrendingApplyRow {
+                        page_id: pid_b,
+                        rank: 2,
+                        hook: "second".into(),
+                        reason_code: "default".into(),
+                        reason_metrics: "{}".into(),
+                        sparkline: "[]".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+
+        let count = |store: &Store, w: &str| -> i64 {
+            let mut q = store
+                .conn()
+                .prepare("SELECT COUNT(*) FROM trending_cache WHERE window = ?")
+                .unwrap();
+            q.bind((1, w)).unwrap();
+            q.next().unwrap();
+            q.read::<i64, _>(0).unwrap()
+        };
+        assert_eq!(count(&store, "24h"), 2);
+
+        // Second apply for the same window: 1 row — must replace.
+        store.conn().execute("BEGIN IMMEDIATE").unwrap();
+        store
+            .apply_trending(
+                &s,
+                &[TrendingApplyRow {
+                    page_id: pid_a,
+                    rank: 1,
+                    hook: "rerun".into(),
+                    reason_code: "default".into(),
+                    reason_metrics: "{}".into(),
+                    sparkline: "[]".into(),
+                }],
+            )
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+        assert_eq!(count(&store, "24h"), 1);
+
+        // Watermark advanced.
+        let (last_id, last_ts) = store.read_trending_watermark(TrendingWindow::H24).unwrap();
+        assert_eq!(last_id, 0);
+        assert_eq!(last_ts, now);
+    }
+
+    #[test]
+    fn apply_trending_watermark_monotonic() {
+        let store = setup();
+        let now = 10_000;
+        let s_low = snap(TrendingWindow::H1, now, 5);
+        let s_high = snap(TrendingWindow::H1, now + 10, 12);
+        store.conn().execute("BEGIN IMMEDIATE").unwrap();
+        store.apply_trending(&s_high, &[]).unwrap();
+        store.conn().execute("COMMIT").unwrap();
+        // A late retry with a smaller max_evidence_id must not rewind.
+        store.conn().execute("BEGIN IMMEDIATE").unwrap();
+        store.apply_trending(&s_low, &[]).unwrap();
+        store.conn().execute("COMMIT").unwrap();
+        let (last_id, _) = store.read_trending_watermark(TrendingWindow::H1).unwrap();
+        assert_eq!(last_id, 12, "watermark must not regress");
+    }
+
+    use super::derive_reason_code;
+
+    fn make_cand(
+        kind: &str,
+        ec: i64,
+        chats: i64,
+        senders: i64,
+        prior_ec: i64,
+        age: i64,
+    ) -> super::TrendingCandidate {
+        super::TrendingCandidate {
+            page_id: 1,
+            kind: kind.into(),
+            title: "T".into(),
+            created_at: 10_000 - age,
+            ec,
+            chats,
+            senders,
+            last_ts: 10_000,
+            prior_ec,
+            score: 0.0,
+        }
+    }
+
+    #[test]
+    fn reason_fresh_event_first() {
+        // Even with surge metrics, fresh_event wins because it's first in priority.
+        let c = make_cand("event", 30, 5, 8, 5, 3_600);
+        let (code, _) = derive_reason_code(&c, 10_000);
+        assert_eq!(code, "fresh_event");
+    }
+
+    #[test]
+    fn reason_event_too_old_falls_through() {
+        // Event > 2h old; fresh_event off, surge takes over.
+        let c = make_cand("event", 30, 1, 1, 5, 7_201);
+        let (code, _) = derive_reason_code(&c, 10_000);
+        assert_eq!(code, "surge");
+    }
+
+    #[test]
+    fn reason_surge_needs_prior_ge_3() {
+        // velocity 100/2 huge, but prior < 3 → no surge.
+        let c = make_cand("topic", 100, 2, 2, 2, 0);
+        let (code, _) = derive_reason_code(&c, 10_000);
+        assert_eq!(code, "default");
+    }
+
+    #[test]
+    fn reason_surge_classic() {
+        let c = make_cand("topic", 30, 1, 1, 5, 10_000);
+        let (code, _) = derive_reason_code(&c, 10_000);
+        assert_eq!(code, "surge");
+    }
+
+    #[test]
+    fn reason_cross_chat_before_spread() {
+        // 3 chats + 5 senders → cross_chat (more specific than spread's
+        // chats ≥ 4 but with only 3 here).
+        let c = make_cand("topic", 5, 3, 5, 0, 10_000);
+        let (code, _) = derive_reason_code(&c, 10_000);
+        assert_eq!(code, "cross_chat");
+    }
+
+    #[test]
+    fn reason_spread_when_no_cross_chat() {
+        let c = make_cand("topic", 5, 4, 1, 0, 10_000);
+        let (code, _) = derive_reason_code(&c, 10_000);
+        assert_eq!(code, "spread");
+    }
+
+    #[test]
+    fn reason_default_fallthrough() {
+        let c = make_cand("topic", 5, 1, 1, 0, 10_000);
+        let (code, metrics) = derive_reason_code(&c, 10_000);
+        assert_eq!(code, "default");
+        assert!(metrics.contains("\"ec\":5"));
+    }
+
+    #[test]
+    fn shortlist_limit_caps_results() {
+        let store = setup();
+        for i in 0..5_i64 {
+            let pid = make_page(&store, &format!("P{i}"));
+            add_evidence_chat(&store, pid, 100 + i, 1, 0, 9_000 + i, 0.5);
+        }
+        let max_id = store.current_max_evidence_id().unwrap();
+        let s = snap(TrendingWindow::H1, 10_000, max_id);
+        let rows = store.shortlist_trending(&s, 3).unwrap();
+        assert_eq!(rows.len(), 3);
     }
 }
