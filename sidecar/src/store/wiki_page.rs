@@ -245,6 +245,19 @@ pub struct NewEvidenceV2<'a> {
     pub salience: f64,
 }
 
+// ---- Phase 9 digest (spec §6.5) -------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct DigestRow {
+    pub chat_id: i64,
+    pub page_id: i64,
+    pub kind: String,
+    pub state: String,
+    pub title: String,
+    pub n: i64,
+    pub last_ts: i64,
+}
+
 // ---- Phase 8 trending (spec §6.4) -----------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1288,6 +1301,63 @@ impl Store {
     }
 }
 
+// ---- Phase 9 digest (spec §6.5) impls -------------------------------------
+
+impl Store {
+    /// Spec §6.5 digest. Per-chat group-by since `wiki_last_open[chat_id]`,
+    /// filter out hidden + resolved pages, `HAVING n >= 3`. The cursor
+    /// (`wiki_last_open`) is advanced only by `mark_chat_read`, never by
+    /// reading the digest, so the user can repeatedly open the panel
+    /// without the "since last read" boundary moving under them.
+    pub fn list_digest_rows(&self, limit: i64) -> Result<Vec<DigestRow>, sqlite::Error> {
+        let q = "
+            SELECT e.chat_id, e.page_id, p.kind, p.state, p.title,
+                   COUNT(*) AS n, MAX(e.ts) AS last_ts
+              FROM wiki_evidence e
+              JOIN wiki_pages_v2 p ON p.id = e.page_id
+             WHERE e.ts > COALESCE(
+                       (SELECT last_open_at FROM wiki_last_open
+                          WHERE chat_id = e.chat_id),
+                       0)
+               AND p.state != 'hidden'
+               AND p.state != 'resolved'
+             GROUP BY e.chat_id, e.page_id
+             HAVING n >= 3
+             ORDER BY e.chat_id, n DESC, last_ts DESC
+             LIMIT ?";
+        let mut s = self.conn().prepare(q)?;
+        s.bind((1, limit.max(0)))?;
+        let mut out = Vec::new();
+        while let sqlite::State::Row = s.next()? {
+            out.push(DigestRow {
+                chat_id: s.read::<i64, _>("chat_id")?,
+                page_id: s.read::<i64, _>("page_id")?,
+                kind: s.read::<String, _>("kind")?,
+                state: s.read::<String, _>("state")?,
+                title: s.read::<String, _>("title")?,
+                n: s.read::<i64, _>("n")?,
+                last_ts: s.read::<i64, _>("last_ts")?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Upsert the per-chat digest cursor. Called on explicit "mark read"
+    /// or when the chat itself is opened — NOT on panel-open (spec §6.5).
+    pub fn mark_chat_read(&self, chat_id: i64, at: i64) -> Result<(), sqlite::Error> {
+        let mut s = self.conn().prepare(
+            "INSERT INTO wiki_last_open (chat_id, last_open_at)
+                 VALUES (?, ?)
+                 ON CONFLICT(chat_id) DO UPDATE SET
+                     last_open_at = MAX(last_open_at, excluded.last_open_at)",
+        )?;
+        s.bind((1, chat_id))?;
+        s.bind((2, at))?;
+        s.next()?;
+        Ok(())
+    }
+}
+
 pub fn compute_source_hash(sources: &[(i64, i64)]) -> String {
     let mut hasher = Sha256::new();
     for &(chat_id, message_id) in sources {
@@ -2217,5 +2287,160 @@ mod tests {
         let s = snap(TrendingWindow::H1, 10_000, max_id);
         let rows = store.shortlist_trending(&s, 3).unwrap();
         assert_eq!(rows.len(), 3);
+    }
+
+    // ---- Phase 9 digest tests ----------------------------------------------
+
+    fn add_evi(store: &Store, page_id: i64, msg_id: i64, chat_id: i64, ts: i64) {
+        // Need chats row for the chat_id; create lazily.
+        let mut q = store
+            .conn()
+            .prepare("SELECT 1 FROM chats WHERE chat_id = ?")
+            .unwrap();
+        q.bind((1, chat_id)).unwrap();
+        if !matches!(q.next().unwrap(), sqlite::State::Row) {
+            store
+                .conn()
+                .execute(format!(
+                    "INSERT INTO chats (chat_id, title, chat_type) VALUES ({chat_id}, 'C', 'channel')"
+                ))
+                .unwrap();
+        }
+        store.conn().execute("BEGIN").unwrap();
+        store
+            .insert_evidence_v2(&NewEvidenceV2 {
+                page_id,
+                msg_id,
+                chat_id,
+                sender_id: 0,
+                ts,
+                excerpt: "x",
+                salience: 0.5,
+            })
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn digest_having_n_at_least_3() {
+        let store = setup();
+        let pid = make_page(&store, "Topic");
+        // Two evidences below threshold.
+        add_evi(&store, pid, 1, 1, 1_000);
+        add_evi(&store, pid, 2, 1, 1_001);
+        let rows = store.list_digest_rows(200).unwrap();
+        assert!(rows.is_empty(), "n=2 must not surface");
+        add_evi(&store, pid, 3, 1, 1_002);
+        let rows = store.list_digest_rows(200).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].n, 3);
+    }
+
+    #[test]
+    fn digest_filters_hidden_and_resolved() {
+        let store = setup();
+        let active = make_page(&store, "Active");
+        let hidden = make_page(&store, "Hidden");
+        let resolved = make_page(&store, "Resolved");
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE wiki_pages_v2 SET state='hidden' WHERE id={hidden}"
+            ))
+            .unwrap();
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE wiki_pages_v2 SET state='resolved' WHERE id={resolved}"
+            ))
+            .unwrap();
+        for (pid, base) in &[(active, 100_i64), (hidden, 200), (resolved, 300)] {
+            for i in 0..3_i64 {
+                add_evi(&store, *pid, base + i, 1, 1_000 + i);
+            }
+        }
+        let rows = store.list_digest_rows(200).unwrap();
+        let ids: Vec<i64> = rows.iter().map(|r| r.page_id).collect();
+        assert_eq!(ids, vec![active]);
+    }
+
+    #[test]
+    fn digest_groups_per_chat_and_ordering() {
+        let store = setup();
+        let p1 = make_page(&store, "P1");
+        let p2 = make_page(&store, "P2");
+        // Chat 1: p1 has n=4, p2 has n=3 → p1 first.
+        for i in 0..4_i64 {
+            add_evi(&store, p1, 100 + i, 1, 1_000 + i);
+        }
+        for i in 0..3_i64 {
+            add_evi(&store, p2, 200 + i, 1, 2_000 + i);
+        }
+        // Chat 2: p1 has n=3.
+        for i in 0..3_i64 {
+            add_evi(&store, p1, 300 + i, 2, 1_500 + i);
+        }
+        let rows = store.list_digest_rows(200).unwrap();
+        assert_eq!(rows.len(), 3);
+        // Ordering: chat_id ASC; within chat, n DESC.
+        assert_eq!((rows[0].chat_id, rows[0].page_id), (1, p1));
+        assert_eq!((rows[1].chat_id, rows[1].page_id), (1, p2));
+        assert_eq!((rows[2].chat_id, rows[2].page_id), (2, p1));
+        assert_eq!(rows[0].n, 4);
+        assert_eq!(rows[1].n, 3);
+    }
+
+    #[test]
+    fn digest_respects_last_open_cursor() {
+        let store = setup();
+        let pid = make_page(&store, "P");
+        for i in 0..5_i64 {
+            add_evi(&store, pid, 100 + i, 1, 1_000 + i);
+        }
+        // Mark chat 1 read at ts=1_002; only ts > 1_002 count → 2 evidences,
+        // below threshold.
+        store.mark_chat_read(1, 1_002).unwrap();
+        let rows = store.list_digest_rows(200).unwrap();
+        assert!(rows.is_empty(), "below threshold after cursor");
+        // Add 1 more evidence past cursor → still only 3 above cursor.
+        add_evi(&store, pid, 999, 1, 1_010);
+        let rows = store.list_digest_rows(200).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].n, 3);
+    }
+
+    #[test]
+    fn mark_chat_read_monotonic() {
+        let store = setup();
+        store.mark_chat_read(1, 1_000).unwrap();
+        // Earlier ts must not rewind.
+        store.mark_chat_read(1, 500).unwrap();
+        let mut q = store
+            .conn()
+            .prepare("SELECT last_open_at FROM wiki_last_open WHERE chat_id = 1")
+            .unwrap();
+        q.next().unwrap();
+        assert_eq!(q.read::<i64, _>(0).unwrap(), 1_000);
+        // Forward bump works.
+        store.mark_chat_read(1, 2_000).unwrap();
+        let mut q = store
+            .conn()
+            .prepare("SELECT last_open_at FROM wiki_last_open WHERE chat_id = 1")
+            .unwrap();
+        q.next().unwrap();
+        assert_eq!(q.read::<i64, _>(0).unwrap(), 2_000);
+    }
+
+    #[test]
+    fn digest_limit_respected() {
+        let store = setup();
+        for i in 0..5_i64 {
+            let pid = make_page(&store, &format!("P{i}"));
+            for j in 0..3_i64 {
+                add_evi(&store, pid, i * 100 + j, 1, 1_000 + j);
+            }
+        }
+        let rows = store.list_digest_rows(2).unwrap();
+        assert_eq!(rows.len(), 2);
     }
 }
