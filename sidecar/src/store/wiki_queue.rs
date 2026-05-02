@@ -423,6 +423,12 @@ impl Store {
     /// `processing` claim so a concurrent classify cannot wipe a worker's
     /// lease (and trick the worker into committing against stale rows).
     pub fn enqueue_rewrite(&self, page_id: i64) -> Result<(), sqlite::Error> {
+        // Force enqueued_at strictly greater than both the previous
+        // enqueued_at AND the current claimed_at. mark_rewrite_done detects
+        // a "re-enqueue arrived during processing" via `enqueued_at >
+        // claimed_at`; if both happen in the same wall-clock second the
+        // naive `enqueued_at = now()` write would lose the signal and the
+        // worker would mark the row done with the new evidence stranded.
         let now = crate::wiki::norm::unix_now();
         let mut s = self.conn().prepare(
             "INSERT INTO wiki_rewrite_queue
@@ -433,7 +439,8 @@ impl Store {
                     WHEN wiki_rewrite_queue.status = 'processing' THEN 'processing'
                     ELSE 'pending'
                 END,
-                enqueued_at = ?,
+                enqueued_at = MAX(?, wiki_rewrite_queue.enqueued_at + 1,
+                                  COALESCE(wiki_rewrite_queue.claimed_at, 0) + 1),
                 next_attempt_at = CASE
                     WHEN wiki_rewrite_queue.status = 'processing' THEN wiki_rewrite_queue.next_attempt_at
                     ELSE ?
@@ -855,6 +862,26 @@ mod tests {
         assert_eq!(
             stats.pending, 1,
             "concurrent re-enqueue must re-arm pending"
+        );
+        assert_eq!(stats.done, 0);
+    }
+
+    #[test]
+    fn rewrite_done_reenqueue_survives_same_second_clock() {
+        // Real-world: claim and re-enqueue often land in the same unix
+        // second. The upsert must force enqueued_at strictly above
+        // claimed_at so mark_done's `>` detection still fires.
+        let store = setup_store_with_messages();
+        let pid = make_page(&store, "SameSec");
+        store.enqueue_rewrite(pid).unwrap();
+        let _ = store.claim_rewrite_batch(1).unwrap();
+        // Don't fudge timestamps — let real wall clock decide.
+        store.enqueue_rewrite(pid).unwrap();
+        store.mark_rewrite_done(pid).unwrap();
+        let stats = store.get_rewrite_stats().unwrap();
+        assert_eq!(
+            stats.pending, 1,
+            "same-second re-enqueue must still re-arm pending"
         );
         assert_eq!(stats.done, 0);
     }

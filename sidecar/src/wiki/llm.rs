@@ -747,35 +747,39 @@ pub fn validate_v2_rewrite(
             // Only facts_version is required; other keys preserved.
         }
         "event" => {
-            // started_at must be a number when present.
-            if let Some(v) = obj.get("started_at") {
-                if !v.is_number() && !v.is_null() {
-                    return Err(V2RewriteValidateError::BadFacts(
-                        kind.into(),
-                        "started_at must be int|null".into(),
-                    ));
-                }
+            // Spec §5.4: started_at, resolved_at, severity, resolution_note.
+            // started_at is the only structurally required field. If the LLM
+            // omits it, default to null rather than reject (the value is
+            // unknown until the timeline is reconstructed).
+            obj.entry("started_at".to_string())
+                .or_insert(serde_json::Value::Null);
+            obj.entry("resolved_at".to_string())
+                .or_insert(serde_json::Value::Null);
+            obj.entry("severity".to_string())
+                .or_insert(serde_json::Value::Null);
+            if !obj["started_at"].is_number() && !obj["started_at"].is_null() {
+                return Err(V2RewriteValidateError::BadFacts(
+                    kind.into(),
+                    "started_at must be int|null".into(),
+                ));
             }
-            if let Some(v) = obj.get("resolved_at") {
-                if !v.is_number() && !v.is_null() {
-                    return Err(V2RewriteValidateError::BadFacts(
-                        kind.into(),
-                        "resolved_at must be int|null".into(),
-                    ));
-                }
+            if !obj["resolved_at"].is_number() && !obj["resolved_at"].is_null() {
+                return Err(V2RewriteValidateError::BadFacts(
+                    kind.into(),
+                    "resolved_at must be int|null".into(),
+                ));
             }
-            if let Some(v) = obj.get("severity") {
-                if !v.is_null()
-                    && !v
-                        .as_str()
-                        .map(|s| matches!(s, "info" | "warn" | "high"))
-                        .unwrap_or(false)
-                {
-                    return Err(V2RewriteValidateError::BadFacts(
-                        kind.into(),
-                        "severity must be info|warn|high|null".into(),
-                    ));
-                }
+            let sev = &obj["severity"];
+            if !sev.is_null()
+                && !sev
+                    .as_str()
+                    .map(|s| matches!(s, "info" | "warn" | "high"))
+                    .unwrap_or(false)
+            {
+                return Err(V2RewriteValidateError::BadFacts(
+                    kind.into(),
+                    "severity must be info|warn|high|null".into(),
+                ));
             }
             if next_state == "resolved" {
                 let note = out
@@ -790,29 +794,67 @@ pub fn validate_v2_rewrite(
             }
         }
         "entity" => {
-            if let Some(v) = obj.get("canonical_name") {
-                if !v.is_string() && !v.is_null() {
+            // Spec §5.4: canonical_name (string), relations (array of
+            // {name, type}), last_seen (int). All three required and
+            // type-checked; relation elements are validated structurally
+            // so a malformed array is rejected (not silently passed).
+            let cname = obj
+                .get("canonical_name")
+                .ok_or_else(|| {
+                    V2RewriteValidateError::BadFacts(kind.into(), "canonical_name required".into())
+                })?
+                .clone();
+            let cname_ok = cname
+                .as_str()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !cname_ok {
+                return Err(V2RewriteValidateError::BadFacts(
+                    kind.into(),
+                    "canonical_name must be non-empty string".into(),
+                ));
+            }
+            let rels = obj
+                .get("relations")
+                .ok_or_else(|| {
+                    V2RewriteValidateError::BadFacts(kind.into(), "relations required".into())
+                })?
+                .clone();
+            let rels_arr = rels.as_array().ok_or_else(|| {
+                V2RewriteValidateError::BadFacts(kind.into(), "relations must be array".into())
+            })?;
+            for (i, r) in rels_arr.iter().enumerate() {
+                let ro = r.as_object().ok_or_else(|| {
+                    V2RewriteValidateError::BadFacts(
+                        kind.into(),
+                        format!("relations[{i}] must be object"),
+                    )
+                })?;
+                let name_ok = ro
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                let type_ok = ro
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if !name_ok || !type_ok {
                     return Err(V2RewriteValidateError::BadFacts(
                         kind.into(),
-                        "canonical_name must be string|null".into(),
+                        format!("relations[{i}] needs string name+type"),
                     ));
                 }
             }
-            if let Some(v) = obj.get("relations") {
-                if !v.is_array() && !v.is_null() {
-                    return Err(V2RewriteValidateError::BadFacts(
-                        kind.into(),
-                        "relations must be array|null".into(),
-                    ));
-                }
-            }
-            if let Some(v) = obj.get("last_seen") {
-                if !v.is_number() && !v.is_null() {
-                    return Err(V2RewriteValidateError::BadFacts(
-                        kind.into(),
-                        "last_seen must be int|null".into(),
-                    ));
-                }
+            let last_seen = obj.get("last_seen").ok_or_else(|| {
+                V2RewriteValidateError::BadFacts(kind.into(), "last_seen required".into())
+            })?;
+            if !last_seen.is_number() {
+                return Err(V2RewriteValidateError::BadFacts(
+                    kind.into(),
+                    "last_seen must be int".into(),
+                ));
             }
         }
         other => {
@@ -1062,5 +1104,71 @@ mod tests {
             validate_v2_rewrite(&out, "active", "event"),
             Err(V2RewriteValidateError::BadFacts(_, _))
         ));
+    }
+
+    #[test]
+    fn rewrite_validator_entity_requires_canonical_name() {
+        let mut out = make_rewrite_out("active", "ok");
+        out.facts = serde_json::json!({
+            "facts_version": 1,
+            "relations": [],
+            "last_seen": 1
+        });
+        assert!(matches!(
+            validate_v2_rewrite(&out, "active", "entity"),
+            Err(V2RewriteValidateError::BadFacts(_, _))
+        ));
+    }
+
+    #[test]
+    fn rewrite_validator_entity_requires_well_formed_relation() {
+        let mut out = make_rewrite_out("active", "ok");
+        // Missing 'type' on the relation element.
+        out.facts = serde_json::json!({
+            "facts_version": 1,
+            "canonical_name": "Vitalik",
+            "relations": [{"name": "Ethereum"}],
+            "last_seen": 1
+        });
+        assert!(matches!(
+            validate_v2_rewrite(&out, "active", "entity"),
+            Err(V2RewriteValidateError::BadFacts(_, _))
+        ));
+    }
+
+    #[test]
+    fn rewrite_validator_entity_requires_last_seen_int() {
+        let mut out = make_rewrite_out("active", "ok");
+        out.facts = serde_json::json!({
+            "facts_version": 1,
+            "canonical_name": "X",
+            "relations": [],
+            "last_seen": "yesterday"
+        });
+        assert!(matches!(
+            validate_v2_rewrite(&out, "active", "entity"),
+            Err(V2RewriteValidateError::BadFacts(_, _))
+        ));
+    }
+
+    #[test]
+    fn rewrite_validator_entity_good_passes() {
+        let mut out = make_rewrite_out("active", "ok");
+        out.facts = serde_json::json!({
+            "facts_version": 1,
+            "canonical_name": "Vitalik Buterin",
+            "relations": [{"name": "Ethereum", "type": "founder"}],
+            "last_seen": 1_700_000_000
+        });
+        let v = validate_v2_rewrite(&out, "active", "entity").unwrap();
+        assert!(v.facts_json.contains("Vitalik"));
+    }
+
+    #[test]
+    fn rewrite_validator_event_started_at_defaults_null() {
+        // Missing started_at should default to null, not reject.
+        let out = make_rewrite_out("active", "ok");
+        let v = validate_v2_rewrite(&out, "active", "event").unwrap();
+        assert!(v.facts_json.contains("\"started_at\":null"));
     }
 }

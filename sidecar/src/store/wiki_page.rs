@@ -682,6 +682,12 @@ impl Store {
             Ok(())
         };
 
+        // Delta is "inserted since last rewrite", not "message ts > last
+        // rewrite". Backfill / historical re-classify inserts evidence with
+        // old `ts` but recent `created_at`; comparing on `ts` would
+        // permanently lose those rows from the delta window. Mirrors spec
+        // §6.4 trending watermark which switched from ts to monotonic id
+        // for the same reason.
         let cutoff = last_rewrite_at.unwrap_or(0);
 
         // 1. delta since last rewrite, ≤30 newest first
@@ -689,8 +695,8 @@ impl Store {
             let mut s = self.conn().prepare(
                 "SELECT id, msg_id, chat_id, ts, excerpt, salience, cited
                    FROM wiki_evidence
-                  WHERE page_id = ? AND ts > ?
-                  ORDER BY ts DESC
+                  WHERE page_id = ? AND created_at > ?
+                  ORDER BY created_at DESC
                   LIMIT 30",
             )?;
             s.bind((1, page_id))?;
@@ -708,7 +714,7 @@ impl Store {
             let mut s = self.conn().prepare(
                 "SELECT id, msg_id, chat_id, ts, excerpt, salience, cited
                    FROM wiki_evidence
-                  WHERE page_id = ? AND ts <= ?
+                  WHERE page_id = ? AND created_at <= ?
                   ORDER BY salience DESC, ts DESC
                   LIMIT 20",
             )?;
