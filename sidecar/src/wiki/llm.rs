@@ -1296,31 +1296,27 @@ pub enum AskRunError {
     Exec(String),
 }
 
-static ASK_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Synchronous codex runner with kill-on-cancel. Lives off the async
-/// runtime: caller spawns its own thread and blocks here. Uses `-o file`
-/// to capture the final agent_message text — codex `--json` does not
-/// emit incremental token deltas (verified 2026-05-04, codex-cli 0.128),
-/// so streaming arrival is bunched-then-parsed regardless of channel;
-/// callbacks still fire per segment.
-pub fn run_codex_ask(
+/// Streaming codex runner. Spawns codex with `--json` events on stdout
+/// and the prompt fed via stdin (NOT argv — keeps the user's query +
+/// evidence excerpts off the process arglist where `ps` would expose
+/// them). Reads codex events line-by-line on a side thread; whenever
+/// an `item.completed` of type `agent_message` arrives, the caller's
+/// `on_agent_message` closure fires with the message text — *before*
+/// codex closes out the turn. Cancellation: state.cancelled flag is
+/// polled every 100ms; setting it kills the child and returns
+/// `AskRunError::Cancelled`. Timeout: `ASK_TIMEOUT_SECS`.
+pub fn run_codex_ask_stream<F>(
     prompt: &str,
     model: &str,
     state: &AskRunState,
-) -> Result<String, AskRunError> {
+    mut on_agent_message: F,
+) -> Result<(), AskRunError>
+where
+    F: FnMut(&str),
+{
+    use std::io::{BufRead, BufReader, Write};
     use std::sync::atomic::Ordering;
-
-    let counter = ASK_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let output_file = std::env::temp_dir().join(format!(
-        "tg-wiki-ask-{}-{}.txt",
-        std::process::id(),
-        counter
-    ));
-    let output_path_str = output_file
-        .to_str()
-        .unwrap_or("/tmp/tg-wiki-ask.txt")
-        .to_string();
+    use std::sync::mpsc;
 
     if state.cancelled.load(Ordering::Acquire) {
         return Err(AskRunError::Cancelled);
@@ -1333,10 +1329,10 @@ pub fn run_codex_ask(
             "--skip-git-repo-check",
             "-m",
             model,
-            "-o",
-            output_path_str.as_str(),
-            prompt,
+            "--json",
+            "-",
         ])
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1344,56 +1340,124 @@ pub fn run_codex_ask(
 
     state.pid.store(child.id() as i32, Ordering::Release);
 
+    // Pipe the prompt via stdin; close stdin so codex sees EOF and starts.
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(prompt.as_bytes()) {
+            // If write fails, codex will likely fail shortly with empty
+            // input; surface but don't bail here — the event loop reports
+            // turn.failed if codex itself rejects.
+            log::warn!("ask: stdin write failed: {e}");
+        }
+        // explicit drop closes the pipe.
+        drop(stdin);
+    }
+
+    // Pump stdout lines through a channel so the main loop can poll
+    // cancellation alongside event arrivals. BufRead::read_line blocks;
+    // doing it on the calling thread would block cancel for arbitrarily
+    // long codex hangs.
+    let (tx, rx) = mpsc::channel::<Result<String, std::io::Error>>();
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let reader_join = std::thread::Builder::new()
+        .name("seoyu-ask-stdout".into())
+        .spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|e| AskRunError::Exec(format!("spawn reader: {e}")))?;
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ASK_TIMEOUT_SECS);
-    let status = loop {
+    let mut early_error: Option<String> = None;
+    let mut got_turn_completed = false;
+
+    loop {
         if state.cancelled.load(Ordering::Acquire) {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = std::fs::remove_file(&output_file);
             state.pid.store(0, Ordering::Release);
+            let _ = reader_join.join();
             return Err(AskRunError::Cancelled);
         }
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = std::fs::remove_file(&output_file);
-                    state.pid.store(0, Ordering::Release);
-                    return Err(AskRunError::Timeout(ASK_TIMEOUT_SECS));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(150));
-            }
-            Err(e) => {
-                state.pid.store(0, Ordering::Release);
-                return Err(AskRunError::Exec(format!("wait codex: {e}")));
-            }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            state.pid.store(0, Ordering::Release);
+            let _ = reader_join.join();
+            return Err(AskRunError::Timeout(ASK_TIMEOUT_SECS));
         }
-    };
-    state.pid.store(0, Ordering::Release);
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(Ok(line)) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let evt: serde_json::Value = match serde_json::from_str(trimmed) {
+                    Ok(v) => v,
+                    Err(_) => continue, // ignore unrecognized framing
+                };
+                let kind = evt.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match kind {
+                    "item.completed" => {
+                        let item = evt.get("item");
+                        let item_type = item
+                            .and_then(|i| i.get("type"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
+                        if item_type == "agent_message" {
+                            if let Some(text) =
+                                item.and_then(|i| i.get("text")).and_then(|t| t.as_str())
+                            {
+                                on_agent_message(text);
+                            }
+                        }
+                    }
+                    "turn.completed" => {
+                        got_turn_completed = true;
+                        break;
+                    }
+                    "turn.failed" | "error" => {
+                        let msg = evt
+                            .get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .or_else(|| evt.get("message").and_then(|m| m.as_str()))
+                            .unwrap_or("turn failed")
+                            .to_string();
+                        early_error = Some(msg);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Err(_)) => break, // io error reading stdout
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
 
-    if !status.success() {
-        let stderr = child
-            .stderr
-            .take()
-            .map(|mut s| {
-                let mut buf = String::new();
-                std::io::Read::read_to_string(&mut s, &mut buf).ok();
-                buf
-            })
-            .unwrap_or_default();
-        let _ = std::fs::remove_file(&output_file);
-        return Err(AskRunError::Exec(format!("codex exit failed: {stderr}")));
+    if let Some(msg) = early_error {
+        let _ = child.kill();
+        let _ = child.wait();
+        state.pid.store(0, Ordering::Release);
+        let _ = reader_join.join();
+        return Err(AskRunError::Exec(msg));
     }
-    let text = std::fs::read_to_string(&output_file)
-        .map_err(|e| AskRunError::Exec(format!("read codex output: {e}")))?;
-    let _ = std::fs::remove_file(&output_file);
-    let trimmed = text.trim().to_string();
-    if trimmed.is_empty() {
-        return Err(AskRunError::Exec("empty codex output".into()));
+
+    let _ = child.wait();
+    state.pid.store(0, Ordering::Release);
+    let _ = reader_join.join();
+    if !got_turn_completed {
+        // Codex may exit cleanly without a turn.completed if it was
+        // killed externally or stdin was malformed. Treat as failure
+        // unless the caller already received a non-empty agent_message
+        // (handled by parse-side checks in the closure path).
+        log::debug!("ask: codex stream ended without turn.completed");
     }
-    Ok(trimmed)
+    Ok(())
 }
 
 /// Build the ask prompt. INPUT is JSON-typed (query is trusted, all
@@ -1423,16 +1487,23 @@ pub fn build_ask_prompt(input: &AskInput<'_>) -> Result<String, LlmError> {
 }
 
 impl LlmClient {
-    /// Run an ask end-to-end: build prompt, call codex, return raw text.
-    /// `model` is the resolved model name (see `resolve_ask_model`).
-    pub fn run_ask(
+    /// Run an ask end-to-end with streamed event dispatch. The closure
+    /// fires once per `agent_message` event the codex turn emits — for
+    /// the typical case (one agent_message per turn) that means once,
+    /// ahead of `turn.completed`. The closure parses + dispatches the
+    /// NDJSON segments inline.
+    pub fn run_ask_stream<F>(
         &self,
         input: &AskInput<'_>,
         model: &str,
         state: &AskRunState,
-    ) -> Result<String, AskRunError> {
+        on_agent_message: F,
+    ) -> Result<(), AskRunError>
+    where
+        F: FnMut(&str),
+    {
         let prompt = build_ask_prompt(input).map_err(|e| AskRunError::Exec(e.to_string()))?;
-        run_codex_ask(&prompt, model, state)
+        run_codex_ask_stream(&prompt, model, state, on_agent_message)
     }
 }
 

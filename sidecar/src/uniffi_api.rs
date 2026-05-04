@@ -905,6 +905,15 @@ fn ask_run_inner(
         for ev in evidence_summaries {
             handler.on_source(0, ev.source_id, ev.clone());
         }
+        // Spec §6.3 retention: bump cited counter so these evidence
+        // rows survive the next rewrite-time pruning. Same as the LLM
+        // path — the user surfaced these rows as the answer.
+        let cited_evidence_ids: Vec<i64> =
+            evidence_summaries.iter().map(|e| e.evidence_id).collect();
+        if !cited_evidence_ids.is_empty() {
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = s.bump_cited(&cited_evidence_ids);
+        }
         let cited_json = cited_sources_json(evidence_summaries);
         finalize(store, ask_id, "done", &msg, &cited_json);
         return AskOutcome::Done;
@@ -942,62 +951,80 @@ fn ask_run_inner(
         evidence: &evidence_in,
     };
 
-    let raw = match LlmClient::new().run_ask(&input, model, state) {
-        Ok(s) => s,
+    let evidence_count = evidence_summaries.len() as u32;
+    // State accumulated across agent_message events. We dispatch each
+    // segment's on_delta + on_source as soon as the agent_message
+    // arrives — codex emits item.completed before turn.completed, so
+    // callbacks fire ahead of the codex subprocess closing the turn.
+    let mut answer_md = String::new();
+    let mut cited_ids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut parse_err: Option<String> = None;
+
+    let res = LlmClient::new().run_ask_stream(&input, model, state, |text| {
+        if parse_err.is_some() {
+            return;
+        }
+        match parse_ask_stream(text) {
+            Ok(parsed) => {
+                for seg in parsed.segments {
+                    let cleaned = strip_citation_markers(&seg.md);
+                    // Spec §6.6 "before any character is shown": validate
+                    // cites first, then dispatch on_delta then on_source.
+                    let valid_cites = validate_cites(&seg.cites, evidence_count);
+                    handler.on_delta(seg.seg, cleaned.clone());
+                    for tag in &valid_cites {
+                        if let Some(ev) = evidence_summaries.get(*tag as usize - 1) {
+                            handler.on_source(seg.seg, *tag, ev.clone());
+                            cited_ids.insert(*tag);
+                        }
+                    }
+                    if !answer_md.is_empty() {
+                        answer_md.push_str("\n\n");
+                    }
+                    answer_md.push_str(&cleaned);
+                }
+            }
+            Err(e) => parse_err = Some(format!("malformed stream: {e}")),
+        }
+    });
+
+    match res {
+        Ok(()) => {}
         Err(AskRunError::Cancelled) => {
             finalize(store, ask_id, "cancelled", "", "[]");
             return AskOutcome::Cancelled;
         }
         Err(AskRunError::Timeout(secs)) => {
-            let msg = format!("ask timed out after {secs}s");
             finalize(store, ask_id, "failed", "", "[]");
-            return AskOutcome::Failed(msg);
+            return AskOutcome::Failed(format!("ask timed out after {secs}s"));
         }
         Err(AskRunError::Exec(e)) => {
             finalize(store, ask_id, "failed", "", "[]");
             return AskOutcome::Failed(format!("codex: {e}"));
         }
-    };
+    }
 
+    if let Some(msg) = parse_err {
+        finalize(store, ask_id, "failed", "", "[]");
+        return AskOutcome::Failed(msg);
+    }
     if state.cancelled.load(Ordering::Acquire) {
         finalize(store, ask_id, "cancelled", "", "[]");
         return AskOutcome::Cancelled;
-    }
-
-    let parsed = match parse_ask_stream(&raw) {
-        Ok(p) => p,
-        Err(e) => {
-            finalize(store, ask_id, "failed", "", "[]");
-            return AskOutcome::Failed(format!("malformed stream: {e}"));
-        }
-    };
-
-    let evidence_count = evidence_summaries.len() as u32;
-    let mut answer_md = String::new();
-    let mut cited_ids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-
-    for seg in &parsed.segments {
-        let cleaned = strip_citation_markers(&seg.md);
-        // Per spec wording "before any character is shown": validate cites
-        // first, then dispatch on_delta and on_source in order.
-        let valid_cites = validate_cites(&seg.cites, evidence_count);
-        handler.on_delta(seg.seg, cleaned.clone());
-        for tag in &valid_cites {
-            if let Some(ev) = evidence_summaries.get(*tag as usize - 1) {
-                handler.on_source(seg.seg, *tag, ev.clone());
-                cited_ids.insert(*tag);
-            }
-        }
-        if !answer_md.is_empty() {
-            answer_md.push_str("\n\n");
-        }
-        answer_md.push_str(&cleaned);
     }
 
     let cited: Vec<EvidenceSummary> = cited_ids
         .iter()
         .filter_map(|id| evidence_summaries.get(*id as usize - 1).cloned())
         .collect();
+    // Spec §6.3 retention: bump the per-row `cited` counter so the
+    // next rewrite tick keeps these evidence rows even if they fall
+    // outside the salience-based pruning window.
+    let cited_evidence_ids: Vec<i64> = cited.iter().map(|e| e.evidence_id).collect();
+    if !cited_evidence_ids.is_empty() {
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = s.bump_cited(&cited_evidence_ids);
+    }
     finalize(
         store,
         ask_id,
@@ -1005,7 +1032,6 @@ fn ask_run_inner(
         &answer_md,
         &cited_sources_json(&cited),
     );
-    let _ = parsed.thin_evidence; // surfaced via the on_delta text already.
     AskOutcome::Done
 }
 

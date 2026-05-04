@@ -1584,17 +1584,27 @@ impl Store {
         } else {
             format!("{} OR {}", fts_phrase(trimmed), fts_phrase(&jamo))
         };
+        // INNER JOIN messages + chats: ask must respect spec §6.6 +
+        // soft-delete (spec line 160) + per-chat exclusion. An evidence
+        // row whose underlying message was soft-deleted, or whose chat
+        // is excluded, must not surface as a citable source. Orphan
+        // evidence (no messages row) is also dropped — the user has no
+        // way to verify or jump to a citation that no longer exists.
         let q = "
             SELECT e.id, e.page_id, p.title, e.chat_id,
                    COALESCE(c.title, '') AS chat_title,
                    e.msg_id, e.sender_id, e.ts, e.excerpt,
                    bm25(evidence_fts) AS rank
               FROM evidence_fts f
-              JOIN wiki_evidence e ON e.id = f.rowid
-              JOIN wiki_pages_v2 p ON p.id = e.page_id
-              LEFT JOIN chats c   ON c.chat_id = e.chat_id
+              JOIN wiki_evidence e  ON e.id = f.rowid
+              JOIN wiki_pages_v2 p  ON p.id = e.page_id
+              JOIN messages m       ON m.chat_id = e.chat_id
+                                   AND m.message_id = e.msg_id
+              JOIN chats c          ON c.chat_id = e.chat_id
              WHERE evidence_fts MATCH ?
                AND p.state != 'hidden'
+               AND m.deleted_at IS NULL
+               AND c.is_excluded = 0
              ORDER BY rank ASC
              LIMIT 50";
         let mut s = self.conn().prepare(q)?;
@@ -1650,6 +1660,29 @@ impl Store {
         s.bind((3, now))?;
         s.next()?;
         self.last_insert_rowid()
+    }
+
+    /// Bump the per-row `cited` counter for the given evidence ids.
+    /// Spec §6.3 retention: `select_rewrite_evidence` keeps `cited > 0`
+    /// rows regardless of salience-based pruning, so an answer's
+    /// citations survive the next rewrite. Single statement; no-op on
+    /// empty input.
+    pub fn bump_cited(&self, evidence_ids: &[i64]) -> Result<(), sqlite::Error> {
+        if evidence_ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = evidence_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let q = format!("UPDATE wiki_evidence SET cited = cited + 1 WHERE id IN ({placeholders})");
+        let mut s = self.conn().prepare(q)?;
+        for (i, id) in evidence_ids.iter().enumerate() {
+            s.bind((i + 1, *id))?;
+        }
+        s.next()?;
+        Ok(())
     }
 
     /// Move an `ask_history` row to a terminal state. `cited_sources_json`
@@ -2942,6 +2975,28 @@ mod tests {
                 ))
                 .unwrap();
         }
+        // ask_fts_evidence INNER JOINs messages — seed a row so the
+        // evidence is reachable from ask. Real wiki_evidence rows
+        // always come from indexed messages; this mirrors that.
+        let mut mq = store
+            .conn()
+            .prepare("SELECT 1 FROM messages WHERE chat_id = ? AND message_id = ?")
+            .unwrap();
+        mq.bind((1, chat_id)).unwrap();
+        mq.bind((2, msg_id)).unwrap();
+        if !matches!(mq.next().unwrap(), sqlite::State::Row) {
+            store
+                .insert_messages_batch(&[crate::store::message::MessageRow {
+                    message_id: msg_id,
+                    chat_id,
+                    timestamp: ts,
+                    text_plain: text.to_string(),
+                    text_stripped: text.replace(' ', ""),
+                    link: None,
+                    sender_id: 7,
+                }])
+                .unwrap();
+        }
         store.conn().execute("BEGIN").unwrap();
         store
             .insert_evidence_v2(&NewEvidenceV2 {
@@ -3083,5 +3138,78 @@ mod tests {
         assert_eq!(s.read::<String, _>(1).unwrap(), "answer text");
         assert_eq!(s.read::<String, _>(2).unwrap(), "[{\"source_id\":1}]");
         assert_eq!(s.read::<i64, _>(3).unwrap(), 1_050);
+    }
+
+    #[test]
+    fn ask_fts_evidence_filters_soft_deleted_messages() {
+        let store = setup();
+        let pid = make_page_with_summary(&store, "Bitcoin ETF", "x");
+        // Two evidence rows. Soft-delete one of the underlying messages
+        // → corresponding evidence must drop out of ask retrieval.
+        add_evi_text(&store, pid, 100, 1, 1_000, "Bitcoin ETF approved today");
+        add_evi_text(&store, pid, 101, 1, 1_500, "Bitcoin ETF inflows surged");
+        store
+            .conn()
+            .execute("UPDATE messages SET deleted_at = 9999 WHERE chat_id = 1 AND message_id = 100")
+            .unwrap();
+        let rows = store.ask_fts_evidence("Bitcoin ETF", 20, 2_000).unwrap();
+        let ids: Vec<i64> = rows.iter().map(|r| r.msg_id).collect();
+        assert!(ids.contains(&101));
+        assert!(!ids.contains(&100), "soft-deleted message must not surface");
+    }
+
+    #[test]
+    fn ask_fts_evidence_filters_excluded_chats() {
+        let store = setup();
+        let pid = make_page_with_summary(&store, "Bitcoin ETF", "x");
+        add_evi_text(&store, pid, 200, 7, 1_000, "Bitcoin ETF activity rising");
+        store
+            .conn()
+            .execute("UPDATE chats SET is_excluded = 1 WHERE chat_id = 7")
+            .unwrap();
+        let rows = store.ask_fts_evidence("Bitcoin ETF", 20, 2_000).unwrap();
+        assert!(
+            rows.iter().all(|r| r.chat_id != 7),
+            "excluded chat must not surface"
+        );
+    }
+
+    #[test]
+    fn bump_cited_increments_counter() {
+        let store = setup();
+        let pid = make_page_with_summary(&store, "X", "x");
+        add_evi_text(&store, pid, 300, 1, 1_000, "first");
+        add_evi_text(&store, pid, 301, 1, 1_000, "second");
+        let ids: Vec<i64> = {
+            let mut q = store
+                .conn()
+                .prepare("SELECT id FROM wiki_evidence WHERE page_id = ? ORDER BY id")
+                .unwrap();
+            q.bind((1, pid)).unwrap();
+            let mut v = Vec::new();
+            while let sqlite::State::Row = q.next().unwrap() {
+                v.push(q.read::<i64, _>(0).unwrap());
+            }
+            v
+        };
+        assert_eq!(ids.len(), 2);
+        store.bump_cited(&ids).unwrap();
+        store.bump_cited(&[ids[0]]).unwrap();
+        let mut q = store
+            .conn()
+            .prepare("SELECT id, cited FROM wiki_evidence WHERE id IN (?, ?) ORDER BY id")
+            .unwrap();
+        q.bind((1, ids[0])).unwrap();
+        q.bind((2, ids[1])).unwrap();
+        q.next().unwrap();
+        assert_eq!(q.read::<i64, _>(1).unwrap(), 2);
+        q.next().unwrap();
+        assert_eq!(q.read::<i64, _>(1).unwrap(), 1);
+    }
+
+    #[test]
+    fn bump_cited_no_op_on_empty() {
+        let store = setup();
+        store.bump_cited(&[]).unwrap();
     }
 }
