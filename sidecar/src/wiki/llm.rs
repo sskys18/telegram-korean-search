@@ -1296,6 +1296,24 @@ pub enum AskRunError {
 
 static ASK_CWD_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// SIGTERM the codex process group rooted at `pid`. The ask spawn
+/// path puts codex in its own process group via `setpgid(0,0)`, so
+/// `kill(-pid, SIGTERM)` reaps the Node host AND any children it
+/// spawned (agent worker, sandbox helpers) — `child.kill()` alone
+/// only signals the direct descendant and orphans the rest (codex
+/// review). No-op for pid <= 0. ESRCH on a reaped pid is harmless.
+pub fn kill_codex_group(pid: i32) {
+    if pid <= 0 {
+        return;
+    }
+    // SAFETY: kill(2) with negative pid → SIGTERM to the process group
+    // whose pgid equals -pid. Process group was set on the child via
+    // setpgid(0,0) at fork time.
+    unsafe {
+        libc::kill(-pid as libc::pid_t, libc::SIGTERM);
+    }
+}
+
 /// Codex runner with event-level dispatch. Spawns codex with `--json`
 /// events on stdout and the prompt fed via stdin (NOT argv — keeps
 /// the user's query + evidence excerpts off the process arglist where
@@ -1358,59 +1376,72 @@ where
         return Err(AskRunError::Exec(format!("mkdir cwd: {e}")));
     }
     let cwd_str = isolated_cwd.to_string_lossy().to_string();
-    let mut child = Command::new("codex")
-        .args([
-            "exec",
-            "--ephemeral",
-            "--skip-git-repo-check",
-            "--ignore-rules",
-            "--ignore-user-config",
-            "--sandbox",
-            "read-only",
-            "--cd",
-            cwd_str.as_str(),
-            // Pre-disable every tool feature the codex agent has —
-            // ask runs untrusted chat excerpts and the model must
-            // produce text only. Names verified against
-            // `codex features list` (codex-cli 0.128). Stays paired
-            // with the post-hoc `disallowed agent item` guard so a
-            // future codex release that resurrects a removed tool
-            // doesn't silently re-enable it.
-            "--disable",
-            "shell_tool",
-            "--disable",
-            "browser_use",
-            "--disable",
-            "computer_use",
-            "--disable",
-            "image_generation",
-            "--disable",
-            "in_app_browser",
-            "--disable",
-            "apps",
-            "--disable",
-            "multi_agent",
-            // Strip env vars from any tool the agent might still
-            // invoke — even with read-only sandbox, env can leak
-            // credentials (HOME, AWS_*, GH_TOKEN).
-            "-c",
-            "shell_environment_policy.inherit=none",
-            // Blank the sandbox permission allowlist.
-            "-c",
-            "sandbox_permissions=[]",
-            "-m",
-            model,
-            "--json",
-            "-",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            let _ = std::fs::remove_dir_all(&isolated_cwd);
-            AskRunError::Exec(format!("spawn codex: {e}"))
-        })?;
+    let mut cmd = Command::new("codex");
+    cmd.args([
+        "exec",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--ignore-rules",
+        "--ignore-user-config",
+        "--sandbox",
+        "read-only",
+        "--cd",
+        cwd_str.as_str(),
+        // Pre-disable every tool feature the codex agent has —
+        // ask runs untrusted chat excerpts and the model must
+        // produce text only. Names verified against
+        // `codex features list` (codex-cli 0.128). Stays paired
+        // with the post-hoc `disallowed agent item` guard so a
+        // future codex release that resurrects a removed tool
+        // doesn't silently re-enable it.
+        "--disable",
+        "shell_tool",
+        "--disable",
+        "browser_use",
+        "--disable",
+        "computer_use",
+        "--disable",
+        "image_generation",
+        "--disable",
+        "in_app_browser",
+        "--disable",
+        "apps",
+        "--disable",
+        "multi_agent",
+        // Strip env vars from any tool the agent might still
+        // invoke — even with read-only sandbox, env can leak
+        // credentials (HOME, AWS_*, GH_TOKEN).
+        "-c",
+        "shell_environment_policy.inherit=none",
+        // Blank the sandbox permission allowlist.
+        "-c",
+        "sandbox_permissions=[]",
+        "-m",
+        model,
+        "--json",
+        "-",
+    ])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    // codex CLI is a Node script that spawns its own children (agent
+    // worker, optional sandbox helpers). SIGTERM to just our direct
+    // child orphans those (codex review). Put the child in its own
+    // process group via setpgid(0,0) so kill_codex_group(pid) can
+    // signal the whole tree via kill(-pgid).
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().map_err(|e| {
+        let _ = std::fs::remove_dir_all(&isolated_cwd);
+        AskRunError::Exec(format!("spawn codex: {e}"))
+    })?;
 
     state.pid.store(child.id() as i32, Ordering::Release);
 
@@ -1447,6 +1478,7 @@ where
             // Codex review: orphan-child guard. If thread spawn fails
             // after the codex child is running, kill+reap before we
             // bail or the subprocess lingers.
+            kill_codex_group(child.id() as i32);
             let _ = child.kill();
             let _ = child.wait();
             state.pid.store(0, Ordering::Release);
@@ -1468,6 +1500,7 @@ where
         }) {
         Ok(j) => j,
         Err(e) => {
+            kill_codex_group(child.id() as i32);
             let _ = child.kill();
             let _ = child.wait();
             state.pid.store(0, Ordering::Release);
@@ -1484,10 +1517,12 @@ where
 
     let result: Result<(), AskRunError> = loop {
         if state.cancelled.load(Ordering::Acquire) {
+            kill_codex_group(child.id() as i32);
             let _ = child.kill();
             break Err(AskRunError::Cancelled);
         }
         if std::time::Instant::now() >= deadline {
+            kill_codex_group(child.id() as i32);
             let _ = child.kill();
             break Err(AskRunError::Timeout(ASK_TIMEOUT_SECS));
         }
@@ -1524,6 +1559,7 @@ where
                             && item_type != "reasoning"
                         {
                             early_error = Some(format!("disallowed agent item: {item_type}"));
+                            kill_codex_group(child.id() as i32);
                             let _ = child.kill();
                             break Ok(());
                         }
@@ -1549,6 +1585,7 @@ where
                             .unwrap_or("turn failed")
                             .to_string();
                         early_error = Some(msg);
+                        kill_codex_group(child.id() as i32);
                         let _ = child.kill();
                         break Ok(()); // surfaced via early_error below
                     }

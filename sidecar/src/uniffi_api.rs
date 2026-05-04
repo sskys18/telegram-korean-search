@@ -35,8 +35,8 @@ use crate::store::message::{
 use crate::store::wiki_page::{AskEvidence, AskPage};
 use crate::store::Store;
 use crate::wiki::llm::{
-    parse_ask_stream, resolve_ask_model, strip_citation_markers, validate_cites, AskEvidenceIn,
-    AskInput, AskRunError, AskRunState, LlmClient,
+    kill_codex_group, parse_ask_stream, resolve_ask_model, strip_citation_markers, validate_cites,
+    AskEvidenceIn, AskInput, AskRunError, AskRunState, LlmClient,
 };
 use crate::wiki::worker::WorkerHandle;
 
@@ -364,12 +364,10 @@ impl Drop for AskHandle {
             .cancelled
             .store(true, std::sync::atomic::Ordering::Release);
         let pid = self.state.pid.load(std::sync::atomic::Ordering::Acquire);
-        if pid > 0 {
-            // SAFETY: SIGTERM via kill(2). ESRCH on a reaped pid is harmless.
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
-        }
+        // SIGTERM the whole codex process group (Node host + agent
+        // worker + sandbox helpers). kill_codex_group is no-op for
+        // pid <= 0 and tolerates already-reaped pids.
+        kill_codex_group(pid);
     }
 }
 
@@ -721,14 +719,7 @@ impl Seoyu {
         };
         if let Some(s) = state {
             s.cancelled.store(true, Ordering::Release);
-            let pid = s.pid.load(Ordering::Acquire);
-            if pid > 0 {
-                // SAFETY: kill(2) on POSIX. Pid may have been reaped
-                // between load and call; ESRCH is harmless.
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                }
-            }
+            kill_codex_group(s.pid.load(Ordering::Acquire));
         }
         Ok(())
     }
@@ -906,12 +897,7 @@ impl Drop for Seoyu {
         let map = self.active_asks.lock().unwrap_or_else(|e| e.into_inner());
         for state in map.values() {
             state.cancelled.store(true, Ordering::Release);
-            let pid = state.pid.load(Ordering::Acquire);
-            if pid > 0 {
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                }
-            }
+            kill_codex_group(state.pid.load(Ordering::Acquire));
         }
     }
 }
