@@ -1098,7 +1098,13 @@ fn ask_run_inner(
             if state.cancelled.load(Ordering::Acquire) {
                 // Persist what's been shown so far per spec §6.6:
                 // "Partial answers shown so far are persisted with the
-                // cancelled status."
+                // cancelled status." Plus bump cited counter so the
+                // next rewrite tick keeps these rows (codex review).
+                let ids: Vec<i64> = shown.iter().map(|e| e.evidence_id).collect();
+                if !ids.is_empty() {
+                    let s = store.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = s.bump_cited(&ids);
+                }
                 let cited_json = cited_sources_json(&shown);
                 finalize(store, ask_id, "cancelled", &msg, &cited_json);
                 return AskOutcome::Cancelled;
@@ -1187,19 +1193,33 @@ fn ask_run_inner(
             .collect()
     };
 
+    // Helper: cancelled finalize that ALSO bumps cited counter on
+    // partially-cited evidence. Codex review: spec §6.3 retention
+    // applies to the cancel path too — what the user already saw is
+    // a "real" citation that must survive the next rewrite-time
+    // pruning, identical to a completed answer.
+    let finalize_cancelled = |cited: &[EvidenceSummary]| {
+        let ids: Vec<i64> = cited.iter().map(|e| e.evidence_id).collect();
+        if !ids.is_empty() {
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = s.bump_cited(&ids);
+        }
+        finalize(
+            store,
+            ask_id,
+            "cancelled",
+            &answer_md,
+            &cited_sources_json(cited),
+        );
+    };
+
     match res {
         Ok(()) => {}
         Err(AskRunError::Cancelled) => {
             // Persist partial answer per spec §6.6: "Partial answers
             // shown so far are persisted with the cancelled status."
             let cited = snapshot_cited(&cited_ids);
-            finalize(
-                store,
-                ask_id,
-                "cancelled",
-                &answer_md,
-                &cited_sources_json(&cited),
-            );
+            finalize_cancelled(&cited);
             return AskOutcome::Cancelled;
         }
         Err(AskRunError::Timeout(secs)) => {
@@ -1207,13 +1227,7 @@ fn ask_run_inner(
             // path triggers must surface as Cancelled, not Failed.
             if state.cancelled.load(Ordering::Acquire) {
                 let cited = snapshot_cited(&cited_ids);
-                finalize(
-                    store,
-                    ask_id,
-                    "cancelled",
-                    &answer_md,
-                    &cited_sources_json(&cited),
-                );
+                finalize_cancelled(&cited);
                 return AskOutcome::Cancelled;
             }
             finalize(store, ask_id, "failed", "", "[]");
@@ -1226,13 +1240,7 @@ fn ask_run_inner(
             // the source of truth, not the codex exit code.
             if state.cancelled.load(Ordering::Acquire) {
                 let cited = snapshot_cited(&cited_ids);
-                finalize(
-                    store,
-                    ask_id,
-                    "cancelled",
-                    &answer_md,
-                    &cited_sources_json(&cited),
-                );
+                finalize_cancelled(&cited);
                 return AskOutcome::Cancelled;
             }
             finalize(store, ask_id, "failed", "", "[]");
@@ -1246,13 +1254,7 @@ fn ask_run_inner(
     }
     if state.cancelled.load(Ordering::Acquire) {
         let cited = snapshot_cited(&cited_ids);
-        finalize(
-            store,
-            ask_id,
-            "cancelled",
-            &answer_md,
-            &cited_sources_json(&cited),
-        );
+        finalize_cancelled(&cited);
         return AskOutcome::Cancelled;
     }
 

@@ -1649,33 +1649,54 @@ impl Store {
         // is excluded, must not surface as a citable source. Orphan
         // evidence (no messages row) is also dropped — the user has no
         // way to verify or jump to a citation that no longer exists.
+        //
+        // Two-CTE dedup so the LIMIT 50 cap counts unique messages
+        // (codex review). bm25() is only callable in the SELECT of a
+        // statement that joins the FTS5 table — not inside aggregates
+        // or window functions referencing it. So:
+        //   1. `raw` materializes bm25 into a regular column.
+        //   2. `deduped` picks the best-ranked row per (chat, msg)
+        //      using ROW_NUMBER over the regular `rank` column.
         let q = "
-            SELECT e.id, e.page_id, p.title, e.chat_id,
-                   COALESCE(c.title, '') AS chat_title,
-                   e.msg_id, e.sender_id, e.ts, e.excerpt,
-                   bm25(evidence_fts) AS rank
-              FROM evidence_fts f
-              JOIN wiki_evidence e  ON e.id = f.rowid
-              JOIN wiki_pages_v2 p  ON p.id = e.page_id
-              JOIN messages m       ON m.chat_id = e.chat_id
-                                   AND m.message_id = e.msg_id
-              JOIN chats c          ON c.chat_id = e.chat_id
-             WHERE evidence_fts MATCH ?
-               AND p.state != 'hidden'
-               AND m.deleted_at IS NULL
-               AND c.is_excluded = 0
+            WITH raw AS (
+                SELECT e.id, e.page_id, p.title AS page_title, e.chat_id,
+                       COALESCE(c.title, '') AS chat_title,
+                       e.msg_id, e.sender_id, e.ts, e.excerpt,
+                       bm25(evidence_fts) AS rank
+                  FROM evidence_fts f
+                  JOIN wiki_evidence e  ON e.id = f.rowid
+                  JOIN wiki_pages_v2 p  ON p.id = e.page_id
+                  JOIN messages m       ON m.chat_id = e.chat_id
+                                       AND m.message_id = e.msg_id
+                  JOIN chats c          ON c.chat_id = e.chat_id
+                 WHERE evidence_fts MATCH ?
+                   AND p.state != 'hidden'
+                   AND m.deleted_at IS NULL
+                   AND c.is_excluded = 0
+            ),
+            deduped AS (
+                SELECT id, page_id, page_title, chat_id, chat_title,
+                       msg_id, sender_id, ts, excerpt, rank,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY chat_id, msg_id
+                           ORDER BY rank ASC, id ASC
+                       ) AS rn
+                  FROM raw
+            )
+            SELECT id, page_id, page_title AS title, chat_id, chat_title,
+                   msg_id, sender_id, ts, excerpt, rank
+              FROM deduped
+             WHERE rn = 1
              ORDER BY rank ASC
              LIMIT 50";
         let mut s = self.conn().prepare(q)?;
         s.bind((1, fts_q.as_str()))?;
         let mut scored: Vec<(f64, AskEvidence)> = Vec::new();
-        let mut seen_msg = std::collections::HashSet::<(i64, i64)>::new();
+        // Dedup is now done in SQL via GROUP BY; the Rust loop just
+        // applies the time-decay multiplier.
         while let sqlite::State::Row = s.next()? {
             let chat_id = s.read::<i64, _>("chat_id")?;
             let msg_id = s.read::<i64, _>("msg_id")?;
-            if !seen_msg.insert((chat_id, msg_id)) {
-                continue;
-            }
             let ts = s.read::<i64, _>("ts")?;
             let bm25 = s.read::<f64, _>("rank")?;
             let age = (now - ts).max(0) as f64;
