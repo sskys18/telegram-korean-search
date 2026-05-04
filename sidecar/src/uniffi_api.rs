@@ -900,9 +900,26 @@ fn ask_run_inner(
         // Spec §6.6: <3 distinct evidence → skip LLM, surface fallback +
         // raw FTS results below. Emit one delta segment, attach every
         // available evidence row as a source, persist + finish.
+        // Cancellation may have arrived between wiki_ask returning the
+        // ask_id and this thread getting scheduled — check before any
+        // callback fires (codex review).
+        if state.cancelled.load(Ordering::Acquire) {
+            finalize(store, ask_id, "cancelled", "", "[]");
+            return AskOutcome::Cancelled;
+        }
         let msg = "Not enough in your chats yet to answer confidently. Showing the best evidence I found.".to_string();
         handler.on_delta(0, msg.clone());
         for ev in evidence_summaries {
+            // Re-check cancel between sources so a long evidence list
+            // doesn't keep firing callbacks after cancel.
+            if state.cancelled.load(Ordering::Acquire) {
+                // Persist what's been shown so far per spec §6.6:
+                // "Partial answers shown so far are persisted with the
+                // cancelled status."
+                let cited_json = cited_sources_json(evidence_summaries);
+                finalize(store, ask_id, "cancelled", &msg, &cited_json);
+                return AskOutcome::Cancelled;
+            }
             handler.on_source(0, ev.source_id, ev.clone());
         }
         // Spec §6.3 retention: bump cited counter so these evidence
@@ -954,6 +971,8 @@ fn ask_run_inner(
     // callbacks fire ahead of the codex subprocess closing the turn.
     let mut answer_md = String::new();
     let mut cited_ids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut segments_dispatched: u32 = 0;
+    let mut model_thin_evidence = false;
     let mut parse_err: Option<String> = None;
 
     let res = LlmClient::new().run_ask_stream(&input, model, state, |text| {
@@ -962,6 +981,7 @@ fn ask_run_inner(
         }
         match parse_ask_stream(text) {
             Ok(parsed) => {
+                model_thin_evidence = model_thin_evidence || parsed.thin_evidence;
                 for seg in parsed.segments {
                     let cleaned = strip_citation_markers(&seg.md);
                     // Spec §6.6 "before any character is shown": validate
@@ -978,16 +998,35 @@ fn ask_run_inner(
                         answer_md.push_str("\n\n");
                     }
                     answer_md.push_str(&cleaned);
+                    segments_dispatched += 1;
                 }
             }
             Err(e) => parse_err = Some(format!("malformed stream: {e}")),
         }
     });
 
+    // Helper closure: snapshot whatever has been dispatched so far.
+    // Used for cancel-with-partial-answer per spec §6.6.
+    let snapshot_cited = |cited_ids: &std::collections::BTreeSet<u32>| -> Vec<EvidenceSummary> {
+        cited_ids
+            .iter()
+            .filter_map(|id| evidence_summaries.get(*id as usize - 1).cloned())
+            .collect()
+    };
+
     match res {
         Ok(()) => {}
         Err(AskRunError::Cancelled) => {
-            finalize(store, ask_id, "cancelled", "", "[]");
+            // Persist partial answer per spec §6.6: "Partial answers
+            // shown so far are persisted with the cancelled status."
+            let cited = snapshot_cited(&cited_ids);
+            finalize(
+                store,
+                ask_id,
+                "cancelled",
+                &answer_md,
+                &cited_sources_json(&cited),
+            );
             return AskOutcome::Cancelled;
         }
         Err(AskRunError::Timeout(secs)) => {
@@ -1005,14 +1044,36 @@ fn ask_run_inner(
         return AskOutcome::Failed(msg);
     }
     if state.cancelled.load(Ordering::Acquire) {
-        finalize(store, ask_id, "cancelled", "", "[]");
+        let cited = snapshot_cited(&cited_ids);
+        finalize(
+            store,
+            ask_id,
+            "cancelled",
+            &answer_md,
+            &cited_sources_json(&cited),
+        );
         return AskOutcome::Cancelled;
     }
 
-    let cited: Vec<EvidenceSummary> = cited_ids
-        .iter()
-        .filter_map(|id| evidence_summaries.get(*id as usize - 1).cloned())
-        .collect();
+    if segments_dispatched == 0 {
+        // Codex review: model emitting only `done` with no segments
+        // must not become a successful blank answer. Two sub-cases:
+        //   - thin_evidence=true → model legitimately said "I can't
+        //     answer". Surface a fallback delta + finish as `done`,
+        //     so the UI shows a message instead of dead silence.
+        //   - thin_evidence=false → model claimed an answer but
+        //     produced nothing → failure.
+        if model_thin_evidence {
+            let msg = "I couldn't find enough relevant context to answer confidently.".to_string();
+            handler.on_delta(0, msg.clone());
+            finalize(store, ask_id, "done", &msg, "[]");
+            return AskOutcome::Done;
+        }
+        finalize(store, ask_id, "failed", "", "[]");
+        return AskOutcome::Failed("model returned no answer segments".into());
+    }
+
+    let cited = snapshot_cited(&cited_ids);
     // Spec §6.3 retention: bump the per-row `cited` counter so the
     // next rewrite tick keeps these evidence rows even if they fall
     // outside the salience-based pruning window.
@@ -1237,5 +1298,51 @@ mod ask_tests {
         assert!(events[1].starts_with("source 0 1 "));
         assert!(events[2].starts_with("source 0 2 "));
         assert!(events[3].starts_with("finished "));
+    }
+
+    #[test]
+    fn thin_path_respects_cancel_before_dispatch() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let recorder = Arc::new(RecordingHandler::default());
+        let handler: Arc<dyn AskStreamHandler> = Arc::clone(&recorder) as Arc<dyn AskStreamHandler>;
+        let state = Arc::new(AskRunState::default());
+        // Cancel BEFORE the worker starts. Codex review: thin path
+        // must check cancel before any callback fires.
+        state.cancelled.store(true, Ordering::Release);
+        let active = Arc::new(Mutex::new(HashMap::new()));
+        let evidence = vec![ev(1, 11, 1, 7), ev(2, 12, 1, 8)];
+
+        let ask_id = {
+            let s = store.lock().unwrap();
+            s.ask_history_insert("q?", "test-model", 0).unwrap()
+        };
+        active.lock().unwrap().insert(ask_id, Arc::clone(&state));
+
+        run_ask_job(
+            store.clone(),
+            active,
+            handler,
+            state,
+            ask_id,
+            "q?".into(),
+            "test-model".into(),
+            Vec::new(),
+            evidence,
+            true,
+        );
+
+        let events = recorder.events.lock().unwrap().clone();
+        // No delta, no source — only the terminal on_cancelled.
+        assert_eq!(events.len(), 1, "cancel-only, got {events:?}");
+        assert!(events[0].starts_with("cancelled "));
+        // ask_history persisted as `cancelled` (not `done`).
+        let s = store.lock().unwrap();
+        let mut q = s
+            .conn()
+            .prepare("SELECT status FROM ask_history WHERE id = ?")
+            .unwrap();
+        q.bind((1, ask_id)).unwrap();
+        q.next().unwrap();
+        assert_eq!(q.read::<String, _>(0).unwrap(), "cancelled");
     }
 }
