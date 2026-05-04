@@ -1249,13 +1249,29 @@ pub fn strip_citation_markers(md: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'[' {
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
+            // Codex review: accept multi-cite shapes like `[1, 2]`,
+            // `[1,2,3]`, `[1-3]`, `[^1]`, plus the original `[12]`.
+            // Scan up to a sane limit looking for `]`. Inner content
+            // must contain at least one digit and only digits + the
+            // separator chars listed below.
+            const MAX_CITE_LEN: usize = 32;
+            let max_close = (i + 1 + MAX_CITE_LEN).min(bytes.len());
+            let mut close: Option<usize> = None;
+            for (offset, &b) in bytes[(i + 1)..max_close].iter().enumerate() {
+                if b == b']' {
+                    close = Some(i + 1 + offset);
+                    break;
+                }
+                if b == b'\n' || b == b'[' {
+                    break;
+                }
             }
-            if j > i + 1 && j < bytes.len() && bytes[j] == b']' {
-                i = j + 1;
-                continue;
+            if let Some(j) = close {
+                let inner = &bytes[i + 1..j];
+                if is_cite_inner(inner) {
+                    i = j + 1;
+                    continue;
+                }
             }
         }
         // Push the next utf-8 char.
@@ -1266,6 +1282,24 @@ pub fn strip_citation_markers(md: &str) -> String {
         i += ch_len;
     }
     out
+}
+
+/// Inside-bracket cite shape check: at least one digit, and every
+/// byte is digit/separator/marker. Allows `0-9 , space tab - ^` plus
+/// the en-dash bytes (utf-8 e2 80 93). Anything else → not a cite.
+fn is_cite_inner(s: &[u8]) -> bool {
+    let mut has_digit = false;
+    for &b in s {
+        match b {
+            b'0'..=b'9' => has_digit = true,
+            b',' | b' ' | b'\t' | b'-' | b'^' => {}
+            // En-dash bytes (utf-8 0xE2 0x80 0x93) treated as range
+            // separators inside cite groups.
+            0xE2 | 0x80 | 0x93 => {}
+            _ => return false,
+        }
+    }
+    has_digit
 }
 
 fn utf8_char_len(b: u8) -> usize {
@@ -1408,6 +1442,26 @@ where
         "apps",
         "--disable",
         "multi_agent",
+        // Codex review: missed enabled-tool features in earlier
+        // pass. Names from `codex features list` (codex-cli 0.128).
+        "--disable",
+        "plugins",
+        "--disable",
+        "codex_hooks",
+        "--disable",
+        "shell_snapshot",
+        "--disable",
+        "tool_call_mcp_elicitation",
+        "--disable",
+        "tool_search",
+        "--disable",
+        "tool_suggest",
+        "--disable",
+        "unified_exec",
+        "--disable",
+        "workspace_dependencies",
+        "--disable",
+        "skill_mcp_dependency_install",
         // Strip env vars from any tool the agent might still
         // invoke — even with read-only sandbox, env can leak
         // credentials (HOME, AWS_*, GH_TOKEN).
@@ -2225,6 +2279,33 @@ not json
         );
         // Brackets without digits are kept.
         assert_eq!(strip_citation_markers("[breaking] news"), "[breaking] news");
+    }
+
+    #[test]
+    fn strip_citation_markers_handles_multi_cite_shapes() {
+        // Codex review: must strip common multi-cite markers too,
+        // not just `[N]`.
+        assert_eq!(
+            strip_citation_markers("BTC moved [1, 2] today"),
+            "BTC moved  today"
+        );
+        assert_eq!(
+            strip_citation_markers("price [1,2,3] surged"),
+            "price  surged"
+        );
+        assert_eq!(strip_citation_markers("range [1-3] high"), "range  high");
+        assert_eq!(
+            strip_citation_markers("range [1\u{2013}3] high"),
+            "range  high"
+        );
+        assert_eq!(strip_citation_markers("note [^1] here"), "note  here");
+        // Long alpha content not stripped.
+        assert_eq!(
+            strip_citation_markers("[this is not a cite]"),
+            "[this is not a cite]"
+        );
+        // Bare digits without brackets unchanged.
+        assert_eq!(strip_citation_markers("12 things"), "12 things");
     }
 
     #[test]
