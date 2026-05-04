@@ -240,10 +240,11 @@ pub struct EvidenceSummary {
 /// still emit `on_delta`. Terminal callback is exactly one of
 /// `on_finished` / `on_cancelled` / `on_error`.
 ///
-/// Drop-cancel: the worker thread holds only a `Weak<dyn AskStreamHandler>`.
-/// If Swift drops its `Arc` reference, the next callback's `Weak::upgrade`
-/// returns None — the worker flips `cancelled`, kills the codex child,
-/// and finalizes `ask_history.status='cancelled'` (spec §7).
+/// Cancellation is explicit only: Swift calls `wiki_cancel_ask(id)`.
+/// Spec §7's "implicit cancel on Arc drop" is not implementable at
+/// this UniFFI binding shape — the foreign-trait Arc the Rust side
+/// receives is independent of any Swift wrapper lifetime, so we have
+/// no way to observe a Swift-side release. Documented + deferred.
 #[uniffi::export(with_foreign)]
 pub trait AskStreamHandler: Send + Sync {
     fn on_delta(&self, segment_index: u32, text: String);
@@ -287,51 +288,46 @@ fn dispatch_to_main<F: FnOnce() + Send + 'static>(f: F) {
     f();
 }
 
-/// Worker-side wrapper around a Weak<dyn AskStreamHandler>. Each call
-/// upgrades + dispatches to main via `dispatch_to_main`. Returns false
-/// when the Swift side has dropped its Arc — caller flips cancellation.
+/// Worker-side wrapper around `Arc<dyn AskStreamHandler>`. Each call
+/// clones the strong Arc into a closure submitted to the main dispatch
+/// queue. Holding a strong ref is required: UniFFI's foreign-trait
+/// binding hands the Rust side an `Arc` that is independent of any
+/// Swift-side wrapper lifetime — downgrading to Weak would make the
+/// handler vanish from under the worker thread the moment our function
+/// returns, even if Swift believes it still has the trait alive.
+///
+/// **Implicit drop-cancel (spec §7) is therefore not implementable at
+/// this binding shape.** Swift cancels via the explicit
+/// `wiki_cancel_ask(id)` API. A future revisit would require either
+/// an extra "release" UniFFI callback Swift invokes from `deinit`, or
+/// codegen changes to share the strong-count across the FFI boundary.
 struct AskDispatch {
-    weak: std::sync::Weak<dyn AskStreamHandler>,
+    handler: Arc<dyn AskStreamHandler>,
 }
 
 impl AskDispatch {
     fn from_arc(handler: Arc<dyn AskStreamHandler>) -> Self {
-        let weak = Arc::downgrade(&handler);
-        // Drop the strong ref the worker received: only Swift's Arc +
-        // the Weak above keep the handler alive. If Swift releases,
-        // upgrade() starts returning None and we cancel.
-        drop(handler);
-        Self { weak }
+        Self { handler }
     }
-    /// Returns false iff the handler was dropped by Swift.
-    fn on_delta(&self, seg: u32, text: String) -> bool {
-        let Some(h) = self.weak.upgrade() else {
-            return false;
-        };
+    fn on_delta(&self, seg: u32, text: String) {
+        let h = Arc::clone(&self.handler);
         dispatch_to_main(move || h.on_delta(seg, text));
-        true
     }
-    fn on_source(&self, seg: u32, tag: u32, src: EvidenceSummary) -> bool {
-        let Some(h) = self.weak.upgrade() else {
-            return false;
-        };
+    fn on_source(&self, seg: u32, tag: u32, src: EvidenceSummary) {
+        let h = Arc::clone(&self.handler);
         dispatch_to_main(move || h.on_source(seg, tag, src));
-        true
     }
     fn on_finished(&self, ask_id: i64) {
-        if let Some(h) = self.weak.upgrade() {
-            dispatch_to_main(move || h.on_finished(ask_id));
-        }
+        let h = Arc::clone(&self.handler);
+        dispatch_to_main(move || h.on_finished(ask_id));
     }
     fn on_cancelled(&self, ask_id: i64) {
-        if let Some(h) = self.weak.upgrade() {
-            dispatch_to_main(move || h.on_cancelled(ask_id));
-        }
+        let h = Arc::clone(&self.handler);
+        dispatch_to_main(move || h.on_cancelled(ask_id));
     }
     fn on_error(&self, ask_id: i64, message: String) {
-        if let Some(h) = self.weak.upgrade() {
-            dispatch_to_main(move || h.on_error(ask_id, message));
-        }
+        let h = Arc::clone(&self.handler);
+        dispatch_to_main(move || h.on_error(ask_id, message));
     }
 }
 
@@ -930,9 +926,11 @@ fn run_ask_job(
     evidence_summaries: Vec<EvidenceSummary>,
     thin_below_three: bool,
 ) {
-    // Convert to Weak so a Swift-side drop of the handler triggers
-    // implicit cancel (spec §7). After this point only Swift's Arc
-    // keeps the handler alive; AskDispatch::on_* upgrades per-call.
+    // Wrap the handler in AskDispatch so every callback hops to the
+    // macOS main queue (spec §7) before invoking the Swift impl. The
+    // worker keeps the strong Arc for the duration; cancel is the
+    // explicit `wiki_cancel_ask(id)` API (no implicit-drop signal at
+    // this UniFFI binding shape).
     let dispatch = AskDispatch::from_arc(handler);
     let finalize_status = ask_run_inner(
         &store,
@@ -951,9 +949,6 @@ fn run_ask_job(
         map.remove(&ask_id);
     }
     // Always emit one terminal callback through the main-queue hop.
-    // If Swift dropped the handler, the upgrade inside AskDispatch
-    // returns None and the call is silently skipped — the user is
-    // gone, there is no UI to update.
     match finalize_status {
         AskOutcome::Done => dispatch.on_finished(ask_id),
         AskOutcome::Cancelled => dispatch.on_cancelled(ask_id),
@@ -967,27 +962,18 @@ enum AskOutcome {
     Failed(String),
 }
 
-/// Helper: trigger drop-cancel — flip the cancellation flag when the
-/// handler weak-ref refuses to upgrade (Swift dropped its Arc).
-fn drop_cancelled(state: &AskRunState) -> AskOutcome {
-    state
-        .cancelled
-        .store(true, std::sync::atomic::Ordering::Release);
-    AskOutcome::Cancelled
-}
-
 /// Parse one codex agent_message text as NDJSON and dispatch each
 /// segment + cite through the handler. Returns Err(msg) on parse
-/// failure so the caller can record it. Segment-level handler
-/// drop (Weak::upgrade returning None) flips state.cancelled and
-/// returns Ok(()) — the outer ask path detects cancel separately.
-/// Extracted so tests can exercise the LLM dispatch path without
-/// invoking codex (codex review).
+/// failure so the caller can record it. Extracted so tests can
+/// exercise the LLM dispatch path without invoking codex (codex
+/// review). The state argument stays in the signature because the
+/// test handler may want to inspect it; current implementation
+/// reads no fields.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_agent_message(
     text: &str,
     handler: &AskDispatch,
-    state: &AskRunState,
+    _state: &AskRunState,
     evidence_summaries: &[EvidenceSummary],
     evidence_count: u32,
     answer_md: &mut String,
@@ -1002,23 +988,10 @@ fn dispatch_agent_message(
         // Spec §6.6 "before any character is shown": validate cites
         // first, then dispatch on_delta then on_source.
         let valid_cites = validate_cites(&seg.cites, evidence_count);
-        // Implicit cancel via handler drop: AskDispatch returns false
-        // if Swift released the Arc. Flip cancelled so the codex
-        // stream + outer loop tear down (spec §7).
-        if !handler.on_delta(seg.seg, cleaned.clone()) {
-            state
-                .cancelled
-                .store(true, std::sync::atomic::Ordering::Release);
-            return Ok(());
-        }
+        handler.on_delta(seg.seg, cleaned.clone());
         for tag in &valid_cites {
             if let Some(ev) = evidence_summaries.get(*tag as usize - 1) {
-                if !handler.on_source(seg.seg, *tag, ev.clone()) {
-                    state
-                        .cancelled
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    return Ok(());
-                }
+                handler.on_source(seg.seg, *tag, ev.clone());
                 cited_ids.insert(*tag);
             }
         }
@@ -1065,11 +1038,7 @@ fn ask_run_inner(
             return AskOutcome::Cancelled;
         }
         let msg = "Not enough in your chats yet to answer confidently. Showing the best evidence I found.".to_string();
-        if !handler.on_delta(0, msg.clone()) {
-            // Swift dropped the handler before any callback fired.
-            finalize(store, ask_id, "cancelled", "", "[]");
-            return drop_cancelled(state);
-        }
+        handler.on_delta(0, msg.clone());
         // Track which sources actually fired, so a mid-loop cancel
         // persists ONLY what the user could have seen — not the full
         // pre-cancel evidence list (codex review). `shown` grows after
@@ -1086,12 +1055,7 @@ fn ask_run_inner(
                 finalize(store, ask_id, "cancelled", &msg, &cited_json);
                 return AskOutcome::Cancelled;
             }
-            if !handler.on_source(0, ev.source_id, ev.clone()) {
-                // Implicit cancel via handler drop (spec §7).
-                let cited_json = cited_sources_json(&shown);
-                finalize(store, ask_id, "cancelled", &msg, &cited_json);
-                return drop_cancelled(state);
-            }
+            handler.on_source(0, ev.source_id, ev.clone());
             shown.push(ev.clone());
         }
         // Spec §6.3 retention: bump cited counter so these evidence
@@ -1226,10 +1190,7 @@ fn ask_run_inner(
         //     produced nothing → failure.
         if model_thin_evidence {
             let msg = "I couldn't find enough relevant context to answer confidently.".to_string();
-            if !handler.on_delta(0, msg.clone()) {
-                finalize(store, ask_id, "cancelled", "", "[]");
-                return drop_cancelled(state);
-            }
+            handler.on_delta(0, msg.clone());
             finalize(store, ask_id, "done", &msg, "[]");
             return AskOutcome::Done;
         }
@@ -1500,59 +1461,6 @@ mod ask_tests {
         assert_eq!(events.len(), 1, "cancel-only, got {events:?}");
         assert!(events[0].starts_with("cancelled "));
         // ask_history persisted as `cancelled` (not `done`).
-        let s = store.lock().unwrap();
-        let mut q = s
-            .conn()
-            .prepare("SELECT status FROM ask_history WHERE id = ?")
-            .unwrap();
-        q.bind((1, ask_id)).unwrap();
-        q.next().unwrap();
-        assert_eq!(q.read::<String, _>(0).unwrap(), "cancelled");
-    }
-
-    #[test]
-    fn dropping_handler_cancels_thin_path() {
-        // Spec §7: dropping the Arc<dyn AskStreamHandler> on the Swift
-        // side triggers wiki_cancel_ask implicitly. Worker holds only
-        // a Weak; if the only strong ref is dropped before dispatch,
-        // the next callback fails to upgrade and the run cancels.
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
-        let recorder = Arc::new(RecordingHandler::default());
-        // Erase to dyn — this is the only strong ref aside from the
-        // one passed into run_ask_job, which is converted to Weak.
-        let handler: Arc<dyn AskStreamHandler> = Arc::clone(&recorder) as Arc<dyn AskStreamHandler>;
-        let state = Arc::new(AskRunState::default());
-        let active = Arc::new(Mutex::new(HashMap::new()));
-        let evidence = vec![ev(1, 11, 1, 7), ev(2, 12, 1, 8)];
-
-        let ask_id = {
-            let s = store.lock().unwrap();
-            s.ask_history_insert("q?", "test-model", 0).unwrap()
-        };
-        active.lock().unwrap().insert(ask_id, Arc::clone(&state));
-
-        // Drop both the trait-object Arc AND the recorder before
-        // run_ask_job runs — only the Arc passed into run_ask_job
-        // remains. Inside, AskDispatch downgrades + drops it, leaving
-        // a dead Weak. First callback returns false → cancel path.
-        let only_strong = Arc::clone(&handler);
-        drop(handler);
-        drop(recorder);
-
-        run_ask_job(
-            store.clone(),
-            active,
-            only_strong, // moved in; downgraded immediately by AskDispatch.
-            state,
-            ask_id,
-            "q?".into(),
-            "test-model".into(),
-            Vec::new(),
-            evidence,
-            true,
-        );
-
-        // ask_history persisted as `cancelled`.
         let s = store.lock().unwrap();
         let mut q = s
             .conn()
