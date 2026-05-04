@@ -1518,6 +1518,23 @@ fn fts_phrase(q: &str) -> String {
     format!("\"{}\"", q.replace('"', "\"\""))
 }
 
+/// Build an FTS5 OR-of-terms query from a natural-language string.
+/// Single-phrase quoting is fine for one-word lookups but kills recall
+/// for "bitcoin etf news today" style asks — that becomes a literal
+/// adjacent-trigrams match. Splitting on whitespace and OR-ing each
+/// quoted token lets bm25 rank docs containing any subset, which is
+/// what users expect from natural-language search (codex review).
+/// Caller already short-circuits on `trimmed.len() < 2`, so we don't
+/// need to re-validate here. Returns empty string if no usable tokens
+/// remain after filtering — caller should treat that as "no match".
+fn fts_or_terms(q: &str) -> String {
+    q.split_whitespace()
+        .filter(|t| !t.is_empty())
+        .map(fts_phrase)
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 /// Time-decay constant: 7 days. Recent rows score higher; rows older
 /// than ~14d are effectively muted regardless of bm25.
 const ASK_DECAY_SECS: f64 = 7.0 * 86_400.0;
@@ -1533,10 +1550,14 @@ impl Store {
             return Ok(Vec::new());
         }
         let jamo = crate::search::hangul::decompose_jamo(trimmed);
-        let fts_q = if jamo == trimmed {
-            fts_phrase(trimmed)
+        let original_q = fts_or_terms(trimmed);
+        let jamo_q = fts_or_terms(&jamo);
+        let fts_q = if original_q.is_empty() {
+            return Ok(Vec::new());
+        } else if jamo == trimmed || jamo_q.is_empty() {
+            original_q
         } else {
-            format!("{} OR {}", fts_phrase(trimmed), fts_phrase(&jamo))
+            format!("{original_q} OR {jamo_q}")
         };
         // Filter out pages whose evidence is entirely from excluded
         // chats or soft-deleted messages: a page summary is synthesized
@@ -1595,10 +1616,14 @@ impl Store {
             return Ok(Vec::new());
         }
         let jamo = crate::search::hangul::decompose_jamo(trimmed);
-        let fts_q = if jamo == trimmed {
-            fts_phrase(trimmed)
+        let original_q = fts_or_terms(trimmed);
+        let jamo_q = fts_or_terms(&jamo);
+        let fts_q = if original_q.is_empty() {
+            return Ok(Vec::new());
+        } else if jamo == trimmed || jamo_q.is_empty() {
+            original_q
         } else {
-            format!("{} OR {}", fts_phrase(trimmed), fts_phrase(&jamo))
+            format!("{original_q} OR {jamo_q}")
         };
         // INNER JOIN messages + chats: ask must respect spec §6.6 +
         // soft-delete (spec line 160) + per-chat exclusion. An evidence
@@ -3026,6 +3051,38 @@ mod tests {
             })
             .unwrap();
         store.conn().execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn ask_fts_evidence_natural_language_query_matches_subset_of_words() {
+        // Natural-language query "bitcoin etf news" must match an
+        // evidence row containing those tokens out of order — the
+        // earlier whole-phrase quoting only matched literal adjacency
+        // (codex review). bm25 ranks hits with more-of-the-tokens
+        // higher.
+        let store = setup();
+        let pid = make_page_with_summary(&store, "Bitcoin ETF", "x");
+        add_evi_text(
+            &store,
+            pid,
+            701,
+            1,
+            1_000,
+            "Latest news about Bitcoin spot ETF inflows surged",
+        );
+        add_evi_text(
+            &store,
+            pid,
+            702,
+            1,
+            1_000,
+            "Ethereum block size discussion (no match)",
+        );
+        let rows = store
+            .ask_fts_evidence("bitcoin etf news", 20, 2_000)
+            .unwrap();
+        let ids: Vec<i64> = rows.iter().map(|r| r.msg_id).collect();
+        assert!(ids.contains(&701), "out-of-order tokens must hit");
     }
 
     #[test]

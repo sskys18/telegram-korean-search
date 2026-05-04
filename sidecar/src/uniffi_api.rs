@@ -976,6 +976,61 @@ fn drop_cancelled(state: &AskRunState) -> AskOutcome {
     AskOutcome::Cancelled
 }
 
+/// Parse one codex agent_message text as NDJSON and dispatch each
+/// segment + cite through the handler. Returns Err(msg) on parse
+/// failure so the caller can record it. Segment-level handler
+/// drop (Weak::upgrade returning None) flips state.cancelled and
+/// returns Ok(()) — the outer ask path detects cancel separately.
+/// Extracted so tests can exercise the LLM dispatch path without
+/// invoking codex (codex review).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_agent_message(
+    text: &str,
+    handler: &AskDispatch,
+    state: &AskRunState,
+    evidence_summaries: &[EvidenceSummary],
+    evidence_count: u32,
+    answer_md: &mut String,
+    cited_ids: &mut std::collections::BTreeSet<u32>,
+    segments_dispatched: &mut u32,
+    model_thin_evidence: &mut bool,
+) -> Result<(), String> {
+    let parsed = parse_ask_stream(text).map_err(|e| format!("malformed stream: {e}"))?;
+    *model_thin_evidence = *model_thin_evidence || parsed.thin_evidence;
+    for seg in parsed.segments {
+        let cleaned = strip_citation_markers(&seg.md);
+        // Spec §6.6 "before any character is shown": validate cites
+        // first, then dispatch on_delta then on_source.
+        let valid_cites = validate_cites(&seg.cites, evidence_count);
+        // Implicit cancel via handler drop: AskDispatch returns false
+        // if Swift released the Arc. Flip cancelled so the codex
+        // stream + outer loop tear down (spec §7).
+        if !handler.on_delta(seg.seg, cleaned.clone()) {
+            state
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Ok(());
+        }
+        for tag in &valid_cites {
+            if let Some(ev) = evidence_summaries.get(*tag as usize - 1) {
+                if !handler.on_source(seg.seg, *tag, ev.clone()) {
+                    state
+                        .cancelled
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return Ok(());
+                }
+                cited_ids.insert(*tag);
+            }
+        }
+        if !answer_md.is_empty() {
+            answer_md.push_str("\n\n");
+        }
+        answer_md.push_str(&cleaned);
+        *segments_dispatched += 1;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ask_run_inner(
     store: &Arc<Mutex<Store>>,
@@ -1096,39 +1151,18 @@ fn ask_run_inner(
         if parse_err.is_some() {
             return;
         }
-        match parse_ask_stream(text) {
-            Ok(parsed) => {
-                model_thin_evidence = model_thin_evidence || parsed.thin_evidence;
-                for seg in parsed.segments {
-                    let cleaned = strip_citation_markers(&seg.md);
-                    // Spec §6.6 "before any character is shown": validate
-                    // cites first, then dispatch on_delta then on_source.
-                    let valid_cites = validate_cites(&seg.cites, evidence_count);
-                    // Implicit cancel via handler drop: AskDispatch
-                    // returns false if Swift released the Arc. Flip
-                    // cancelled so the codex stream + outer loop tear
-                    // down (spec §7).
-                    if !handler.on_delta(seg.seg, cleaned.clone()) {
-                        state.cancelled.store(true, Ordering::Release);
-                        return;
-                    }
-                    for tag in &valid_cites {
-                        if let Some(ev) = evidence_summaries.get(*tag as usize - 1) {
-                            if !handler.on_source(seg.seg, *tag, ev.clone()) {
-                                state.cancelled.store(true, Ordering::Release);
-                                return;
-                            }
-                            cited_ids.insert(*tag);
-                        }
-                    }
-                    if !answer_md.is_empty() {
-                        answer_md.push_str("\n\n");
-                    }
-                    answer_md.push_str(&cleaned);
-                    segments_dispatched += 1;
-                }
-            }
-            Err(e) => parse_err = Some(format!("malformed stream: {e}")),
+        if let Err(msg) = dispatch_agent_message(
+            text,
+            handler,
+            state,
+            evidence_summaries,
+            evidence_count,
+            &mut answer_md,
+            &mut cited_ids,
+            &mut segments_dispatched,
+            &mut model_thin_evidence,
+        ) {
+            parse_err = Some(msg);
         }
     });
 
@@ -1527,5 +1561,159 @@ mod ask_tests {
         q.bind((1, ask_id)).unwrap();
         q.next().unwrap();
         assert_eq!(q.read::<String, _>(0).unwrap(), "cancelled");
+    }
+
+    // ---- dispatch_agent_message: tests the LLM dispatch path
+    // without a live codex subprocess (codex review).
+
+    fn dispatch_setup() -> (
+        Arc<RecordingHandler>,
+        AskDispatch,
+        Arc<AskRunState>,
+        Vec<EvidenceSummary>,
+    ) {
+        let recorder = Arc::new(RecordingHandler::default());
+        let handler_arc: Arc<dyn AskStreamHandler> =
+            Arc::clone(&recorder) as Arc<dyn AskStreamHandler>;
+        let dispatch = AskDispatch::from_arc(handler_arc);
+        let state = Arc::new(AskRunState::default());
+        let evidence = vec![ev(1, 11, 1, 7), ev(2, 12, 2, 8), ev(3, 13, 3, 9)];
+        (recorder, dispatch, state, evidence)
+    }
+
+    #[test]
+    fn dispatch_agent_message_dispatches_segments_in_order() {
+        let (recorder, dispatch, state, evidence) = dispatch_setup();
+        let mut answer = String::new();
+        let mut cited = std::collections::BTreeSet::new();
+        let mut count = 0u32;
+        let mut thin = false;
+        let text = r#"{"type":"segment","seg":0,"md":"first paragraph","cites":[1]}
+{"type":"segment","seg":1,"md":"second paragraph","cites":[2,3]}
+{"type":"done","thin_evidence":false}"#;
+        let r = dispatch_agent_message(
+            text,
+            &dispatch,
+            &state,
+            &evidence,
+            evidence.len() as u32,
+            &mut answer,
+            &mut cited,
+            &mut count,
+            &mut thin,
+        );
+        assert!(r.is_ok());
+        assert_eq!(count, 2);
+        assert_eq!(answer, "first paragraph\n\nsecond paragraph");
+        assert_eq!(cited.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+        let events = recorder.events.lock().unwrap().clone();
+        // delta 0, source 0/1, delta 1, source 1/2, source 1/3.
+        assert_eq!(events.len(), 5);
+        assert!(events[0].starts_with("delta 0 first paragraph"));
+        assert!(events[1].starts_with("source 0 1 "));
+        assert!(events[2].starts_with("delta 1 second paragraph"));
+        assert!(events[3].starts_with("source 1 2 "));
+        assert!(events[4].starts_with("source 1 3 "));
+    }
+
+    #[test]
+    fn dispatch_agent_message_strips_unknown_cites() {
+        let (recorder, dispatch, state, evidence) = dispatch_setup();
+        let mut answer = String::new();
+        let mut cited = std::collections::BTreeSet::new();
+        let mut count = 0u32;
+        let mut thin = false;
+        // cite 99 doesn't exist — must not fire on_source.
+        let text = r#"{"type":"segment","seg":0,"md":"a","cites":[1,99,2]}
+{"type":"done","thin_evidence":false}"#;
+        let r = dispatch_agent_message(
+            text,
+            &dispatch,
+            &state,
+            &evidence,
+            evidence.len() as u32,
+            &mut answer,
+            &mut cited,
+            &mut count,
+            &mut thin,
+        );
+        assert!(r.is_ok());
+        let events = recorder.events.lock().unwrap().clone();
+        assert!(events.iter().all(|e| !e.contains(" 99 ")));
+        assert_eq!(cited.iter().copied().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn dispatch_agent_message_strips_inline_citation_markers() {
+        let (recorder, dispatch, state, evidence) = dispatch_setup();
+        let mut answer = String::new();
+        let mut cited = std::collections::BTreeSet::new();
+        let mut count = 0u32;
+        let mut thin = false;
+        // Model emitted `[1]` inline despite the prompt prohibiting it.
+        let text = r#"{"type":"segment","seg":0,"md":"BTC up [1] today","cites":[1]}
+{"type":"done","thin_evidence":false}"#;
+        let r = dispatch_agent_message(
+            text,
+            &dispatch,
+            &state,
+            &evidence,
+            evidence.len() as u32,
+            &mut answer,
+            &mut cited,
+            &mut count,
+            &mut thin,
+        );
+        assert!(r.is_ok());
+        // delta text must not contain `[1]`.
+        let events = recorder.events.lock().unwrap().clone();
+        assert!(events[0].starts_with("delta 0 BTC up  today"));
+    }
+
+    #[test]
+    fn dispatch_agent_message_returns_parse_error() {
+        let (_recorder, dispatch, state, evidence) = dispatch_setup();
+        let mut answer = String::new();
+        let mut cited = std::collections::BTreeSet::new();
+        let mut count = 0u32;
+        let mut thin = false;
+        let r = dispatch_agent_message(
+            "not json",
+            &dispatch,
+            &state,
+            &evidence,
+            evidence.len() as u32,
+            &mut answer,
+            &mut cited,
+            &mut count,
+            &mut thin,
+        );
+        assert!(r.is_err());
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn dispatch_agent_message_thin_evidence_done_only() {
+        let (recorder, dispatch, state, evidence) = dispatch_setup();
+        let mut answer = String::new();
+        let mut cited = std::collections::BTreeSet::new();
+        let mut count = 0u32;
+        let mut thin = false;
+        let text = r#"{"type":"done","thin_evidence":true}"#;
+        let r = dispatch_agent_message(
+            text,
+            &dispatch,
+            &state,
+            &evidence,
+            evidence.len() as u32,
+            &mut answer,
+            &mut cited,
+            &mut count,
+            &mut thin,
+        );
+        assert!(r.is_ok());
+        assert_eq!(count, 0);
+        assert!(thin);
+        assert_eq!(recorder.events.lock().unwrap().len(), 0);
     }
 }

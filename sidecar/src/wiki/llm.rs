@@ -1443,6 +1443,19 @@ where
             }
         })
         .map_err(|e| AskRunError::Exec(format!("spawn reader: {e}")))?;
+    // Drain stderr on its own thread (codex review). The pipe buffer
+    // fills at ~64KB on macOS; without a draining reader, codex blocks
+    // on its stderr write and the main loop never sees turn.completed.
+    // Captured for diagnostics in case codex exits with an error.
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let stderr_join = std::thread::Builder::new()
+        .name("seoyu-ask-stderr".into())
+        .spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut BufReader::new(stderr), &mut buf);
+            buf
+        })
+        .map_err(|e| AskRunError::Exec(format!("spawn stderr drain: {e}")))?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ASK_TIMEOUT_SECS);
     let mut early_error: Option<String> = None;
@@ -1531,11 +1544,20 @@ where
     let _ = child.wait();
     state.pid.store(0, Ordering::Release);
     let _ = reader_join.join();
+    let stderr_buf = stderr_join.join().unwrap_or_default();
     let _ = std::fs::remove_dir_all(&isolated_cwd);
 
     result?;
     if let Some(msg) = early_error {
-        return Err(AskRunError::Exec(msg));
+        // Append a tail of stderr if codex left diagnostics there. Cap
+        // so an aberrant codex run can't blow our error string.
+        let stderr_tail = String::from_utf8_lossy(&stderr_buf);
+        let tail = stderr_tail.trim();
+        let trimmed_tail: String = tail.chars().take(500).collect();
+        if trimmed_tail.is_empty() {
+            return Err(AskRunError::Exec(msg));
+        }
+        return Err(AskRunError::Exec(format!("{msg} | stderr: {trimmed_tail}")));
     }
     // Codex review: a silent exit (stream closed without turn.completed
     // OR with no agent_message ever delivered) must NOT persist as a
