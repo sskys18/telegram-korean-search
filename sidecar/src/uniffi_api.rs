@@ -909,6 +909,11 @@ fn ask_run_inner(
         }
         let msg = "Not enough in your chats yet to answer confidently. Showing the best evidence I found.".to_string();
         handler.on_delta(0, msg.clone());
+        // Track which sources actually fired, so a mid-loop cancel
+        // persists ONLY what the user could have seen — not the full
+        // pre-cancel evidence list (codex review). `shown` grows after
+        // each successful on_source.
+        let mut shown: Vec<EvidenceSummary> = Vec::with_capacity(evidence_summaries.len());
         for ev in evidence_summaries {
             // Re-check cancel between sources so a long evidence list
             // doesn't keep firing callbacks after cancel.
@@ -916,11 +921,12 @@ fn ask_run_inner(
                 // Persist what's been shown so far per spec §6.6:
                 // "Partial answers shown so far are persisted with the
                 // cancelled status."
-                let cited_json = cited_sources_json(evidence_summaries);
+                let cited_json = cited_sources_json(&shown);
                 finalize(store, ask_id, "cancelled", &msg, &cited_json);
                 return AskOutcome::Cancelled;
             }
             handler.on_source(0, ev.source_id, ev.clone());
+            shown.push(ev.clone());
         }
         // Spec §6.3 retention: bump cited counter so these evidence
         // rows survive the next rewrite-time pruning. Same as the LLM
