@@ -1369,14 +1369,33 @@ where
             "read-only",
             "--cd",
             cwd_str.as_str(),
-            // Strip env vars from any tool the agent might invoke —
-            // even with read-only sandbox, env can leak credentials
-            // (HOME, AWS_*, GH_TOKEN). `inherit=none` blanks them.
+            // Pre-disable every tool feature the codex agent has —
+            // ask runs untrusted chat excerpts and the model must
+            // produce text only. Names verified against
+            // `codex features list` (codex-cli 0.128). Stays paired
+            // with the post-hoc `disallowed agent item` guard so a
+            // future codex release that resurrects a removed tool
+            // doesn't silently re-enable it.
+            "--disable",
+            "shell_tool",
+            "--disable",
+            "browser_use",
+            "--disable",
+            "computer_use",
+            "--disable",
+            "image_generation",
+            "--disable",
+            "in_app_browser",
+            "--disable",
+            "apps",
+            "--disable",
+            "multi_agent",
+            // Strip env vars from any tool the agent might still
+            // invoke — even with read-only sandbox, env can leak
+            // credentials (HOME, AWS_*, GH_TOKEN).
             "-c",
             "shell_environment_policy.inherit=none",
-            // Defense in depth: blank the sandbox permission allowlist.
-            // `--sandbox read-only` is the policy; this is the explicit
-            // capability set behind it. Empty array → no extra grants.
+            // Blank the sandbox permission allowlist.
             "-c",
             "sandbox_permissions=[]",
             "-m",

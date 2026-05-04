@@ -229,13 +229,21 @@ pub struct EvidenceSummary {
 }
 
 /// Spec §6.6 streaming handler. Callbacks for a single ask are
-/// serialized on the worker thread; the Swift side wraps body code in
-/// `DispatchQueue.main.async` per spec §7 threading contract.
+/// serialized — the sidecar dispatches every invocation through the
+/// macOS main queue (libdispatch `dispatch_async_f` on
+/// `_dispatch_main_q`), so Swift implementations may touch AppKit
+/// directly without their own `DispatchQueue.main.async` hop. Spec §7
+/// threading contract.
 ///
 /// Per-segment delivery order: `on_delta` first, then 0+ `on_source`
 /// for that segment's validated cites. Segments with no valid cites
 /// still emit `on_delta`. Terminal callback is exactly one of
 /// `on_finished` / `on_cancelled` / `on_error`.
+///
+/// Drop-cancel: the worker thread holds only a `Weak<dyn AskStreamHandler>`.
+/// If Swift drops its `Arc` reference, the next callback's `Weak::upgrade`
+/// returns None — the worker flips `cancelled`, kills the codex child,
+/// and finalizes `ask_history.status='cancelled'` (spec §7).
 #[uniffi::export(with_foreign)]
 pub trait AskStreamHandler: Send + Sync {
     fn on_delta(&self, segment_index: u32, text: String);
@@ -243,6 +251,88 @@ pub trait AskStreamHandler: Send + Sync {
     fn on_finished(&self, ask_id: i64);
     fn on_cancelled(&self, ask_id: i64);
     fn on_error(&self, ask_id: i64, message: String);
+}
+
+/// Hop a closure to the macOS main dispatch queue. Swift impls of
+/// `AskStreamHandler` can therefore touch AppKit directly without a
+/// per-callsite `DispatchQueue.main.async`. Tests + non-macos targets
+/// fall back to direct invocation: cargo test runs without an active
+/// main queue, so dispatching there would queue forever.
+#[cfg(all(target_os = "macos", not(test)))]
+fn dispatch_to_main<F: FnOnce() + Send + 'static>(f: F) {
+    use std::ffi::c_void;
+    #[link(name = "System", kind = "framework")]
+    extern "C" {
+        static _dispatch_main_q: c_void;
+        fn dispatch_async_f(queue: *mut c_void, ctx: *mut c_void, work: extern "C" fn(*mut c_void));
+    }
+    let boxed: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
+    let ctx = Box::into_raw(boxed) as *mut c_void;
+    extern "C" fn trampoline(ctx: *mut c_void) {
+        // SAFETY: trampoline owns the box round-trip; Box::from_raw reclaims it.
+        let f: Box<Box<dyn FnOnce() + Send>> = unsafe { Box::from_raw(ctx as *mut _) };
+        f();
+    }
+    unsafe {
+        dispatch_async_f(
+            &_dispatch_main_q as *const _ as *mut c_void,
+            ctx,
+            trampoline,
+        );
+    }
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+fn dispatch_to_main<F: FnOnce() + Send + 'static>(f: F) {
+    f();
+}
+
+/// Worker-side wrapper around a Weak<dyn AskStreamHandler>. Each call
+/// upgrades + dispatches to main via `dispatch_to_main`. Returns false
+/// when the Swift side has dropped its Arc — caller flips cancellation.
+struct AskDispatch {
+    weak: std::sync::Weak<dyn AskStreamHandler>,
+}
+
+impl AskDispatch {
+    fn from_arc(handler: Arc<dyn AskStreamHandler>) -> Self {
+        let weak = Arc::downgrade(&handler);
+        // Drop the strong ref the worker received: only Swift's Arc +
+        // the Weak above keep the handler alive. If Swift releases,
+        // upgrade() starts returning None and we cancel.
+        drop(handler);
+        Self { weak }
+    }
+    /// Returns false iff the handler was dropped by Swift.
+    fn on_delta(&self, seg: u32, text: String) -> bool {
+        let Some(h) = self.weak.upgrade() else {
+            return false;
+        };
+        dispatch_to_main(move || h.on_delta(seg, text));
+        true
+    }
+    fn on_source(&self, seg: u32, tag: u32, src: EvidenceSummary) -> bool {
+        let Some(h) = self.weak.upgrade() else {
+            return false;
+        };
+        dispatch_to_main(move || h.on_source(seg, tag, src));
+        true
+    }
+    fn on_finished(&self, ask_id: i64) {
+        if let Some(h) = self.weak.upgrade() {
+            dispatch_to_main(move || h.on_finished(ask_id));
+        }
+    }
+    fn on_cancelled(&self, ask_id: i64) {
+        if let Some(h) = self.weak.upgrade() {
+            dispatch_to_main(move || h.on_cancelled(ask_id));
+        }
+    }
+    fn on_error(&self, ask_id: i64, message: String) {
+        if let Some(h) = self.weak.upgrade() {
+            dispatch_to_main(move || h.on_error(ask_id, message));
+        }
+    }
 }
 
 // ---------- The Swift-facing `Seoyu` object ----------
@@ -840,9 +930,13 @@ fn run_ask_job(
     evidence_summaries: Vec<EvidenceSummary>,
     thin_below_three: bool,
 ) {
+    // Convert to Weak so a Swift-side drop of the handler triggers
+    // implicit cancel (spec §7). After this point only Swift's Arc
+    // keeps the handler alive; AskDispatch::on_* upgrades per-call.
+    let dispatch = AskDispatch::from_arc(handler);
     let finalize_status = ask_run_inner(
         &store,
-        &handler,
+        &dispatch,
         &state,
         ask_id,
         &query,
@@ -856,15 +950,14 @@ fn run_ask_job(
         let mut map = active.lock().unwrap_or_else(|e| e.into_inner());
         map.remove(&ask_id);
     }
-    // Always emit one terminal callback. A panic above would skip this
-    // → callers see no terminal event. The inner fn is panic-safe by
-    // construction (no unwrap on user-supplied data); if that assumption
-    // breaks, the missing callback is the visible symptom and worth
-    // surfacing.
+    // Always emit one terminal callback through the main-queue hop.
+    // If Swift dropped the handler, the upgrade inside AskDispatch
+    // returns None and the call is silently skipped — the user is
+    // gone, there is no UI to update.
     match finalize_status {
-        AskOutcome::Done => handler.on_finished(ask_id),
-        AskOutcome::Cancelled => handler.on_cancelled(ask_id),
-        AskOutcome::Failed(msg) => handler.on_error(ask_id, msg),
+        AskOutcome::Done => dispatch.on_finished(ask_id),
+        AskOutcome::Cancelled => dispatch.on_cancelled(ask_id),
+        AskOutcome::Failed(msg) => dispatch.on_error(ask_id, msg),
     }
 }
 
@@ -874,10 +967,19 @@ enum AskOutcome {
     Failed(String),
 }
 
+/// Helper: trigger drop-cancel — flip the cancellation flag when the
+/// handler weak-ref refuses to upgrade (Swift dropped its Arc).
+fn drop_cancelled(state: &AskRunState) -> AskOutcome {
+    state
+        .cancelled
+        .store(true, std::sync::atomic::Ordering::Release);
+    AskOutcome::Cancelled
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ask_run_inner(
     store: &Arc<Mutex<Store>>,
-    handler: &Arc<dyn AskStreamHandler>,
+    handler: &AskDispatch,
     state: &Arc<AskRunState>,
     ask_id: i64,
     query: &str,
@@ -908,7 +1010,11 @@ fn ask_run_inner(
             return AskOutcome::Cancelled;
         }
         let msg = "Not enough in your chats yet to answer confidently. Showing the best evidence I found.".to_string();
-        handler.on_delta(0, msg.clone());
+        if !handler.on_delta(0, msg.clone()) {
+            // Swift dropped the handler before any callback fired.
+            finalize(store, ask_id, "cancelled", "", "[]");
+            return drop_cancelled(state);
+        }
         // Track which sources actually fired, so a mid-loop cancel
         // persists ONLY what the user could have seen — not the full
         // pre-cancel evidence list (codex review). `shown` grows after
@@ -925,7 +1031,12 @@ fn ask_run_inner(
                 finalize(store, ask_id, "cancelled", &msg, &cited_json);
                 return AskOutcome::Cancelled;
             }
-            handler.on_source(0, ev.source_id, ev.clone());
+            if !handler.on_source(0, ev.source_id, ev.clone()) {
+                // Implicit cancel via handler drop (spec §7).
+                let cited_json = cited_sources_json(&shown);
+                finalize(store, ask_id, "cancelled", &msg, &cited_json);
+                return drop_cancelled(state);
+            }
             shown.push(ev.clone());
         }
         // Spec §6.3 retention: bump cited counter so these evidence
@@ -993,10 +1104,20 @@ fn ask_run_inner(
                     // Spec §6.6 "before any character is shown": validate
                     // cites first, then dispatch on_delta then on_source.
                     let valid_cites = validate_cites(&seg.cites, evidence_count);
-                    handler.on_delta(seg.seg, cleaned.clone());
+                    // Implicit cancel via handler drop: AskDispatch
+                    // returns false if Swift released the Arc. Flip
+                    // cancelled so the codex stream + outer loop tear
+                    // down (spec §7).
+                    if !handler.on_delta(seg.seg, cleaned.clone()) {
+                        state.cancelled.store(true, Ordering::Release);
+                        return;
+                    }
                     for tag in &valid_cites {
                         if let Some(ev) = evidence_summaries.get(*tag as usize - 1) {
-                            handler.on_source(seg.seg, *tag, ev.clone());
+                            if !handler.on_source(seg.seg, *tag, ev.clone()) {
+                                state.cancelled.store(true, Ordering::Release);
+                                return;
+                            }
                             cited_ids.insert(*tag);
                         }
                     }
@@ -1071,7 +1192,10 @@ fn ask_run_inner(
         //     produced nothing → failure.
         if model_thin_evidence {
             let msg = "I couldn't find enough relevant context to answer confidently.".to_string();
-            handler.on_delta(0, msg.clone());
+            if !handler.on_delta(0, msg.clone()) {
+                finalize(store, ask_id, "cancelled", "", "[]");
+                return drop_cancelled(state);
+            }
             finalize(store, ask_id, "done", &msg, "[]");
             return AskOutcome::Done;
         }
@@ -1342,6 +1466,59 @@ mod ask_tests {
         assert_eq!(events.len(), 1, "cancel-only, got {events:?}");
         assert!(events[0].starts_with("cancelled "));
         // ask_history persisted as `cancelled` (not `done`).
+        let s = store.lock().unwrap();
+        let mut q = s
+            .conn()
+            .prepare("SELECT status FROM ask_history WHERE id = ?")
+            .unwrap();
+        q.bind((1, ask_id)).unwrap();
+        q.next().unwrap();
+        assert_eq!(q.read::<String, _>(0).unwrap(), "cancelled");
+    }
+
+    #[test]
+    fn dropping_handler_cancels_thin_path() {
+        // Spec §7: dropping the Arc<dyn AskStreamHandler> on the Swift
+        // side triggers wiki_cancel_ask implicitly. Worker holds only
+        // a Weak; if the only strong ref is dropped before dispatch,
+        // the next callback fails to upgrade and the run cancels.
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let recorder = Arc::new(RecordingHandler::default());
+        // Erase to dyn — this is the only strong ref aside from the
+        // one passed into run_ask_job, which is converted to Weak.
+        let handler: Arc<dyn AskStreamHandler> = Arc::clone(&recorder) as Arc<dyn AskStreamHandler>;
+        let state = Arc::new(AskRunState::default());
+        let active = Arc::new(Mutex::new(HashMap::new()));
+        let evidence = vec![ev(1, 11, 1, 7), ev(2, 12, 1, 8)];
+
+        let ask_id = {
+            let s = store.lock().unwrap();
+            s.ask_history_insert("q?", "test-model", 0).unwrap()
+        };
+        active.lock().unwrap().insert(ask_id, Arc::clone(&state));
+
+        // Drop both the trait-object Arc AND the recorder before
+        // run_ask_job runs — only the Arc passed into run_ask_job
+        // remains. Inside, AskDispatch downgrades + drops it, leaving
+        // a dead Weak. First callback returns false → cancel path.
+        let only_strong = Arc::clone(&handler);
+        drop(handler);
+        drop(recorder);
+
+        run_ask_job(
+            store.clone(),
+            active,
+            only_strong, // moved in; downgraded immediately by AskDispatch.
+            state,
+            ask_id,
+            "q?".into(),
+            "test-model".into(),
+            Vec::new(),
+            evidence,
+            true,
+        );
+
+        // ask_history persisted as `cancelled`.
         let s = store.lock().unwrap();
         let mut q = s
             .conn()
