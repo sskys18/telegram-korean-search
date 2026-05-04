@@ -22,6 +22,7 @@
 //! `try` / `catch`. Do not panic across the FFI boundary; convert to
 //! an error instead.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -31,7 +32,12 @@ use crate::store::message::{
     strip_whitespace, Cursor, IndexOutcome as CoreIndexOutcome, MessageRef as CoreMessageRef,
     MessageRow,
 };
+use crate::store::wiki_page::{AskEvidence, AskPage};
 use crate::store::Store;
+use crate::wiki::llm::{
+    parse_ask_stream, resolve_ask_model, strip_citation_markers, validate_cites, AskEvidenceIn,
+    AskInput, AskPageIn, AskRunError, AskRunState, LlmClient,
+};
 use crate::wiki::worker::WorkerHandle;
 
 /// Swift-facing errors. Anything that went wrong inside the crate is
@@ -205,6 +211,40 @@ pub trait WikiObserver: Send + Sync {
     fn on_topics_changed(&self);
 }
 
+/// One evidence row presented to the UI as a citable source. `source_id`
+/// is the 1-based presentation index — the LLM only ever sees this id,
+/// so unknown cites can be stripped before any character renders.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct EvidenceSummary {
+    pub source_id: u32,
+    pub evidence_id: i64,
+    pub page_id: i64,
+    pub page_title: String,
+    pub chat_id: i64,
+    pub chat_title: String,
+    pub msg_id: i64,
+    pub sender_id: i64,
+    pub ts: i64,
+    pub excerpt: String,
+}
+
+/// Spec §6.6 streaming handler. Callbacks for a single ask are
+/// serialized on the worker thread; the Swift side wraps body code in
+/// `DispatchQueue.main.async` per spec §7 threading contract.
+///
+/// Per-segment delivery order: `on_delta` first, then 0+ `on_source`
+/// for that segment's validated cites. Segments with no valid cites
+/// still emit `on_delta`. Terminal callback is exactly one of
+/// `on_finished` / `on_cancelled` / `on_error`.
+#[uniffi::export(with_foreign)]
+pub trait AskStreamHandler: Send + Sync {
+    fn on_delta(&self, segment_index: u32, text: String);
+    fn on_source(&self, segment_index: u32, tag: u32, source: EvidenceSummary);
+    fn on_finished(&self, ask_id: i64);
+    fn on_cancelled(&self, ask_id: i64);
+    fn on_error(&self, ask_id: i64, message: String);
+}
+
 // ---------- The Swift-facing `Seoyu` object ----------
 
 /// Root handle the Swift shell keeps for the lifetime of the app.
@@ -216,6 +256,11 @@ pub struct Seoyu {
     wiki_worker: Mutex<Option<WorkerHandle>>,
     wiki_observer: Arc<Mutex<Option<Arc<dyn WikiObserver>>>>,
     wiki_wake: Arc<AtomicBool>,
+    /// Map of ask_id → cancellation state. Lives only while the ask is
+    /// in flight; the worker thread removes its entry in a `finally`-
+    /// like guard before exiting. `wiki_cancel_ask` looks up by id and
+    /// flips `cancelled`, then sends SIGTERM to the codex pid if known.
+    active_asks: Arc<Mutex<HashMap<i64, Arc<AskRunState>>>>,
 }
 
 #[uniffi::export]
@@ -233,6 +278,7 @@ impl Seoyu {
             wiki_worker: Mutex::new(None),
             wiki_observer: Arc::new(Mutex::new(None)),
             wiki_wake: Arc::new(AtomicBool::new(false)),
+            active_asks: Arc::new(Mutex::new(HashMap::new())),
         }))
     }
 
@@ -454,6 +500,105 @@ impl Seoyu {
         Ok(())
     }
 
+    /// Spec §6.6 ask. Inserts an `ask_history` row in `streaming` state,
+    /// retrieves FTS top-5 pages + top-20 evidence, then either:
+    ///   - thin (<3 distinct evidence rows) → emit fallback delta + raw
+    ///     evidence as on_source, finalize as `done`; OR
+    ///   - call codex on a worker thread, parse NDJSON, dispatch
+    ///     callbacks per segment, finalize as `done` / `cancelled` /
+    ///     `failed`.
+    /// Returns the ask_id immediately; callbacks fire from the worker.
+    pub fn wiki_ask(
+        &self,
+        query: String,
+        handler: Arc<dyn AskStreamHandler>,
+    ) -> Result<i64, SeoyuError> {
+        let q = query.trim().to_string();
+        if q.is_empty() {
+            return Err(SeoyuError::InvalidArgument("empty query".into()));
+        }
+        let now = crate::wiki::norm::unix_now();
+        let (ask_id, evidence_summaries, page_ctx, thin_below_three, model) = {
+            let store = self.lock_store();
+            let pages = store.ask_fts_pages(&q, 5)?;
+            let evidence = store.ask_fts_evidence(&q, 20, now)?;
+            let summaries = build_evidence_summaries(&evidence);
+            let setting = store.get_wiki_setting("model_ask").ok().flatten();
+            let model = resolve_ask_model(setting.as_deref());
+            let ask_id = store.ask_history_insert(&q, &model, now)?;
+            let thin_below_three = summaries.len() < 3;
+            (ask_id, summaries, pages, thin_below_three, model)
+        };
+
+        let state = Arc::new(AskRunState::default());
+        {
+            let mut map = self.active_asks.lock().unwrap_or_else(|e| e.into_inner());
+            map.insert(ask_id, Arc::clone(&state));
+        }
+
+        let store = Arc::clone(&self.store);
+        let active = Arc::clone(&self.active_asks);
+        let handler_for_thread: Arc<dyn AskStreamHandler> = Arc::clone(&handler);
+        let q_for_thread = q.clone();
+
+        std::thread::Builder::new()
+            .name("seoyu-wiki-ask".into())
+            .spawn(move || {
+                run_ask_job(
+                    store,
+                    active,
+                    handler_for_thread,
+                    state,
+                    ask_id,
+                    q_for_thread,
+                    model,
+                    page_ctx,
+                    evidence_summaries,
+                    thin_below_three,
+                );
+            })
+            .map_err(|e| {
+                // Spawn failed: mark history as failed and pop the slot.
+                let store = self.lock_store();
+                let _ = store.ask_history_finalize(
+                    ask_id,
+                    "failed",
+                    "",
+                    "[]",
+                    crate::wiki::norm::unix_now(),
+                );
+                let mut map = self.active_asks.lock().unwrap_or_else(|e| e.into_inner());
+                map.remove(&ask_id);
+                SeoyuError::Other(format!("spawn ask thread: {e}"))
+            })?;
+
+        Ok(ask_id)
+    }
+
+    /// Spec §6.6 cancel. Flips the cancellation flag and sends SIGTERM
+    /// to the codex pid if one is registered. The worker thread sees
+    /// the flag, kills its child, drives the handler's `on_cancelled`,
+    /// and writes `ask_history.status='cancelled'`. Calling cancel on
+    /// a finished/unknown id is a no-op (returns Ok).
+    pub fn wiki_cancel_ask(&self, ask_id: i64) -> Result<(), SeoyuError> {
+        let state = {
+            let map = self.active_asks.lock().unwrap_or_else(|e| e.into_inner());
+            map.get(&ask_id).cloned()
+        };
+        if let Some(s) = state {
+            s.cancelled.store(true, Ordering::Release);
+            let pid = s.pid.load(Ordering::Acquire);
+            if pid > 0 {
+                // SAFETY: kill(2) on POSIX. Pid may have been reaped
+                // between load and call; ESRCH is harmless.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Search the wiki FTS5 index (Korean + English article text).
     pub fn wiki_search(
         &self,
@@ -618,6 +763,22 @@ impl Drop for Seoyu {
     fn drop(&mut self) {
         self.set_wiki_observer(None);
         self.stop_wiki_worker();
+        // Cancel any in-flight asks. The worker thread holds Arcs to
+        // store + handler so it survives `Seoyu` dropping; without this
+        // it would run to completion firing callbacks into a Swift
+        // context the user has already abandoned. SIGTERM short-circuits
+        // the codex subprocess; the thread sees `cancelled` next poll
+        // and writes `ask_history.status='cancelled'`.
+        let map = self.active_asks.lock().unwrap_or_else(|e| e.into_inner());
+        for state in map.values() {
+            state.cancelled.store(true, Ordering::Release);
+            let pid = state.pid.load(Ordering::Acquire);
+            if pid > 0 {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+            }
+        }
     }
 }
 
@@ -644,6 +805,252 @@ fn local_day_start(now_secs: i64) -> (i64, String) {
     }
 }
 
+/// Build presentation-indexed evidence summaries (1..=N) from the
+/// retrieved evidence rows. The LLM never sees evidence_id — it only
+/// sees `source_id`, which lets the host strip cites pointing to ids
+/// the LLM hallucinated.
+fn build_evidence_summaries(rows: &[AskEvidence]) -> Vec<EvidenceSummary> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, e)| EvidenceSummary {
+            source_id: (i + 1) as u32,
+            evidence_id: e.evidence_id,
+            page_id: e.page_id,
+            page_title: e.page_title.clone(),
+            chat_id: e.chat_id,
+            chat_title: e.chat_title.clone(),
+            msg_id: e.msg_id,
+            sender_id: e.sender_id,
+            ts: e.ts,
+            excerpt: e.excerpt.clone(),
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_ask_job(
+    store: Arc<Mutex<Store>>,
+    active: Arc<Mutex<HashMap<i64, Arc<AskRunState>>>>,
+    handler: Arc<dyn AskStreamHandler>,
+    state: Arc<AskRunState>,
+    ask_id: i64,
+    query: String,
+    model: String,
+    page_ctx: Vec<AskPage>,
+    evidence_summaries: Vec<EvidenceSummary>,
+    thin_below_three: bool,
+) {
+    let finalize_status = ask_run_inner(
+        &store,
+        &handler,
+        &state,
+        ask_id,
+        &query,
+        &model,
+        &page_ctx,
+        &evidence_summaries,
+        thin_below_three,
+    );
+    // Drop the active-asks slot regardless of outcome.
+    {
+        let mut map = active.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(&ask_id);
+    }
+    // Always emit one terminal callback. A panic above would skip this
+    // → callers see no terminal event. The inner fn is panic-safe by
+    // construction (no unwrap on user-supplied data); if that assumption
+    // breaks, the missing callback is the visible symptom and worth
+    // surfacing.
+    match finalize_status {
+        AskOutcome::Done => handler.on_finished(ask_id),
+        AskOutcome::Cancelled => handler.on_cancelled(ask_id),
+        AskOutcome::Failed(msg) => handler.on_error(ask_id, msg),
+    }
+}
+
+enum AskOutcome {
+    Done,
+    Cancelled,
+    Failed(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ask_run_inner(
+    store: &Arc<Mutex<Store>>,
+    handler: &Arc<dyn AskStreamHandler>,
+    state: &Arc<AskRunState>,
+    ask_id: i64,
+    query: &str,
+    model: &str,
+    page_ctx: &[AskPage],
+    evidence_summaries: &[EvidenceSummary],
+    thin_below_three: bool,
+) -> AskOutcome {
+    // Compute thin_evidence hint per spec §6.6: <2 distinct chats AND
+    // <3 distinct senders → mark thin and let the model flag uncertainty.
+    let mut chats = std::collections::HashSet::new();
+    let mut senders = std::collections::HashSet::new();
+    for e in evidence_summaries {
+        chats.insert(e.chat_id);
+        senders.insert(e.sender_id);
+    }
+    let thin_hint = chats.len() < 2 && senders.len() < 3;
+
+    if thin_below_three {
+        // Spec §6.6: <3 distinct evidence → skip LLM, surface fallback +
+        // raw FTS results below. Emit one delta segment, attach every
+        // available evidence row as a source, persist + finish.
+        let msg = "Not enough in your chats yet to answer confidently. Showing the best evidence I found.".to_string();
+        handler.on_delta(0, msg.clone());
+        for ev in evidence_summaries {
+            handler.on_source(0, ev.source_id, ev.clone());
+        }
+        let cited_json = cited_sources_json(evidence_summaries);
+        finalize(store, ask_id, "done", &msg, &cited_json);
+        return AskOutcome::Done;
+    }
+
+    // Build LLM input. Truncate excerpts so a single oversize row
+    // can't blow the prompt budget.
+    let pages_in: Vec<AskPageIn> = page_ctx
+        .iter()
+        .map(|p| AskPageIn {
+            kind: p.kind.as_str(),
+            title: p.title.as_str(),
+            summary_md: truncate_chars(&p.summary_md, 600),
+        })
+        .collect();
+    let excerpts: Vec<String> = evidence_summaries
+        .iter()
+        .map(|e| truncate_chars(&e.excerpt, 280).to_string())
+        .collect();
+    let evidence_in: Vec<AskEvidenceIn> = evidence_summaries
+        .iter()
+        .zip(excerpts.iter())
+        .map(|(e, ex)| AskEvidenceIn {
+            source_id: e.source_id,
+            page_title: e.page_title.as_str(),
+            chat_title: e.chat_title.as_str(),
+            ts: e.ts,
+            excerpt: ex.as_str(),
+        })
+        .collect();
+    let input = AskInput {
+        query,
+        thin_evidence: thin_hint,
+        pages: &pages_in,
+        evidence: &evidence_in,
+    };
+
+    let raw = match LlmClient::new().run_ask(&input, model, state) {
+        Ok(s) => s,
+        Err(AskRunError::Cancelled) => {
+            finalize(store, ask_id, "cancelled", "", "[]");
+            return AskOutcome::Cancelled;
+        }
+        Err(AskRunError::Timeout(secs)) => {
+            let msg = format!("ask timed out after {secs}s");
+            finalize(store, ask_id, "failed", "", "[]");
+            return AskOutcome::Failed(msg);
+        }
+        Err(AskRunError::Exec(e)) => {
+            finalize(store, ask_id, "failed", "", "[]");
+            return AskOutcome::Failed(format!("codex: {e}"));
+        }
+    };
+
+    if state.cancelled.load(Ordering::Acquire) {
+        finalize(store, ask_id, "cancelled", "", "[]");
+        return AskOutcome::Cancelled;
+    }
+
+    let parsed = match parse_ask_stream(&raw) {
+        Ok(p) => p,
+        Err(e) => {
+            finalize(store, ask_id, "failed", "", "[]");
+            return AskOutcome::Failed(format!("malformed stream: {e}"));
+        }
+    };
+
+    let evidence_count = evidence_summaries.len() as u32;
+    let mut answer_md = String::new();
+    let mut cited_ids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+
+    for seg in &parsed.segments {
+        let cleaned = strip_citation_markers(&seg.md);
+        // Per spec wording "before any character is shown": validate cites
+        // first, then dispatch on_delta and on_source in order.
+        let valid_cites = validate_cites(&seg.cites, evidence_count);
+        handler.on_delta(seg.seg, cleaned.clone());
+        for tag in &valid_cites {
+            if let Some(ev) = evidence_summaries.get(*tag as usize - 1) {
+                handler.on_source(seg.seg, *tag, ev.clone());
+                cited_ids.insert(*tag);
+            }
+        }
+        if !answer_md.is_empty() {
+            answer_md.push_str("\n\n");
+        }
+        answer_md.push_str(&cleaned);
+    }
+
+    let cited: Vec<EvidenceSummary> = cited_ids
+        .iter()
+        .filter_map(|id| evidence_summaries.get(*id as usize - 1).cloned())
+        .collect();
+    finalize(
+        store,
+        ask_id,
+        "done",
+        &answer_md,
+        &cited_sources_json(&cited),
+    );
+    let _ = parsed.thin_evidence; // surfaced via the on_delta text already.
+    AskOutcome::Done
+}
+
+fn finalize(
+    store: &Arc<Mutex<Store>>,
+    ask_id: i64,
+    status: &str,
+    answer_md: &str,
+    cited_json: &str,
+) {
+    let now = crate::wiki::norm::unix_now();
+    let s = store.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = s.ask_history_finalize(ask_id, status, answer_md, cited_json, now);
+}
+
+/// Persist the actual evidence rows the answer cited (spec line 964) —
+/// not `[n]` labels. Schema is plain JSON list of source records.
+fn cited_sources_json(items: &[EvidenceSummary]) -> String {
+    let arr: Vec<serde_json::Value> = items
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "source_id": e.source_id,
+                "evidence_id": e.evidence_id,
+                "page_id": e.page_id,
+                "page_title": e.page_title,
+                "chat_id": e.chat_id,
+                "chat_title": e.chat_title,
+                "msg_id": e.msg_id,
+                "sender_id": e.sender_id,
+                "ts": e.ts,
+                "excerpt": e.excerpt,
+            })
+        })
+        .collect();
+    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
 fn topic_row_to_hit(row: crate::store::wiki_topic::TopicMessageRow) -> SearchHit {
     SearchHit {
         chat_id: row.chat_id,
@@ -654,5 +1061,159 @@ fn topic_row_to_hit(row: crate::store::wiki_topic::TopicMessageRow) -> SearchHit
         chat_title: row.chat_title,
         highlight_starts: Vec::new(),
         highlight_ends: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod ask_tests {
+    use super::*;
+
+    /// Records every callback in delivery order so tests can assert
+    /// ordering + final terminal callback.
+    #[derive(Default)]
+    struct RecordingHandler {
+        events: Mutex<Vec<String>>,
+    }
+    impl AskStreamHandler for RecordingHandler {
+        fn on_delta(&self, seg: u32, text: String) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("delta {seg} {text}"));
+        }
+        fn on_source(&self, seg: u32, tag: u32, source: EvidenceSummary) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("source {seg} {tag} ev{}", source.evidence_id));
+        }
+        fn on_finished(&self, ask_id: i64) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("finished {ask_id}"));
+        }
+        fn on_cancelled(&self, ask_id: i64) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("cancelled {ask_id}"));
+        }
+        fn on_error(&self, ask_id: i64, message: String) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("error {ask_id} {message}"));
+        }
+    }
+
+    fn ev(source_id: u32, evidence_id: i64, chat_id: i64, sender_id: i64) -> EvidenceSummary {
+        EvidenceSummary {
+            source_id,
+            evidence_id,
+            page_id: 1,
+            page_title: "P".into(),
+            chat_id,
+            chat_title: "C".into(),
+            msg_id: evidence_id,
+            sender_id,
+            ts: 1_000,
+            excerpt: "snippet".into(),
+        }
+    }
+
+    #[test]
+    fn thin_path_emits_fallback_delta_and_sources_then_finalizes_done() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let recorder = Arc::new(RecordingHandler::default());
+        let handler: Arc<dyn AskStreamHandler> = Arc::clone(&recorder) as Arc<dyn AskStreamHandler>;
+        let state = Arc::new(AskRunState::default());
+        let active = Arc::new(Mutex::new(HashMap::new()));
+        let evidence = vec![ev(1, 11, 1, 7), ev(2, 12, 1, 8)];
+
+        // Seed an ask_history row so finalize has a target.
+        let ask_id = {
+            let s = store.lock().unwrap();
+            s.ask_history_insert("q?", "test-model", 0).unwrap()
+        };
+        active.lock().unwrap().insert(ask_id, Arc::clone(&state));
+
+        // Drive the job. thin_below_three=true → no LLM call needed,
+        // safe to run synchronously in the test thread.
+        run_ask_job(
+            Arc::clone(&store),
+            Arc::clone(&active),
+            handler,
+            state,
+            ask_id,
+            "q?".into(),
+            "test-model".into(),
+            Vec::new(),
+            evidence,
+            true,
+        );
+        let _ = recorder; // recorder kept alive via Arc; events asserted below.
+
+        // Active map cleared.
+        assert!(active.lock().unwrap().is_empty());
+
+        // ask_history row finalized to 'done' with non-empty cited list.
+        let s = store.lock().unwrap();
+        let mut q = s
+            .conn()
+            .prepare("SELECT status, answer_md, cited_sources FROM ask_history WHERE id = ?")
+            .unwrap();
+        q.bind((1, ask_id)).unwrap();
+        q.next().unwrap();
+        assert_eq!(q.read::<String, _>(0).unwrap(), "done");
+        assert!(q
+            .read::<String, _>(1)
+            .unwrap()
+            .contains("Not enough in your chats yet"));
+        let cited = q.read::<String, _>(2).unwrap();
+        // Both evidence rows persisted as cited (thin path surfaces the
+        // raw FTS rows below the fallback message).
+        assert!(cited.contains("\"evidence_id\":11"));
+        assert!(cited.contains("\"evidence_id\":12"));
+    }
+
+    #[test]
+    fn thin_path_callback_order_delta_before_sources_then_finished() {
+        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let recorder = Arc::new(RecordingHandler::default());
+        let handler: Arc<dyn AskStreamHandler> = Arc::clone(&recorder) as Arc<dyn AskStreamHandler>;
+        let state = Arc::new(AskRunState::default());
+        let active = Arc::new(Mutex::new(HashMap::new()));
+        let evidence = vec![ev(1, 11, 1, 7), ev(2, 12, 1, 8)];
+
+        let ask_id = {
+            let s = store.lock().unwrap();
+            s.ask_history_insert("q?", "test-model", 0).unwrap()
+        };
+        active.lock().unwrap().insert(ask_id, Arc::clone(&state));
+
+        run_ask_job(
+            store,
+            active,
+            handler,
+            state,
+            ask_id,
+            "q?".into(),
+            "test-model".into(),
+            Vec::new(),
+            evidence,
+            true,
+        );
+
+        let events = recorder.events.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            4,
+            "delta + 2 sources + finished, got {events:?}"
+        );
+        assert!(events[0].starts_with("delta 0 "));
+        assert!(events[1].starts_with("source 0 1 "));
+        assert!(events[2].starts_with("source 0 2 "));
+        assert!(events[3].starts_with("finished "));
     }
 }

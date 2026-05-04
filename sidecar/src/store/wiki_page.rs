@@ -1483,6 +1483,204 @@ impl Store {
     }
 }
 
+// ---- Phase 10 ask retrieval (spec §6.6) -----------------------------------
+
+/// One page surfaced into the LLM context. Provides background; not a
+/// citation target. Citations refer to evidence rows by `source_id`.
+#[derive(Debug, Clone)]
+pub struct AskPage {
+    pub page_id: i64,
+    pub kind: String,
+    pub title: String,
+    pub summary_md: String,
+}
+
+/// One evidence row passed to the LLM as a citable source. `source_id`
+/// is assigned by the caller (1..=N) when the retrieval result is
+/// finalized — the LLM never sees real evidence ids, so unknown cites
+/// can be stripped at the host before any character is shown.
+#[derive(Debug, Clone)]
+pub struct AskEvidence {
+    pub evidence_id: i64,
+    pub page_id: i64,
+    pub page_title: String,
+    pub chat_id: i64,
+    pub chat_title: String,
+    pub msg_id: i64,
+    pub sender_id: i64,
+    pub ts: i64,
+    pub excerpt: String,
+}
+
+/// FTS5 quote: wrap in double-quotes and double-up internal ones.
+/// Matches the existing pattern in `search_wiki_pages`.
+fn fts_phrase(q: &str) -> String {
+    format!("\"{}\"", q.replace('"', "\"\""))
+}
+
+/// Time-decay constant: 7 days. Recent rows score higher; rows older
+/// than ~14d are effectively muted regardless of bm25.
+const ASK_DECAY_SECS: f64 = 7.0 * 86_400.0;
+
+impl Store {
+    /// Spec §6.6 retrieval — top pages by bm25 over `pages_fts`. Excludes
+    /// hidden pages; resolved pages stay askable per spec §0.1. Query
+    /// tries both the raw form and the jamo decomposition so Korean
+    /// queries hit either column.
+    pub fn ask_fts_pages(&self, query: &str, limit: usize) -> Result<Vec<AskPage>, sqlite::Error> {
+        let trimmed = query.trim();
+        if trimmed.len() < 2 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let jamo = crate::search::hangul::decompose_jamo(trimmed);
+        let fts_q = if jamo == trimmed {
+            fts_phrase(trimmed)
+        } else {
+            format!("{} OR {}", fts_phrase(trimmed), fts_phrase(&jamo))
+        };
+        let q = "
+            SELECT p.id, p.kind, p.title, p.summary_md
+              FROM pages_fts f
+              JOIN wiki_pages_v2 p ON p.id = f.rowid
+             WHERE pages_fts MATCH ?
+               AND p.state IN ('active','resolved')
+             ORDER BY bm25(pages_fts)
+             LIMIT ?";
+        let mut s = self.conn().prepare(q)?;
+        s.bind((1, fts_q.as_str()))?;
+        s.bind((2, limit as i64))?;
+        let mut out = Vec::new();
+        while let sqlite::State::Row = s.next()? {
+            out.push(AskPage {
+                page_id: s.read::<i64, _>(0)?,
+                kind: s.read::<String, _>(1)?,
+                title: s.read::<String, _>(2)?,
+                summary_md: s.read::<String, _>(3)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Spec §6.6 retrieval — top evidence rows by `bm25 * exp(-age/τ)`.
+    /// SQL pulls top-50 by bm25 (ASC: smaller = more relevant). Rust
+    /// applies the time-decay multiplier and picks `limit`. Math is
+    /// done in Rust because SQLite needs `SQLITE_ENABLE_MATH_FUNCTIONS`
+    /// for `EXP`, which is not portable (matches the trending decision).
+    /// Same `(chat_id, msg_id)` is collapsed to a single row — duplicates
+    /// would burn presentation slots without adding signal.
+    pub fn ask_fts_evidence(
+        &self,
+        query: &str,
+        limit: usize,
+        now: i64,
+    ) -> Result<Vec<AskEvidence>, sqlite::Error> {
+        let trimmed = query.trim();
+        if trimmed.len() < 2 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let jamo = crate::search::hangul::decompose_jamo(trimmed);
+        let fts_q = if jamo == trimmed {
+            fts_phrase(trimmed)
+        } else {
+            format!("{} OR {}", fts_phrase(trimmed), fts_phrase(&jamo))
+        };
+        let q = "
+            SELECT e.id, e.page_id, p.title, e.chat_id,
+                   COALESCE(c.title, '') AS chat_title,
+                   e.msg_id, e.sender_id, e.ts, e.excerpt,
+                   bm25(evidence_fts) AS rank
+              FROM evidence_fts f
+              JOIN wiki_evidence e ON e.id = f.rowid
+              JOIN wiki_pages_v2 p ON p.id = e.page_id
+              LEFT JOIN chats c   ON c.chat_id = e.chat_id
+             WHERE evidence_fts MATCH ?
+               AND p.state != 'hidden'
+             ORDER BY rank ASC
+             LIMIT 50";
+        let mut s = self.conn().prepare(q)?;
+        s.bind((1, fts_q.as_str()))?;
+        let mut scored: Vec<(f64, AskEvidence)> = Vec::new();
+        let mut seen_msg = std::collections::HashSet::<(i64, i64)>::new();
+        while let sqlite::State::Row = s.next()? {
+            let chat_id = s.read::<i64, _>("chat_id")?;
+            let msg_id = s.read::<i64, _>("msg_id")?;
+            if !seen_msg.insert((chat_id, msg_id)) {
+                continue;
+            }
+            let ts = s.read::<i64, _>("ts")?;
+            let bm25 = s.read::<f64, _>("rank")?;
+            let age = (now - ts).max(0) as f64;
+            let decay = (-age / ASK_DECAY_SECS).exp();
+            let score = -bm25 * decay;
+            scored.push((
+                score,
+                AskEvidence {
+                    evidence_id: s.read::<i64, _>("id")?,
+                    page_id: s.read::<i64, _>("page_id")?,
+                    page_title: s.read::<String, _>("title")?,
+                    chat_id,
+                    chat_title: s.read::<String, _>("chat_title")?,
+                    msg_id,
+                    sender_id: s.read::<i64, _>("sender_id")?,
+                    ts,
+                    excerpt: s.read::<String, _>("excerpt")?,
+                },
+            ));
+        }
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored.into_iter().map(|(_, e)| e).collect())
+    }
+
+    /// Insert a new ask_history row in `streaming` state and return its id.
+    /// Caller drives the row to a terminal state (`done`, `cancelled`,
+    /// `failed`) via `ask_history_finalize`.
+    pub fn ask_history_insert(
+        &self,
+        query: &str,
+        model: &str,
+        now: i64,
+    ) -> Result<i64, sqlite::Error> {
+        let mut s = self.conn().prepare(
+            "INSERT INTO ask_history (query, answer_md, cited_sources, model, status, created_at)
+                 VALUES (?, '', '[]', ?, 'streaming', ?)",
+        )?;
+        s.bind((1, query))?;
+        s.bind((2, model))?;
+        s.bind((3, now))?;
+        s.next()?;
+        self.last_insert_rowid()
+    }
+
+    /// Move an `ask_history` row to a terminal state. `cited_sources_json`
+    /// is the persisted evidence rows the answer actually cited (spec
+    /// line 964) — not `[n]` labels. Idempotent at the SQL level: a row
+    /// already in a terminal state is overwritten with the new payload,
+    /// which keeps the late-arriving codex stdout from getting lost if
+    /// cancel + completion race.
+    pub fn ask_history_finalize(
+        &self,
+        id: i64,
+        status: &str,
+        answer_md: &str,
+        cited_sources_json: &str,
+        finished_at: i64,
+    ) -> Result<(), sqlite::Error> {
+        let mut s = self.conn().prepare(
+            "UPDATE ask_history
+                SET status = ?, answer_md = ?, cited_sources = ?, finished_at = ?
+              WHERE id = ?",
+        )?;
+        s.bind((1, status))?;
+        s.bind((2, answer_md))?;
+        s.bind((3, cited_sources_json))?;
+        s.bind((4, finished_at))?;
+        s.bind((5, id))?;
+        s.next()?;
+        Ok(())
+    }
+}
+
 pub fn compute_source_hash(sources: &[(i64, i64)]) -> String {
     let mut hasher = Sha256::new();
     for &(chat_id, message_id) in sources {
@@ -2710,5 +2908,180 @@ mod tests {
         }
         let rows = store.list_digest_rows(2).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    // ---- Phase 10 ask retrieval tests --------------------------------------
+
+    fn make_page_with_summary(store: &Store, title: &str, summary: &str) -> i64 {
+        store.conn().execute("BEGIN").unwrap();
+        let p = store.dedup_or_insert_page_v2("topic", title, &[]).unwrap();
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE wiki_pages_v2 SET summary_md = '{}' WHERE id = {}",
+                summary.replace('\'', "''"),
+                p.id
+            ))
+            .unwrap();
+        store.refresh_pages_index(p.id).unwrap();
+        store.conn().execute("COMMIT").unwrap();
+        p.id
+    }
+
+    fn add_evi_text(store: &Store, page_id: i64, msg_id: i64, chat_id: i64, ts: i64, text: &str) {
+        let mut q = store
+            .conn()
+            .prepare("SELECT 1 FROM chats WHERE chat_id = ?")
+            .unwrap();
+        q.bind((1, chat_id)).unwrap();
+        if !matches!(q.next().unwrap(), sqlite::State::Row) {
+            store
+                .conn()
+                .execute(format!(
+                    "INSERT INTO chats (chat_id, title, chat_type) VALUES ({chat_id}, 'Chat{chat_id}', 'channel')"
+                ))
+                .unwrap();
+        }
+        store.conn().execute("BEGIN").unwrap();
+        store
+            .insert_evidence_v2(&NewEvidenceV2 {
+                page_id,
+                msg_id,
+                chat_id,
+                sender_id: 7,
+                ts,
+                excerpt: text,
+                salience: 0.7,
+            })
+            .unwrap();
+        store.conn().execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn ask_fts_pages_returns_top_match_excluding_hidden() {
+        let store = setup();
+        let p1 = make_page_with_summary(&store, "Bitcoin ETF inflows", "ETF activity summary");
+        let p2 = make_page_with_summary(&store, "Ethereum L2 fees", "L2 fee market summary");
+        let p_hidden = make_page_with_summary(&store, "Bitcoin halving", "halving impact on price");
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE wiki_pages_v2 SET state='hidden' WHERE id={p_hidden}"
+            ))
+            .unwrap();
+
+        let hits = store.ask_fts_pages("Bitcoin ETF", 5).unwrap();
+        let ids: Vec<i64> = hits.iter().map(|p| p.page_id).collect();
+        assert!(ids.contains(&p1));
+        assert!(!ids.contains(&p_hidden));
+        assert!(!ids.contains(&p2));
+    }
+
+    #[test]
+    fn ask_fts_pages_short_or_zero_limit_returns_empty() {
+        let store = setup();
+        make_page_with_summary(&store, "Bitcoin", "x");
+        assert!(store.ask_fts_pages("a", 5).unwrap().is_empty());
+        assert!(store.ask_fts_pages("Bitcoin", 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ask_fts_evidence_time_decay_prefers_recent() {
+        let store = setup();
+        let pid = make_page_with_summary(&store, "Bitcoin ETF", "summary");
+        let now = 14 * 86_400_i64; // 14 days from epoch.
+                                   // Old evidence (10 days ago) — bm25 strong but decayed heavily.
+        add_evi_text(
+            &store,
+            pid,
+            10,
+            1,
+            now - 10 * 86_400,
+            "Bitcoin ETF inflows surged again with strong demand",
+        );
+        // Recent evidence (1 hour ago) — same bm25 quality, full weight.
+        add_evi_text(
+            &store,
+            pid,
+            11,
+            1,
+            now - 3_600,
+            "Bitcoin ETF inflows continue this morning",
+        );
+        let rows = store.ask_fts_evidence("Bitcoin ETF", 2, now).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Recent row should be first after decay.
+        assert_eq!(rows[0].msg_id, 11);
+        assert_eq!(rows[1].msg_id, 10);
+    }
+
+    #[test]
+    fn ask_fts_evidence_dedups_same_message() {
+        let store = setup();
+        let p1 = make_page_with_summary(&store, "Bitcoin", "x");
+        let p2 = make_page_with_summary(&store, "ETF", "x");
+        // Same (chat_id, msg_id) attached to two pages — only the better-
+        // scoring row survives dedup so a presentation slot is not burned.
+        add_evi_text(
+            &store,
+            p1,
+            42,
+            1,
+            1_000,
+            "Bitcoin ETF approved by SEC today",
+        );
+        add_evi_text(
+            &store,
+            p2,
+            42,
+            1,
+            1_000,
+            "Bitcoin ETF approved by SEC today",
+        );
+        let rows = store.ask_fts_evidence("Bitcoin ETF", 20, 2_000).unwrap();
+        let pairs: Vec<(i64, i64)> = rows.iter().map(|r| (r.chat_id, r.msg_id)).collect();
+        let mut sorted = pairs.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(pairs.len(), sorted.len(), "no duplicate (chat, msg)");
+    }
+
+    #[test]
+    fn ask_fts_evidence_skips_hidden_pages() {
+        let store = setup();
+        let visible = make_page_with_summary(&store, "Bitcoin ETF", "x");
+        let hidden = make_page_with_summary(&store, "ETF banned", "x");
+        store
+            .conn()
+            .execute(format!(
+                "UPDATE wiki_pages_v2 SET state='hidden' WHERE id={hidden}"
+            ))
+            .unwrap();
+        add_evi_text(&store, visible, 1, 1, 1_000, "Bitcoin ETF approved today");
+        add_evi_text(&store, hidden, 2, 1, 1_000, "Bitcoin ETF approved today");
+        let rows = store.ask_fts_evidence("Bitcoin ETF", 20, 2_000).unwrap();
+        assert!(rows.iter().all(|r| r.page_id == visible));
+    }
+
+    #[test]
+    fn ask_history_lifecycle() {
+        let store = setup();
+        let id = store
+            .ask_history_insert("how is BTC?", "gpt-test", 1_000)
+            .unwrap();
+        assert!(id > 0);
+        store
+            .ask_history_finalize(id, "done", "answer text", "[{\"source_id\":1}]", 1_050)
+            .unwrap();
+        let mut s = store
+            .conn()
+            .prepare("SELECT status, answer_md, cited_sources, finished_at FROM ask_history WHERE id = ?")
+            .unwrap();
+        s.bind((1, id)).unwrap();
+        s.next().unwrap();
+        assert_eq!(s.read::<String, _>(0).unwrap(), "done");
+        assert_eq!(s.read::<String, _>(1).unwrap(), "answer text");
+        assert_eq!(s.read::<String, _>(2).unwrap(), "[{\"source_id\":1}]");
+        assert_eq!(s.read::<i64, _>(3).unwrap(), 1_050);
     }
 }
