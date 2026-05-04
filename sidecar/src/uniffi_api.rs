@@ -36,7 +36,7 @@ use crate::store::wiki_page::{AskEvidence, AskPage};
 use crate::store::Store;
 use crate::wiki::llm::{
     parse_ask_stream, resolve_ask_model, strip_citation_markers, validate_cites, AskEvidenceIn,
-    AskInput, AskPageIn, AskRunError, AskRunState, LlmClient,
+    AskInput, AskRunError, AskRunState, LlmClient,
 };
 use crate::wiki::worker::WorkerHandle;
 
@@ -919,16 +919,13 @@ fn ask_run_inner(
         return AskOutcome::Done;
     }
 
-    // Build LLM input. Truncate excerpts so a single oversize row
-    // can't blow the prompt budget.
-    let pages_in: Vec<AskPageIn> = page_ctx
-        .iter()
-        .map(|p| AskPageIn {
-            kind: p.kind.as_str(),
-            title: p.title.as_str(),
-            summary_md: truncate_chars(&p.summary_md, 600),
-        })
-        .collect();
+    // Build LLM input. Page summaries intentionally NOT passed —
+    // codex review: a page's summary_md is synthesized from its
+    // evidence rows and can leak excluded/deleted-source content even
+    // after the evidence-level filter. Pages stay in `page_ctx` for
+    // potential UI use but never reach the LLM. Evidence rows already
+    // carry `page_title`, which is enough topic context for the model.
+    let _ = page_ctx;
     let excerpts: Vec<String> = evidence_summaries
         .iter()
         .map(|e| truncate_chars(&e.excerpt, 280).to_string())
@@ -947,7 +944,6 @@ fn ask_run_inner(
     let input = AskInput {
         query,
         thin_evidence: thin_hint,
-        pages: &pages_in,
         evidence: &evidence_in,
     };
 

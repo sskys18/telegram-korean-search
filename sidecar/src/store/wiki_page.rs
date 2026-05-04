@@ -1538,12 +1538,28 @@ impl Store {
         } else {
             format!("{} OR {}", fts_phrase(trimmed), fts_phrase(&jamo))
         };
+        // Filter out pages whose evidence is entirely from excluded
+        // chats or soft-deleted messages: a page summary is synthesized
+        // from its evidence rows, so a page backed exclusively by
+        // filtered sources can leak that content through `summary_md`
+        // even after the evidence-level filter (codex review). Keep
+        // pages with at least one safe evidence row.
         let q = "
             SELECT p.id, p.kind, p.title, p.summary_md
               FROM pages_fts f
               JOIN wiki_pages_v2 p ON p.id = f.rowid
              WHERE pages_fts MATCH ?
                AND p.state IN ('active','resolved')
+               AND EXISTS (
+                   SELECT 1
+                     FROM wiki_evidence e
+                     JOIN messages m ON m.chat_id = e.chat_id
+                                    AND m.message_id = e.msg_id
+                     JOIN chats c    ON c.chat_id = e.chat_id
+                    WHERE e.page_id = p.id
+                      AND m.deleted_at IS NULL
+                      AND c.is_excluded = 0
+               )
              ORDER BY bm25(pages_fts)
              LIMIT ?";
         let mut s = self.conn().prepare(q)?;
@@ -3018,6 +3034,12 @@ mod tests {
         let p1 = make_page_with_summary(&store, "Bitcoin ETF inflows", "ETF activity summary");
         let p2 = make_page_with_summary(&store, "Ethereum L2 fees", "L2 fee market summary");
         let p_hidden = make_page_with_summary(&store, "Bitcoin halving", "halving impact on price");
+        // ask_fts_pages requires AT LEAST ONE non-deleted, non-excluded
+        // evidence row per page (codex review: prevents page summary
+        // from leaking content of pages whose evidence is fully filtered).
+        add_evi_text(&store, p1, 401, 1, 1_000, "Bitcoin ETF approved");
+        add_evi_text(&store, p2, 402, 1, 1_000, "Ethereum L2 fee drop");
+        add_evi_text(&store, p_hidden, 403, 1, 1_000, "Bitcoin halving day");
         store
             .conn()
             .execute(format!(
@@ -3030,6 +3052,45 @@ mod tests {
         assert!(ids.contains(&p1));
         assert!(!ids.contains(&p_hidden));
         assert!(!ids.contains(&p2));
+    }
+
+    #[test]
+    fn ask_fts_pages_drops_pages_with_only_filtered_evidence() {
+        let store = setup();
+        let safe = make_page_with_summary(&store, "Bitcoin safe", "x");
+        let leaky = make_page_with_summary(&store, "Bitcoin leaky", "x");
+        // safe has clean evidence; leaky has only soft-deleted evidence.
+        add_evi_text(&store, safe, 501, 1, 1_000, "Bitcoin clean source");
+        add_evi_text(&store, leaky, 502, 1, 1_000, "Bitcoin leaky source");
+        store
+            .conn()
+            .execute("UPDATE messages SET deleted_at = 9999 WHERE chat_id = 1 AND message_id = 502")
+            .unwrap();
+        let hits = store.ask_fts_pages("Bitcoin", 5).unwrap();
+        let ids: Vec<i64> = hits.iter().map(|p| p.page_id).collect();
+        assert!(ids.contains(&safe));
+        assert!(
+            !ids.contains(&leaky),
+            "page with only filtered evidence must drop"
+        );
+
+        // Also: same behavior when chat is excluded (rather than msg deleted).
+        let leaky_chat = make_page_with_summary(&store, "Bitcoin chat-excluded", "x");
+        add_evi_text(
+            &store,
+            leaky_chat,
+            503,
+            99,
+            1_000,
+            "Bitcoin from secret chat",
+        );
+        store
+            .conn()
+            .execute("UPDATE chats SET is_excluded = 1 WHERE chat_id = 99")
+            .unwrap();
+        let hits = store.ask_fts_pages("Bitcoin", 5).unwrap();
+        let ids: Vec<i64> = hits.iter().map(|p| p.page_id).collect();
+        assert!(!ids.contains(&leaky_chat));
     }
 
     #[test]
