@@ -240,11 +240,13 @@ pub struct EvidenceSummary {
 /// still emit `on_delta`. Terminal callback is exactly one of
 /// `on_finished` / `on_cancelled` / `on_error`.
 ///
-/// Cancellation is explicit only: Swift calls `wiki_cancel_ask(id)`.
-/// Spec §7's "implicit cancel on Arc drop" is not implementable at
-/// this UniFFI binding shape — the foreign-trait Arc the Rust side
-/// receives is independent of any Swift wrapper lifetime, so we have
-/// no way to observe a Swift-side release. Documented + deferred.
+/// Cancellation paths (spec §7):
+///   - explicit: Swift calls `wiki_cancel_ask(id)` or drops `AskHandle`
+///   - implicit on `AskStreamHandler` drop is NOT implementable —
+///     UniFFI's foreign-trait Arc on the Rust side is independent of
+///     Swift's wrapper lifetime. The `AskHandle` Drop trampoline
+///     covers the spec's intent: when Swift releases the handle, the
+///     ask cancels.
 #[uniffi::export(with_foreign)]
 pub trait AskStreamHandler: Send + Sync {
     fn on_delta(&self, segment_index: u32, text: String);
@@ -328,6 +330,46 @@ impl AskDispatch {
     fn on_error(&self, ask_id: i64, message: String) {
         let h = Arc::clone(&self.handler);
         dispatch_to_main(move || h.on_error(ask_id, message));
+    }
+}
+
+/// Handle returned from `wiki_ask`. Swift retains it for the lifetime
+/// of the Ask UI; dropping it (explicitly or via UI dismiss) cancels
+/// the underlying ask. Spec §7 drop-cancel contract — implemented
+/// here as a UniFFI Object Drop trampoline rather than against the
+/// foreign-trait Arc, which has the wrong lifetime semantics for
+/// implicit cancel (see AskDispatch comment).
+#[derive(uniffi::Object)]
+pub struct AskHandle {
+    id: i64,
+    state: Arc<AskRunState>,
+}
+
+#[uniffi::export]
+impl AskHandle {
+    /// The persistent `ask_history.id`. Stays valid even after the
+    /// handle drops — Swift can use it to look up the row later.
+    pub fn ask_id(&self) -> i64 {
+        self.id
+    }
+}
+
+impl Drop for AskHandle {
+    fn drop(&mut self) {
+        // Spec §7 implicit cancel: dropping the handle short-circuits
+        // any in-flight work. The worker thread sees `cancelled` next
+        // poll, kills its codex child if running, and finalizes the
+        // ask_history row. Pid kill mirrors `wiki_cancel_ask`.
+        self.state
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        let pid = self.state.pid.load(std::sync::atomic::Ordering::Acquire);
+        if pid > 0 {
+            // SAFETY: SIGTERM via kill(2). ESRCH on a reaped pid is harmless.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
     }
 }
 
@@ -593,12 +635,14 @@ impl Seoyu {
     ///   - call codex on a worker thread, parse NDJSON, dispatch
     ///     callbacks per segment, finalize as `done` / `cancelled` /
     ///     `failed`.
-    /// Returns the ask_id immediately; callbacks fire from the worker.
+    /// Returns an `AskHandle` immediately; callbacks fire from the
+    /// worker. Swift retains the handle for the lifetime of the Ask
+    /// UI — when it drops, the ask cancels (spec §7).
     pub fn wiki_ask(
         &self,
         query: String,
         handler: Arc<dyn AskStreamHandler>,
-    ) -> Result<i64, SeoyuError> {
+    ) -> Result<Arc<AskHandle>, SeoyuError> {
         let q = query.trim().to_string();
         if q.is_empty() {
             return Err(SeoyuError::InvalidArgument("empty query".into()));
@@ -617,6 +661,7 @@ impl Seoyu {
         };
 
         let state = Arc::new(AskRunState::default());
+        let state_for_handle = Arc::clone(&state);
         {
             let mut map = self.active_asks.lock().unwrap_or_else(|e| e.into_inner());
             map.insert(ask_id, Arc::clone(&state));
@@ -658,7 +703,10 @@ impl Seoyu {
                 SeoyuError::Other(format!("spawn ask thread: {e}"))
             })?;
 
-        Ok(ask_id)
+        Ok(Arc::new(AskHandle {
+            id: ask_id,
+            state: state_for_handle,
+        }))
     }
 
     /// Spec §6.6 cancel. Flips the cancellation flag and sends SIGTERM
@@ -1155,10 +1203,38 @@ fn ask_run_inner(
             return AskOutcome::Cancelled;
         }
         Err(AskRunError::Timeout(secs)) => {
+            // Codex review: a cancel arriving just before the timeout
+            // path triggers must surface as Cancelled, not Failed.
+            if state.cancelled.load(Ordering::Acquire) {
+                let cited = snapshot_cited(&cited_ids);
+                finalize(
+                    store,
+                    ask_id,
+                    "cancelled",
+                    &answer_md,
+                    &cited_sources_json(&cited),
+                );
+                return AskOutcome::Cancelled;
+            }
             finalize(store, ask_id, "failed", "", "[]");
             return AskOutcome::Failed(format!("ask timed out after {secs}s"));
         }
         Err(AskRunError::Exec(e)) => {
+            // Codex review: when cancel races with codex's non-zero
+            // exit (we SIGTERM the child → exit code != 0 → Exec
+            // error), surface as Cancelled. The cancellation flag is
+            // the source of truth, not the codex exit code.
+            if state.cancelled.load(Ordering::Acquire) {
+                let cited = snapshot_cited(&cited_ids);
+                finalize(
+                    store,
+                    ask_id,
+                    "cancelled",
+                    &answer_md,
+                    &cited_sources_json(&cited),
+                );
+                return AskOutcome::Cancelled;
+            }
             finalize(store, ask_id, "failed", "", "[]");
             return AskOutcome::Failed(format!("codex: {e}"));
         }
@@ -1623,5 +1699,24 @@ mod ask_tests {
         assert_eq!(count, 0);
         assert!(thin);
         assert_eq!(recorder.events.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn ask_handle_drop_sets_cancelled_flag() {
+        // Spec §7: dropping the AskHandle implicitly cancels the ask.
+        // Implemented as a UniFFI Object Drop trampoline (since the
+        // foreign-trait Arc lifecycle can't carry the signal).
+        let state = Arc::new(AskRunState::default());
+        let handle = AskHandle {
+            id: 42,
+            state: Arc::clone(&state),
+        };
+        assert!(!state.cancelled.load(Ordering::Acquire));
+        assert_eq!(handle.ask_id(), 42);
+        drop(handle);
+        assert!(
+            state.cancelled.load(Ordering::Acquire),
+            "Drop must set cancelled"
+        );
     }
 }

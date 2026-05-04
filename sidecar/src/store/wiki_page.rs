@@ -1518,6 +1518,36 @@ fn fts_phrase(q: &str) -> String {
     format!("\"{}\"", q.replace('"', "\"\""))
 }
 
+/// Combined ask FTS5 query: phrase OR or-of-terms, both forms for
+/// the original + jamo-decomposed input. The whole-phrase clause
+/// keeps short exact queries hitting (e.g. user types "BTC ETF" and
+/// expects the literal pair to score high — pure or-of-terms loses
+/// adjacency signal, codex review). The OR-of-terms clause restores
+/// recall for natural-language asks where adjacent ordering isn't
+/// expected. Returns None when no usable token survives — caller
+/// returns an empty result set.
+fn build_ask_fts_query(trimmed: &str, jamo: &str) -> Option<String> {
+    let phrase = fts_phrase(trimmed);
+    let or_terms = fts_or_terms(trimmed);
+    let mut clauses: Vec<String> = Vec::with_capacity(4);
+    clauses.push(phrase);
+    if !or_terms.is_empty() {
+        clauses.push(or_terms);
+    }
+    if jamo != trimmed {
+        let jamo_phrase = fts_phrase(jamo);
+        let jamo_or = fts_or_terms(jamo);
+        clauses.push(jamo_phrase);
+        if !jamo_or.is_empty() {
+            clauses.push(jamo_or);
+        }
+    }
+    if clauses.is_empty() {
+        return None;
+    }
+    Some(clauses.join(" OR "))
+}
+
 /// Build an FTS5 OR-of-terms query from a natural-language string.
 /// Single-phrase quoting is fine for one-word lookups but kills recall
 /// for "bitcoin etf news today" style asks — that becomes a literal
@@ -1546,18 +1576,12 @@ impl Store {
     /// queries hit either column.
     pub fn ask_fts_pages(&self, query: &str, limit: usize) -> Result<Vec<AskPage>, sqlite::Error> {
         let trimmed = query.trim();
-        if trimmed.len() < 2 || limit == 0 {
+        if trimmed.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let jamo = crate::search::hangul::decompose_jamo(trimmed);
-        let original_q = fts_or_terms(trimmed);
-        let jamo_q = fts_or_terms(&jamo);
-        let fts_q = if original_q.is_empty() {
+        let Some(fts_q) = build_ask_fts_query(trimmed, &jamo) else {
             return Ok(Vec::new());
-        } else if jamo == trimmed || jamo_q.is_empty() {
-            original_q
-        } else {
-            format!("{original_q} OR {jamo_q}")
         };
         // Filter out pages whose evidence is entirely from excluded
         // chats or soft-deleted messages: a page summary is synthesized
@@ -1612,18 +1636,12 @@ impl Store {
         now: i64,
     ) -> Result<Vec<AskEvidence>, sqlite::Error> {
         let trimmed = query.trim();
-        if trimmed.len() < 2 || limit == 0 {
+        if trimmed.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let jamo = crate::search::hangul::decompose_jamo(trimmed);
-        let original_q = fts_or_terms(trimmed);
-        let jamo_q = fts_or_terms(&jamo);
-        let fts_q = if original_q.is_empty() {
+        let Some(fts_q) = build_ask_fts_query(trimmed, &jamo) else {
             return Ok(Vec::new());
-        } else if jamo == trimmed || jamo_q.is_empty() {
-            original_q
-        } else {
-            format!("{original_q} OR {jamo_q}")
         };
         // INNER JOIN messages + chats: ask must respect spec §6.6 +
         // soft-delete (spec line 160) + per-chat exclusion. An evidence
@@ -3051,6 +3069,21 @@ mod tests {
             })
             .unwrap();
         store.conn().execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn ask_fts_evidence_short_exact_query_matches() {
+        // Codex review: 3-char ASCII queries like "BTC" or "ETF" must
+        // match. Our combined phrase + or-of-terms FTS query should
+        // surface the exact substring even though trigram tokenizer
+        // is stricter than word search.
+        let store = setup();
+        let pid = make_page_with_summary(&store, "Bitcoin", "x");
+        add_evi_text(&store, pid, 801, 1, 1_000, "BTC just hit a new local high");
+        add_evi_text(&store, pid, 802, 1, 1_000, "Ethereum momentum continues");
+        let rows = store.ask_fts_evidence("BTC", 20, 2_000).unwrap();
+        let ids: Vec<i64> = rows.iter().map(|r| r.msg_id).collect();
+        assert!(ids.contains(&801), "exact BTC match must hit");
     }
 
     #[test]

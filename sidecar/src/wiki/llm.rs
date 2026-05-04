@@ -1432,7 +1432,7 @@ where
     // long codex hangs.
     let (tx, rx) = mpsc::channel::<Result<String, std::io::Error>>();
     let stdout = child.stdout.take().expect("stdout was piped");
-    let reader_join = std::thread::Builder::new()
+    let reader_join = match std::thread::Builder::new()
         .name("seoyu-ask-stdout".into())
         .spawn(move || {
             let reader = BufReader::new(stdout);
@@ -1441,21 +1441,41 @@ where
                     break;
                 }
             }
-        })
-        .map_err(|e| AskRunError::Exec(format!("spawn reader: {e}")))?;
+        }) {
+        Ok(j) => j,
+        Err(e) => {
+            // Codex review: orphan-child guard. If thread spawn fails
+            // after the codex child is running, kill+reap before we
+            // bail or the subprocess lingers.
+            let _ = child.kill();
+            let _ = child.wait();
+            state.pid.store(0, Ordering::Release);
+            let _ = std::fs::remove_dir_all(&isolated_cwd);
+            return Err(AskRunError::Exec(format!("spawn reader: {e}")));
+        }
+    };
     // Drain stderr on its own thread (codex review). The pipe buffer
     // fills at ~64KB on macOS; without a draining reader, codex blocks
     // on its stderr write and the main loop never sees turn.completed.
     // Captured for diagnostics in case codex exits with an error.
     let stderr = child.stderr.take().expect("stderr was piped");
-    let stderr_join = std::thread::Builder::new()
+    let stderr_join = match std::thread::Builder::new()
         .name("seoyu-ask-stderr".into())
         .spawn(move || {
             let mut buf = Vec::new();
             let _ = std::io::Read::read_to_end(&mut BufReader::new(stderr), &mut buf);
             buf
-        })
-        .map_err(|e| AskRunError::Exec(format!("spawn stderr drain: {e}")))?;
+        }) {
+        Ok(j) => j,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            state.pid.store(0, Ordering::Release);
+            let _ = reader_join.join();
+            let _ = std::fs::remove_dir_all(&isolated_cwd);
+            return Err(AskRunError::Exec(format!("spawn stderr drain: {e}")));
+        }
+    };
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(ASK_TIMEOUT_SECS);
     let mut early_error: Option<String> = None;
