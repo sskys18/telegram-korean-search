@@ -1576,7 +1576,12 @@ where
                         got_turn_completed = true;
                         break Ok(());
                     }
-                    "turn.failed" | "error" => {
+                    "turn.failed" => {
+                        // Only `turn.failed` is terminal. Plain `error`
+                        // events (codex review: reconnect attempts emit
+                        // them transiently) are diagnostic — log and
+                        // keep reading. If the turn really fails, codex
+                        // emits `turn.failed` after.
                         let msg = evt
                             .get("error")
                             .and_then(|e| e.get("message"))
@@ -1589,6 +1594,18 @@ where
                         let _ = child.kill();
                         break Ok(()); // surfaced via early_error below
                     }
+                    "error" => {
+                        let msg = evt
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .or_else(|| {
+                                evt.get("error")
+                                    .and_then(|e| e.get("message"))
+                                    .and_then(|m| m.as_str())
+                            })
+                            .unwrap_or("");
+                        log::debug!("ask: codex transient error event: {msg}");
+                    }
                     _ => {}
                 }
             }
@@ -1598,7 +1615,29 @@ where
         }
     };
 
-    let _ = child.wait();
+    // Codex review: timeout applies post-turn too. After turn.completed
+    // we have everything we need; don't let codex's own cleanup hang
+    // the worker. Kill the process group + bound the wait.
+    if got_turn_completed {
+        kill_codex_group(child.id() as i32);
+        let _ = child.kill();
+    }
+    let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= wait_deadline {
+                    kill_codex_group(child.id() as i32);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
     state.pid.store(0, Ordering::Release);
     let _ = reader_join.join();
     let stderr_buf = stderr_join.join().unwrap_or_default();

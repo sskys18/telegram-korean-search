@@ -1527,17 +1527,24 @@ fn fts_phrase(q: &str) -> String {
 /// expected. Returns None when no usable token survives — caller
 /// returns an empty result set.
 fn build_ask_fts_query(trimmed: &str, jamo: &str) -> Option<String> {
-    let phrase = fts_phrase(trimmed);
-    let or_terms = fts_or_terms(trimmed);
+    // Punctuation glued to tokens breaks trigram matching (codex
+    // review). Normalize whole-phrase clauses by joining the
+    // already-stripped tokens; OR-of-terms strips per token.
+    let stripped_phrase = strip_punct_phrase(trimmed);
+    let stripped_jamo = strip_punct_phrase(jamo);
     let mut clauses: Vec<String> = Vec::with_capacity(4);
-    clauses.push(phrase);
+    if !stripped_phrase.is_empty() {
+        clauses.push(fts_phrase(&stripped_phrase));
+    }
+    let or_terms = fts_or_terms(trimmed);
     if !or_terms.is_empty() {
         clauses.push(or_terms);
     }
     if jamo != trimmed {
-        let jamo_phrase = fts_phrase(jamo);
+        if !stripped_jamo.is_empty() {
+            clauses.push(fts_phrase(&stripped_jamo));
+        }
         let jamo_or = fts_or_terms(jamo);
-        clauses.push(jamo_phrase);
         if !jamo_or.is_empty() {
             clauses.push(jamo_or);
         }
@@ -1546,6 +1553,21 @@ fn build_ask_fts_query(trimmed: &str, jamo: &str) -> Option<String> {
         return None;
     }
     Some(clauses.join(" OR "))
+}
+
+/// Whitespace-rejoin tokens after stripping leading/trailing
+/// punctuation. Mirror of fts_or_terms's token cleanup so the
+/// whole-phrase clause sees the same normalized text.
+fn strip_punct_phrase(q: &str) -> String {
+    const PUNCT: &[char] = &[
+        '?', ',', '.', '!', ':', ';', '(', ')', '[', ']', '{', '}', '"', '\'', '`', '\u{201C}',
+        '\u{201D}', '\u{2018}', '\u{2019}', '\u{2026}',
+    ];
+    q.split_whitespace()
+        .map(|t| t.trim_matches(PUNCT))
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Build an FTS5 OR-of-terms query from a natural-language string.
@@ -1558,7 +1580,18 @@ fn build_ask_fts_query(trimmed: &str, jamo: &str) -> Option<String> {
 /// need to re-validate here. Returns empty string if no usable tokens
 /// remain after filtering — caller should treat that as "no match".
 fn fts_or_terms(q: &str) -> String {
+    // Strip leading/trailing punctuation per token. Natural questions
+    // arrive with `?` `,` `.` `!` `:` `;` `(` `)` `"` `'` glued onto
+    // tokens — those become part of the trigram and never match
+    // (codex review). split_whitespace gives us word boundaries; the
+    // trim_matches drops boundary punctuation without touching
+    // mid-token characters like hyphens or apostrophes inside words.
+    const PUNCT: &[char] = &[
+        '?', ',', '.', '!', ':', ';', '(', ')', '[', ']', '{', '}', '"', '\'', '`', '\u{201C}',
+        '\u{201D}', '\u{2018}', '\u{2019}', '\u{2026}',
+    ];
     q.split_whitespace()
+        .map(|t| t.trim_matches(PUNCT))
         .filter(|t| !t.is_empty())
         .map(fts_phrase)
         .collect::<Vec<_>>()
@@ -3090,6 +3123,18 @@ mod tests {
             })
             .unwrap();
         store.conn().execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn ask_fts_evidence_strips_punctuation_in_query() {
+        // Codex review: "what is BTC?" with `?` glued to BTC must
+        // still match. Boundary punctuation gets stripped per token.
+        let store = setup();
+        let pid = make_page_with_summary(&store, "Bitcoin", "x");
+        add_evi_text(&store, pid, 901, 1, 1_000, "BTC trading update for the day");
+        let rows = store.ask_fts_evidence("what is BTC?", 20, 2_000).unwrap();
+        let ids: Vec<i64> = rows.iter().map(|r| r.msg_id).collect();
+        assert!(ids.contains(&901), "punctuation must not block match");
     }
 
     #[test]
